@@ -2,7 +2,7 @@
     A holder of a single table of data, and potentially a status dictionary
 """
 
-from typing import Callable, Liberal, Protocol, Self
+from typing import Callable, Literal, Protocol, Self
 from abc import abstractmethod
 from queue import Queue
 
@@ -125,8 +125,6 @@ class MemoryCell( Nucleus ):
         self.table_schema = table_schema
         
         self.update_lambda = update_lambda
-        self.get_lambda = get_lambda
-        self.push_method = push_method
     #/def __init__
     
     def updateOnce( self: Self ) -> None:
@@ -448,6 +446,8 @@ def getUpdateLambda_auto(
 # Update to simply get the table and ignore the cell
 updateLambda_replace: TableLambda = lambda cel, tab: tab
 
+# TODO: All deez
+
 def infer_updateLambda( any ) -> UpdateLambda:
     raise Exception("UC")
 #
@@ -464,17 +464,11 @@ def infer_transformLamba( any ) -> TableLambda:
     raise Exception("UC")
 #
 
-
-
-
-
-
 # -- Cell Factories
-
 
 def eagerMemory_fromWebRow(
     row: dict[ str, any ]
-    ) -> EagerMemoryCell
+    ) -> EagerMemoryCell:
     # TODO: set table
     return EagerMemoryCell(
         status = row["cell_status"],
@@ -490,7 +484,7 @@ def eagerMemory_fromWebRow(
 
 def patientMemory_fromWebRow(
     row: dict[ str, any ]
-    ) -> PatientMemoryCell
+    ) -> PatientMemoryCell:
     # TODO: set table
     return PatientMemoryCell(
         status = row["cell-status"],
@@ -558,5 +552,5 @@ def fromWebRow(
         )
     #/switch row["cell_type"]
     
-    raise Exception("UC")
+    raise Exception("Unexpected EoF")
 #/def fromWebRow

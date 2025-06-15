@@ -3,6 +3,7 @@
 """
 
 from silverbrain import cell
+#import silverbrain
 import polars as pl
 
 
@@ -11,7 +12,7 @@ nucleus_0_schema: dict[ str, str ] = {
     'number': pl.UInt8,
 }
 
-nucleus_0: cell.Nucleus = cell.Nucleus(
+nucleus_0: cell.PatientMemoryCell = cell.PatientMemoryCell(
     status = {},
     table_schema = nucleus_0_schema,
     update_lambda = cell.getUpdateLambda_forKey( ['letter'] )
