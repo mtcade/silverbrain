@@ -8,7 +8,7 @@ from queue import Queue
 
 from . import cell
 
-class AcyclicWeb():
+class Web( cell.Nucleus ):
     """
         Has a series of cells, connected by `.connections`. Must be acyclic as a directed graph.
     """
@@ -17,48 +17,22 @@ class AcyclicWeb():
         status: dict[ str, any ] = {},
         cells: dict[ str, cell.CellInterface ] = {},
         connections: dict[ str, str ] = {},
-        input_id: str = '',
-        get_lambda: cell.GetLambda,
-        queue: Queue | None = None,
+        input_ids: list[ str ] = [],
+        inbox: Queue | None = None,
         outbox: Queue | None = None,
         log: Queue | None = None
         ) -> None:
+        
+        super().__init__(
+            status = status,
+            inbox = inbox,
+            outbox = outbox,
+            log = log
+        )
+        
         self.cells = cells
         self.connections = connections
-        self.input_id = input_id
-        
-        # Fill out sources using `connections`
-        self.sources = {}
-        for sid, dids in connections.items():
-            for did in dids:
-                if did not in self.sources:
-                    self.sources[ did ] = [ sid ]
-                else:
-                    self.sources[ did ].append( sid )
-                #
-            #/for did in dids
-        #/for sid, dids in connections.items()
-        
-        if queue is None:
-            self.queue = Queue()
-        #
-        else:
-            self.queue = queue
-        #
-        
-        if outbox is None:
-            self.outbox = Queue()
-        #
-        else:
-            self.outbox = outbox
-        #
-        
-        if log is None:
-            self.log = Queue()
-        #
-        else:
-            self.log = log
-        #
+        self.input_ids = input_ids
         
         return
     #/def __init__
@@ -67,77 +41,128 @@ class AcyclicWeb():
         self: Self,
         update: pl.DataFrame
         ) -> None:
-        self.queue.put( update )
+        self.inbox.put( update )
         return
     #/def queueUpdate
     
+    def cycleOnce( self: Self ) -> None:
+        """
+            Has each cell run `.updateAll`, consuming everything in their queues, and pushing results to their outbox. Then, move everything from each outbox to their destination inboxes via `self.connections`
+        """
+        
+        # Have each cell run its entire queue
+        for cid, cell in self.cells.items():
+            cell.updateAll()
+        #/for cid, cell in self.cells.items()
+        
+        for cid, cell in self.cells.items():
+            while not cell.outbox.empty():
+                # Get output
+                tab: pl.DataFrame = cell.outbox.get()
+
+                # Send output to destinations
+                for did in self.connections[ cid ]:
+                    self.cells[ did ].queueUpdate( tab )
+                #/for did in self.connections[ cid ]
+                
+                cell.outbox.task_done()
+            #/while not cell.outbox.empty()
+        #/for cid, cell in self.cells.items()
+        
+        return
+    #/def cycleOnce
+    
     def updateOnce( self: Self ) -> None:
-        if self.queue.empty():
+        if self.inbox.empty():
             return
-        #/if self.queue.empty()
+        #/if self.inbox.empty()
         
-        tab: pl.DataFrame
-        tab = self.queue.get()
-        self.queue.task_done()
+        tab: pl.DataFrame = self.inbox.get()
+        self.inbox.task_done()
         
-        self.cells[ input_id ].queueUpdate( tab )
-        self.cells[ input_id ].updateAll()
+        for cid in self.input_ids:
+            self.cells[ cid ].queueUpdate( tab )
+        #/for cid in self.input_ids
         
-        cells_current: list[ str ] = [ input_id ]
-        cells_next: list[ str ]
-        update_counter: int = 0
-        
-        while update_counter <= len( self.cells ):
-            cells_next = []
-            for cid in cells_current:
-                while not cells[ cid ].outbox.empty():
-                    tab = cells[ cid ].outbox.get()
-                    for did in self.connections[ cid ]:
-                        self.cells[ did ].queueUpdate( tab.clone() )
-                    #/for did in self.connections[ cid ]
-                    cells[ cid ].task_done()
-                    if cid in self.connections:
-                        cells_next.extend( self.connections[ cid ] )
-                    #/if cid in self.connections
-                #/while not cells[ cid ].outbox.empty()
-            #/for cid in cells_current
-            
-            update_counter += 1
-            
-            if cells_next:
-                cells_current = list( set( cells_next ) )
-            #
-            else:
-                break
-            #/if cells_next
-        #/while update_counter <= len( self.cells )
-        
-        assert update_counter <= len( self.cells )
-        
-        if self.get_lambda:
-            self.outbox.put(
-                self.get_lambda( self )
-            )
-        #
-        else:
-            assert len( cells_current ) == 1
-            cid: str = cells_current[ 0 ]
-            while not self.cells[ cid ].outbox.empty():
-                tab = self.cells[ cid ].outbox.get()
-                self.outbox.put(
-                    tab
-                )
-                self.cells[ cid ].outbox.task_done()
-            #
-        #/if self.get_lambda/else
+        self.cycleOnce()
         
         return
     #/def updateOnce
     
     def updateAll( self: Self ) -> None:
         """
-            Apply all updates in the queue to the input cell, and for each output
+            Apply all updates in the inbox to the input cell, and for each output
+            
+            TODO: decide how often to cycle
         """
-        raise NotImplementedError()
-    #/def applyUpdates
-#/class AcyclicWeb
+        if self.inbox.empty():
+            return
+        #/if self.inbox.empty()
+        
+        tab: pl.DataFrame
+        while not self.inbox.empty():
+            tab = self.inbox.get()
+            self.inbox.task_done()
+            
+            for cid in self.input_ids:
+                self.cells[ cid ].queueUpdate( tab )
+            #/for cid in self.input_ids
+        #/while not self.inbox.empty()
+        
+        self.cycleOnce()
+        
+        return
+    #/def updateAll
+#/class Web
+
+def web_fromTable(
+    table: pl.DataFrame,
+    status: dict[ str, any ] = {},
+    inbox: Queue | None = None,
+    outbox: Queue | None = None,
+    log: Queue | None = None
+    ) -> Web:
+    """
+        :param pl.DataFrame table: A web map, with columns
+            - `"cell_id": str`
+            - `"cell_type": Literal[
+                    'transformer',
+                    'eagerMemory',
+                    'patientMemory'
+                ]`
+            - `"cell_status": dict[ str, any ]`
+            - `"table_schema": dict[ str, str ]`
+            - `"update_lambda": any`
+            - `"get_lambda": any`
+            - `"transform_lambda": any`
+            - `"destinations": list[ str ]`
+            - '"input": bool'
+    """
+    
+    cells: dict[ str, cell.Nucleus ] = {}
+    connections: dict[ str, str ] = {}
+    input_ids: list[ str ] = []
+    
+    # Gather everything from the table
+    for row in table.iter_rows( named = True ):
+        cells[ row['cell_id'] ] = cell.fromWebRow( row )
+        
+        if row['destinations']:
+            connections[ row['cell_id'] ] = row['destinations']
+        #
+        
+        if row[ input ]:
+            input_ids.append( row['cell_id'] )
+        #
+    #/for row in table.iter_rows( named = True )
+    
+    return Web(
+        status = status,
+        cells = cells,
+        connections = connecctions,
+        input_ids = input_ids,
+        inbox = inbox,
+        outbox = outbox,
+        log = log
+    )
+#/def web_fromTable
