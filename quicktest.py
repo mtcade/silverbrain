@@ -1,61 +1,283 @@
 """
-    Connect to the simple database at `data/example/quicktest.duckdb`
+    Basic tests for silverbrain
 """
-
+ 
 from silverbrain import cell
-#import silverbrain
 import polars as pl
 
+TestResult: type = bool
 
-nucleus_0_schema: dict[ str, str ] = {
-    'letter': pl.String,
-    'number': pl.UInt8,
-}
+# -- Settings
+VERBOSE = 2
+# Verbose:
+#    >0: Start and end of tests
+#    >1: Schema
+#    >2: Data inputs and outputs
 
-nucleus_0: cell.PatientMemoryCell = cell.PatientMemoryCell(
-    status = {},
-    table_schema = nucleus_0_schema,
-    update_lambda = cell.getUpdateLambda_forKey( ['letter'] )
-)
+INDENT_BASE: int = 1 # Spaces after the "#" for messages
+PREFIX_BASE: str = ' '*INDENT_BASE
 
-nucleus_0.queueUpdate(
-    pl.DataFrame(
+if VERBOSE > 0:
+    print("#" + PREFIX_BASE + "quicktest")
+    print("#" + PREFIX_BASE + "quicktest VERBOSE={}".format( VERBOSE ))
+#
+
+
+# -- Tests
+
+def test_cell_0(
+    schema: dict = {},
+    verbose: int = 0,
+    indent: int = 1
+    ) -> TestResult:
+    
+    prefix_0: str = ' '*indent
+    prefix_1: str = prefix_0 + '  '
+    prefix_2: str = prefix_1 + '  '
+    
+    if verbose > 0:
+        print("#" + prefix_0 + "quicktest.test_cell_0")
+    #
+    
+    if schema and verbose > 1:
+        print("#" + prefix_1 + "quicktest.test_cell_0 schema:")
+        print( schema )
+    #
+    
+    # Test -- cell.PatientMemoryCell
+    #   update a table by one column
+    
+    nucleus_0_schema: dict[ str, type ] = {
+        'letter': pl.String,
+        'number': pl.UInt8,
+    }
+
+    nucleus_0: cell.PatientMemoryCell = cell.PatientMemoryCell(
+        status = {},
+        table_schema = nucleus_0_schema,
+        update_lambda = cell.getUpdateLambda_forKey( ['letter'] )
+    )
+    
+    data_0: pl.DataFrame = pl.DataFrame(
         {
             'letter': ['a'],
             'number': [0]
         },
         schema = nucleus_0_schema
     )
-)
+    
+    nucleus_0.queueUpdate(
+        data_0
+    )
 
-nucleus_0.updateAll()
-
-print( nucleus_0.table )
-
-nucleus_0.queueUpdate(
-    pl.DataFrame(
+    nucleus_0.updateAll()
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_cell_0 data_0:")
+        print( data_0 )
+        
+        print("#" + prefix_2 + "quicktest.test_cell_0 nucleus_0.table:")
+        print( nucleus_0.table )
+    #/if verbose > 2
+    
+    assert nucleus_0.table.equals( data_0 )
+    
+    # -- Test cell.PatientMemoryCell
+    #  Add row
+    data_1: pl.DataFrame = pl.DataFrame(
         {
             'letter': ['b'],
             'number': [1]
         },
         schema = nucleus_0_schema
     )
-)
+    
+    data_check_1: pl.DataFrame = pl.DataFrame(
+        {
+            'letter': ['a','b'],
+            'number': [0,1]
+        },
+        schema = nucleus_0_schema
+    )
+    
+    nucleus_0.queueUpdate(
+        data_1
+    )
+    
+    nucleus_0.updateAll()
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_cell_0 data_1:")
+        print( data_1 )
+    
+        print("#" + prefix_2 + "quicktest.test_cell_0 nucleus_0.table:")
+        print( nucleus_0.table )
+    #
 
-nucleus_0.updateAll()
+    assert nucleus_0.table.equals( data_check_1 )
 
-print( nucleus_0.table )
-
-nucleus_0.queueUpdate(
-    pl.DataFrame(
+    # -- Test cell.PatientMemoryCell
+    #  Update value (row) by letter (a)
+    
+    data_2: pl.DataFrame = pl.DataFrame(
         {
             'letter': ['a'],
             'number': [2]
         },
         schema = nucleus_0_schema
     )
+    
+    data_check_2: pl.DataFrame = pl.DataFrame(
+        {
+            'letter': ['a','b'],
+            'number': [2,1]
+        },
+        schema = nucleus_0_schema
+    )
+    
+    nucleus_0.queueUpdate(
+        data_2
+    )
+
+    nucleus_0.updateAll()
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_cell_0 data_2:")
+        print( data_2 )
+        
+        print("#" + prefix_2 + "quicktest.test_cell_0 nucleus_0.table:")
+        print( nucleus_0.table )
+    #
+
+    assert nucleus_0.table.equals( data_check_2 )
+    
+    if verbose > 0:
+        print("#" + prefix_0 + "/quicktest.test_cell_0")
+    #
+    
+    return True
+#/def test_cell_0
+
+
+
+def test_web_0(
+    schema: dict = {},
+    verbose: int = 0,
+    indent: int = 1
+    ) -> TestResult:
+    """
+        Make a one-celled web, with only a simple transformation
+    """
+    prefix_0: str = ' '*indent
+    prefix_1: str = prefix_0 + '  '
+    prefix_2: str = prefix_1 + '  '
+    
+    if verbose > 0:
+        print("#" + prefix_0 + "quicktest.test_web_0")
+    #
+    if schema and verbose > 1:
+        print("#" + prefix_1 + "quicktest.test_web_0 schema:")
+        print( schema )
+    #
+    
+    # Data setup
+    data_0: pl.DataFrame = pl.DataFrame(
+        {'letter':['a','b'], 'number': [0,1] },
+        schema = {
+            'letter': pl.String,
+            'number': pl.UInt8,
+        }
+    )
+    
+    data_check_0: pl.DataFrame = pl.DataFrame(
+        {'letter':['a','b'], 'number': [1,2] },
+        schema = {
+            'letter': pl.String,
+            'number': pl.UInt8,
+        }
+    )
+    
+    # Test -- TableLambda
+    
+    transform_lambda_0: cell.TableLambda = lambda cel, tab: tab.with_columns(
+        pl.col("number") + 1
+    )
+    
+    data_0_result_0: pl.DataFrame = transform_lambda_0( None, data_0)
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0:")
+        print( data_0 )
+
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0_result_0:")
+        print( data_0_result_0 )
+    #
+    
+    assert data_0_result_0.equals( data_check_0 )
+    
+    # Test -- cell.TransformerCell.updateAll
+    
+    transformerCell_0: cell.TransformerCell = cell.TransformerCell(
+        transform_lambda = transform_lambda_0
+    )
+    
+    transformerCell_0.queueUpdate( data_0 )
+    transformerCell_0.updateAll()
+    
+    assert not transformerCell_0.outbox.empty()
+    
+    data_0_result_1: pl.DataFrame = transformerCell_0.outbox.get()
+    transformerCell_0.outbox.task_done()
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0:")
+        print( data_0 )
+        
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0_result_1:")
+        print( data_0_result_1 )
+    #
+    
+    assert data_0_result_1.equals( data_check_0 )
+    
+    assert transformerCell_0.inbox.empty()
+    assert transformerCell_0.outbox.empty()
+    
+    # Test -- cell.TransformerCell.updateOnce
+    
+    transformerCell_0.queueUpdate( data_0 )
+    transformerCell_0.updateOnce()
+    
+    assert not transformerCell_0.outbox.empty()
+    data_0_result_2: pl.DataFrame = transformerCell_0.outbox.get()
+    transformerCell_0.outbox.task_done()
+    
+    if verbose > 2:
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0:")
+        print( data_0 )
+        
+        print("#" + prefix_2 + "quicktest.test_web_0 data_0_result_2:")
+        print( data_0_result_2 )
+    #
+    
+    assert data_0_result_0.equals( data_check_0 )
+    
+    if verbose > 0:
+        print("#" + prefix_0 + "/quicktest.test_web_0")
+    #
+    
+    return True
+#/def test_web_0
+
+if True: test_cell_0(
+    verbose = VERBOSE,
+    indent = INDENT_BASE + 2
 )
 
-nucleus_0.updateAll()
+if True: test_web_0(
+    verbose = VERBOSE,
+    indent = INDENT_BASE + 2
+)
 
-print( nucleus_0.table )
+if VERBOSE > 0:
+    print("#" + PREFIX_BASE + "/quicktest")
+#
