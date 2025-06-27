@@ -1,23 +1,15 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-exclude = ["data*"]
-
 [project]
 name = "silverbrain"
-version = "0.0.1"
-authors = [
-  { name="Evan Mason" }
-]
-description = "tabular ai"
-keywords = ["tabular","storage","ai"]
+version = "0.1.0"
+description = "AI for Tabular Engineering"
 readme = "README.md"
-requires-python = ">=3.11"
+authors = [
+    { name = "Evan Mason" }
+]
+requires-python = ">=3.13"
 dependencies = [
-    "polars >=1.30, <2"
+    "jable",
+    "polars >=1.30, <2",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -25,3 +17,17 @@ classifiers = [
 ]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+
+
+[project.scripts]
+silverbrain = "silverbrain:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+jable = { path = "../jable" }

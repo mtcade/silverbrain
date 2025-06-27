@@ -11,6 +11,7 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: polars<2,>=1.30
+Requires-Dist: pyjable
 Dynamic: license-file
 
 # silverbrain

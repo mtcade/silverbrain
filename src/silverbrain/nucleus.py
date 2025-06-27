@@ -1,5 +1,7 @@
 """
-    A holder of a single table of data, and potentially a status dictionary
+    A holder of up to one single table of data, and potentially a status dictionary
+    
+    Nothing pushes output, instead you use `.queueUpdate(...)` to add a `pl.DataFrame`, potentially run `.updateOnce(...)` or `.updateAll(...)` and then find the results in the `Nucleus` `.outbox`
 """
 
 from typing import Callable, Literal, Protocol, Self
@@ -8,26 +10,11 @@ from queue import Queue
 
 import polars as pl
 
-class CellInterface( Protocol ):
-    @abstractmethod
-    def queueUpdate( self: Self, update: pl.DataFrame ):
-        raise NotImplementedError()
-    #
-    
-    @abstractmethod
-    def updateOnce( self: Self ) -> None:
-        raise NotImplementedError
-    #
-    
-    @abstractmethod
-    def updateAll( self: Self ) -> None:
-        raise NotImplementedError
-    #
-#/class CellInterface
+from . import types
 
 TableLambda = Callable[
     [
-        CellInterface,
+        types.Cell,
         pl.DataFrame
     ],
     pl.DataFrame

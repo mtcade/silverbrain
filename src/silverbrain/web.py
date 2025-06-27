@@ -1,21 +1,22 @@
 """
-    Holds multiple cells in a graph; see ./cell.py
+    Holds multiple cells in a graph; see ./nucleus.py
 """
 
 from typing import Callable, Literal, Protocol, Self
 from abc import abstractmethod
 from queue import Queue
 
-from . import cell
+from . import nucleus
+from . import types
 
-class Web( cell.Nucleus ):
+class Web( nucleus.Nucleus ):
     """
         Has a series of cells, connected by `.connections`. Must be acyclic as a directed graph.
     """
     def __init__(
         self: Self,
         status: dict[ str, any ] = {},
-        cells: dict[ str, cell.CellInterface ] = {},
+        cells: dict[ str, types.Cell ] = {},
         connections: dict[ str, str ] = {},
         input_ids: list[ str ] = [],
         inbox: Queue | None = None,
@@ -139,7 +140,7 @@ def web_fromTable(
             - '"input": bool'
     """
     
-    cells: dict[ str, cell.Nucleus ] = {}
+    cells: dict[ str, types.Cell ] = {}
     connections: dict[ str, str ] = {}
     input_ids: list[ str ] = []
     

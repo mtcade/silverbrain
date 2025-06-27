@@ -2,7 +2,8 @@ LICENSE
 README.md
 pyproject.toml
 src/silverbrain/__init__.py
-src/silverbrain/cell.py
+src/silverbrain/nucleus.py
+src/silverbrain/types.py
 src/silverbrain/web.py
 src/silverbrain.egg-info/PKG-INFO
 src/silverbrain.egg-info/SOURCES.txt

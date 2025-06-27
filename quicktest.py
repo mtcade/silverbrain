@@ -2,13 +2,13 @@
     Basic tests for silverbrain
 """
  
-from silverbrain import cell
+from silverbrain import nucleus
 import polars as pl
 
 TestResult: type = bool
 
-# -- Settings
-VERBOSE = 2
+# -- Settings - Display
+VERBOSE = 3
 # Verbose:
 #    >0: Start and end of tests
 #    >1: Schema
@@ -44,7 +44,7 @@ def test_cell_0(
         print( schema )
     #
     
-    # Test -- cell.PatientMemoryCell
+    # Test -- nucleus.PatientMemoryCell
     #   update a table by one column
     
     nucleus_0_schema: dict[ str, type ] = {
@@ -52,10 +52,10 @@ def test_cell_0(
         'number': pl.UInt8,
     }
 
-    nucleus_0: cell.PatientMemoryCell = cell.PatientMemoryCell(
+    nucleus_0: nucleus.PatientMemoryCell = nucleus.PatientMemoryCell(
         status = {},
         table_schema = nucleus_0_schema,
-        update_lambda = cell.getUpdateLambda_forKey( ['letter'] )
+        update_lambda = nucleus.getUpdateLambda_forKey( ['letter'] )
     )
     
     data_0: pl.DataFrame = pl.DataFrame(
@@ -82,7 +82,7 @@ def test_cell_0(
     
     assert nucleus_0.table.equals( data_0 )
     
-    # -- Test cell.PatientMemoryCell
+    # -- Test nucleus.PatientMemoryCell
     #  Add row
     data_1: pl.DataFrame = pl.DataFrame(
         {
@@ -116,7 +116,7 @@ def test_cell_0(
 
     assert nucleus_0.table.equals( data_check_1 )
 
-    # -- Test cell.PatientMemoryCell
+    # -- Test nucleus.PatientMemoryCell
     #  Update value (row) by letter (a)
     
     data_2: pl.DataFrame = pl.DataFrame(
@@ -158,8 +158,6 @@ def test_cell_0(
     return True
 #/def test_cell_0
 
-
-
 def test_web_0(
     schema: dict = {},
     verbose: int = 0,
@@ -199,7 +197,7 @@ def test_web_0(
     
     # Test -- TableLambda
     
-    transform_lambda_0: cell.TableLambda = lambda cel, tab: tab.with_columns(
+    transform_lambda_0: nucleus.TableLambda = lambda cel, tab: tab.with_columns(
         pl.col("number") + 1
     )
     
@@ -215,9 +213,9 @@ def test_web_0(
     
     assert data_0_result_0.equals( data_check_0 )
     
-    # Test -- cell.TransformerCell.updateAll
+    # Test -- nucleus.TransformerCell.updateAll
     
-    transformerCell_0: cell.TransformerCell = cell.TransformerCell(
+    transformerCell_0: nucleus.TransformerCell = nucleus.TransformerCell(
         transform_lambda = transform_lambda_0
     )
     
@@ -242,7 +240,7 @@ def test_web_0(
     assert transformerCell_0.inbox.empty()
     assert transformerCell_0.outbox.empty()
     
-    # Test -- cell.TransformerCell.updateOnce
+    # Test -- nucleus.TransformerCell.updateOnce
     
     transformerCell_0.queueUpdate( data_0 )
     transformerCell_0.updateOnce()
