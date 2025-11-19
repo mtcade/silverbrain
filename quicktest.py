@@ -1,11 +1,12 @@
 """
     Basic tests for silverbrain
 """
- 
+
+from typing import Callable, Type
 from silverbrain import nucleus
 import polars as pl
 
-TestResult: type = bool
+TestResult: Type = bool
 
 # -- Settings - Display
 VERBOSE = 3
@@ -54,8 +55,11 @@ def test_cell_0(
 
     nucleus_0: nucleus.PatientMemoryCell = nucleus.PatientMemoryCell(
         status = {},
-        table_schema = nucleus_0_schema,
-        update_lambda = nucleus.getUpdateLambda_forKey( ['letter'] )
+        table_schema = nucleus_0_schema
+    )
+    nucleus_0.update_lambda = nucleus.getUpdateLambda_forKey(
+        nucleus_0,
+        on = ['letter']
     )
     
     data_0: pl.DataFrame = pl.DataFrame(
@@ -197,11 +201,11 @@ def test_web_0(
     
     # Test -- TableLambda
     
-    transform_lambda_0: nucleus.TableLambda = lambda cel, tab: tab.with_columns(
+    transform_lambda_0: nucleus.TableLambda = lambda tab: tab.with_columns(
         pl.col("number") + 1
     )
     
-    data_0_result_0: pl.DataFrame = transform_lambda_0( None, data_0)
+    data_0_result_0: pl.DataFrame = transform_lambda_0( data_0)
     
     if verbose > 2:
         print("#" + prefix_2 + "quicktest.test_web_0 data_0:")
@@ -258,6 +262,8 @@ def test_web_0(
     #
     
     assert data_0_result_0.equals( data_check_0 )
+    
+    # TODO: Initialize web
     
     if verbose > 0:
         print("#" + prefix_0 + "/quicktest.test_web_0")

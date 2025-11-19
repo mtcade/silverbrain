@@ -6,6 +6,12 @@ requires-python = ">=3.13"
 name = "jable"
 version = "0.1.0"
 source = { directory = "../jable" }
+dependencies = [
+    { name = "polars" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "polars", specifier = "==1.30.0" }]
 
 [[package]]
 name = "polars"

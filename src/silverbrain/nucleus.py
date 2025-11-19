@@ -4,54 +4,44 @@
     Nothing pushes output, instead you use `.queueUpdate(...)` to add a `pl.DataFrame`, potentially run `.updateOnce(...)` or `.updateAll(...)` and then find the results in the `Nucleus` `.outbox`
 """
 
-from typing import Callable, Literal, Protocol, Self
-from abc import abstractmethod
-from queue import Queue
+from . import types
 
 import polars as pl
 
-from . import types
+from typing import Callable, Literal, Optional, Protocol, Self, Type
+from abc import abstractmethod
+from queue import Queue
 
-TableLambda = Callable[
+
+
+
+
+TableLambda: Type = Callable[
     [
-        types.Cell,
-        pl.DataFrame
+        tuple[ pl.DataFrame,...], # dfs
+        Optional[ int ], # verbose
+        Optional[ str ], # verbose_prefix
     ],
     pl.DataFrame
 ]
 
 
-
 class Nucleus():
     def __init__(
         self: Self,
-        status: dict[ str, any ] = {},
+        status: dict[ str, any ] | None = None,
         inbox: Queue | None = None,
         outbox: Queue | None = None,
         log: Queue | None = None
         ):
-        self.status = status
+        self.status = status or {}
     
-        if inbox is None:
-            self.inbox = Queue()
-        #
-        else:
-            self.inbox = inbox
-        #
+        self.inbox = inbox or Queue()
         
-        if outbox is None:
-            self.outbox = Queue()
-        #
-        else:
-            self.outbox = outbox
-        #
+        self.outbox = outbox or Queue()
         
-        if log is None:
-            self.log = Queue()
-        #
-        else:
-            self.log = log
-        #
+        self.log = log or Queue()
+
         return
     #/def __init__
     
@@ -84,13 +74,7 @@ class MemoryCell( Nucleus ):
         log: Queue | None = None,
         table: pl.DataFrame | None = None,
         table_schema: pl.Schema | None = None,
-        update_lambda: Callable[
-            [
-                Self,
-                pl.DataFrame
-            ],
-            pl.DataFrame
-        ] | None = None
+        update_lambda: TableLambda | None = None
         ):
         super().__init__(
             status = status,
@@ -129,18 +113,8 @@ class MemoryCell( Nucleus ):
     #/def updateAll
 #/class MemoryCell
 
-UpdateLambda = Callable[
-    [
-        MemoryCell,
-        pl.DataFrame
-    ],
-    pl.DataFrame
-]
-
 PatientUpdateLambda = Callable[
-    [
-        MemoryCell
-    ],
+    [],
     pl.DataFrame
 ]
 
@@ -156,8 +130,8 @@ class EagerMemoryCell( MemoryCell ):
         log: Queue | None = None,
         table: pl.DataFrame | None = None,
         table_schema: pl.Schema | None = None,
-        update_lambda: UpdateLambda | None = None,
-        eager_get_lambda: UpdateLambda | None = None
+        update_lambda: TableLambda | None = None,
+        get_lambda: TableLambda | None = None
         ):
         super().__init__(
             status = status,
@@ -169,7 +143,7 @@ class EagerMemoryCell( MemoryCell ):
             update_lambda = update_lambda
         )
 
-        self.eager_get_lambda = eager_get_lambda
+        self.get_lambda = get_lambda
         
         return
     #/def __init__
@@ -183,12 +157,11 @@ class EagerMemoryCell( MemoryCell ):
         #
         
         tab: pl.DataFrame = self.inbox.get()
-        self.table = self.update_lambda( self, tab )
+        self.table = self.update_lambda( tab )
 
-        if self.eager_get_lambda:
+        if self.get_lambda:
             self.outbox.put(
-                self.eager_get_lambda(
-                    self,
+                self.get_lambda(
                     tab
                 )
             )
@@ -215,12 +188,11 @@ class EagerMemoryCell( MemoryCell ):
         
         while not self.inbox.empty():
             tab = self.inbox.get()
-            self.table = self.update_lambda( self, tab )
+            self.table = self.update_lambda( tab )
             
-            if self.eager_get_lambda:
+            if self.get_lambda:
                 self.outbox.put(
-                    self.eager_get_lambda(
-                        self,
+                    self.get_lambda(
                         tab
                     )
                 )
@@ -250,7 +222,7 @@ class PatientMemoryCell( MemoryCell ):
         log: Queue | None = None,
         table: pl.DataFrame | None = None,
         table_schema: pl.Schema | None = None,
-        update_lambda: UpdateLambda | None = None,
+        update_lambda: TableLambda | None = None,
         patient_get_lambda: PatientUpdateLambda | None = None
         ):
         super().__init__(
@@ -277,14 +249,12 @@ class PatientMemoryCell( MemoryCell ):
         #
         
         tab: pl.DataFrame = self.inbox.get()
-        self.table = self.update_lambda( self, tab )
+        self.table = self.update_lambda( tab )
         self.inbox.task_done()
         
         if self.patient_get_lambda:
             self.outbox.put(
-                self.patient_get_lambda(
-                    self
-                )
+                self.patient_get_lambda()
             )
         #
         else:
@@ -309,16 +279,14 @@ class PatientMemoryCell( MemoryCell ):
         
         while not self.inbox.empty():
             tab = self.inbox.get()
-            self.table = self.update_lambda( self, tab )
+            self.table = self.update_lambda( tab )
 
             self.inbox.task_done()
         #/while not self.inbox.empty()
         
         if self.patient_get_lambda:
             self.outbox.put(
-                self.patient_get_lambda(
-                    self
-                )
+                self.patient_get_lambda()
             )
         #
         else:
@@ -360,7 +328,7 @@ class TransformerCell( Nucleus ):
             tab: pl.DataFrame = self.inbox.get()
             self.outbox.put(
                 self.transform_lambda(
-                    self, tab
+                    tab
                 )
             )
             self.inbox.task_done()
@@ -374,7 +342,7 @@ class TransformerCell( Nucleus ):
 
             self.outbox.put(
                 self.transform_lambda(
-                    self, tab
+                    tab
                 )
             )
             self.inbox.task_done()
@@ -386,12 +354,14 @@ class TransformerCell( Nucleus ):
 # -- Lambda makers: transform, update, get
 
 def getUpdateLambda_forKey(
+    cel: Nucleus,
     on: list[ str ],
     how: str = 'full',
     *args,
     **kwargs
-    ) -> UpdateLambda:
+    ) -> TableLambda:
     """
+        :param Nucleus cel: Table holder
         :param list[ str ] on: Keys to update by, shared by the memoryCell.table, and the input table
         :param str how: Join method, used by `table.update()`
         :param *args: Passed to `table.update()`
@@ -399,7 +369,8 @@ def getUpdateLambda_forKey(
         
         Uses `pl.DataFrame.update()` to simply update `nuc.table
     """
-    return lambda cel, tab: cel.table.update(
+    # TODO: kill
+    return lambda tab: cel.table.update(
         tab,
         on = on,
         how = how,
@@ -413,7 +384,7 @@ def getUpdateLambda_auto(
     how: str = 'full',
     *args,
     **kwargs
-    ) -> UpdateLambda:
+    ) -> TableLambda:
     """
         :param MemoryCell memoryCell: A `MemoryCell` with `.status["primary_key"]`, which will be the `on` value in `getUpdateLambda_forKey`
         :param str how: Join method, used by `table.update()`
@@ -423,6 +394,7 @@ def getUpdateLambda_auto(
         Update `memoryCell` by its `status["primary_key"]
     """
     return getUpdateLambda_forKey(
+        cel = memoryCell,
         on = memoryCell.status["primary_key"],
         how = how,
         *args,
@@ -431,15 +403,15 @@ def getUpdateLambda_auto(
 #/getUpdateLambda_auto
 
 # Update to simply get the table and ignore the cell
-updateLambda_replace: TableLambda = lambda cel, tab: tab
+updateLambda_replace: TableLambda = lambda tab: tab
 
 # TODO: All deez
 
-def infer_updateLambda( any ) -> UpdateLambda:
+def infer_updateLambda( any ) -> TableLambda:
     raise Exception("UC")
 #
 
-def infer_eagerGetLambda( any ) -> UpdateLambda:
+def infer_eagerGetLambda( any ) -> TableLambda:
     raise Exception("UC")
 #
 
