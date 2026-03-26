@@ -4,17 +4,11 @@
     Nothing pushes output, instead you use `.queueUpdate(...)` to add a `pl.DataFrame`, potentially run `.updateOnce(...)` or `.updateAll(...)` and then find the results in the `Nucleus` `.outbox`
 """
 
-from . import types
-
 import polars as pl
 
 from typing import Callable, Literal, Optional, Protocol, Self, Type
 from abc import abstractmethod
 from queue import Queue
-
-
-
-
 
 TableLambda: Type = Callable[
     [

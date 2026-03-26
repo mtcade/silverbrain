@@ -6,10 +6,11 @@ readme = "README.md"
 authors = [
     { name = "Evan Mason" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
-    "jable",
-    "polars >=1.30, <2",
+    "polars >=1.32, <2",
+    "numpy>=1.26.0",
+    "pyarrow",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -19,9 +20,6 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 
 
-[project.scripts]
-silverbrain = "silverbrain:main"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -30,4 +28,3 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.uv.sources]
-jable = { path = "../jable" }

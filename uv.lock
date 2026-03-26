@@ -1,17 +1,6 @@
 version = 1
 revision = 2
-requires-python = ">=3.13"
-
-[[package]]
-name = "jable"
-version = "0.1.0"
-source = { directory = "../jable" }
-dependencies = [
-    { name = "polars" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "polars", specifier = "==1.30.0" }]
+requires-python = ">=3.11"
 
 [[package]]
 name = "polars"
@@ -32,12 +21,8 @@ name = "silverbrain"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "jable" },
     { name = "polars" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "jable", directory = "../jable" },
-    { name = "polars", specifier = ">=1.30,<2" },
-]
+requires-dist = [{ name = "polars", specifier = ">=1.30,<2" }]
