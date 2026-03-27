@@ -3,6 +3,7 @@ r"""UUID objects (universally unique identifiers) according to RFC 4122/9562.
 IMPORTED from https://github.com/python/cpython/blob/main/Lib/uuid.py
 
 # TODO: switch to standard library later
+# 2026-03-27: Switching to external uuid7
 
 This module provides immutable UUID objects (class UUID) and functions for
 generating UUIDs corresponding to a specific UUID version as specified in

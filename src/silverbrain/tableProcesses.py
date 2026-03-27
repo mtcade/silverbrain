@@ -7,18 +7,12 @@
 
 from . import types
 from .tableOps import TransformOp
+from .schema import table_schemas
 
 import polars as pl
 
 from dataclasses import dataclass
 from typing import Self, Sequence, Type
-
-OP_BINDINGS_SCHEMA: dict[ str, pl.DataType ] = {
-    'process_id':    pl.Utf8,
-    'op_id':         pl.Utf8,
-    'input_tables':  pl.List( pl.Utf8 ),
-    'output_tables': pl.List( pl.Utf8 ),
-}
 
 # -- Process Ref; Atomic types.TaggedTableProcess
 
@@ -96,7 +90,7 @@ class TableProcessRef():
                 'input_tables':  list( self.source ),
                 'output_tables': list( self.target ),
             }],
-            schema = OP_BINDINGS_SCHEMA,
+            schema = table_schemas['op_bindings'],
         )
     #/def get_op_bindings
 #/class TableProcessRef
@@ -205,7 +199,7 @@ class TableCheckRef():
                 'input_tables':  list( self.source ),
                 'output_tables': [],
             }],
-            schema = OP_BINDINGS_SCHEMA,
+            schema = table_schemas['op_bindings'],
         )
     #/def get_op_bindings
 #/class TableCheckRef

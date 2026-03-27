@@ -11,6 +11,7 @@ dependencies = [
     "polars >=1.32, <2",
     "numpy>=1.26.0",
     "pyarrow",
+    "uuid7",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

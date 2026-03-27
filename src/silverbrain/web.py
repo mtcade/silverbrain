@@ -1,12 +1,10 @@
 #
-#//  web_1.py
+#//  web.py
 #//  silverbrain
 #//
 #//  Created by Evan Mason on 3/11/26.
-#//  Update to web, removing TableOpParent and its decendents,
-#//     in favor of TableOpRef and TableOp
 
-from . import tableOps, types
+from . import tableOps, types, utilities
 
 import polars as pl
 import numpy as np
@@ -33,6 +31,8 @@ class Web():
     """
     def __init__(
         self: Self,
+        main_id: str = '',
+        rng: np.random.Generator | None = None,
         inputIds: list[
             str
         ] | None = None,
@@ -47,7 +47,10 @@ class Web():
         log: Queue | None = None,
         verbose: int = 0,
         ) -> None:
-
+        
+        self.main_id = main_id
+        self.rng = rng
+        
         self.inputIds = inputIds or []
         self.tables = tables or {}
         self.tableOps = tableOps or {}
@@ -62,6 +65,306 @@ class Web():
         return
     #/def __init__
     
+    @classmethod
+    def init_default_with_main_id(
+        cls,
+        main_id: str,
+        rng: np.random.Generator | None = None,
+        main_root: str | None = None,
+        verbose: int = 0,
+        ) -> Self:
+        """
+            Initialize from main_root or getcwd();
+            
+            {main_root}/
+                settings/
+                    paths_index.json
+                        - 'default': "./default/paths.json"
+                        - {main_id}: "./{main_id}/paths.json"
+                    default/
+                        paths.json
+                            - '__main_root__': "../.."
+                            - '__data_root_default__': "data/default"
+                    {main_id}/
+                        paths.json
+                            - '__data_root__': "data/{main_id}"
+                data/
+                    default/
+                    {main_id}/
+                    
+            Setup a data root at main_root/data/{main_id}
+        """
+        from os import path
+        if main_root is None:
+            from os import getcwd
+            main_root = getcwd()
+        #
+        
+        if verbose > 0:
+            print(
+                "Initializing default"
+            )
+            print(
+                "  main_id='{}'".format(
+                    main_id
+                )
+            )
+            print(
+                "  main_root='{}'".format(
+                    main_root
+                )
+            )
+        #/if verbose > 0
+
+        
+        # Get a list of dirs we need to make
+        mkdir_list: list[ str ] = []
+        
+        # Data
+        # {main_root}/data
+        if not path.isdir(
+            data_all_dir:= path.join(
+                main_root, "data"
+            )
+        ):
+            mkdir_list.append( data_all_dir )
+        #
+        
+        # {main_root}/data/{main_id}
+        if not path.isdir(
+            data_self_dir:= path.join(
+                data_all_dir, main_id
+            )
+        ):
+            mkdir_list.append( data_self_dir )
+        #
+        # {main_root}/data/default
+        if not path.isdir(
+            data_default_dir:= path.join(
+                data_all_dir, "default",
+            )
+        ):
+            mkdir_list.append( data_default_dir )
+        #
+        
+        # Settings
+        # {main_root}/settings
+        if not path.isdir(
+            settings_all_dir:= path.join(
+                main_root, "settings"
+            )
+        ):
+            mkdir_list.append( settings_all_dir )
+        #
+        
+        # {main_root}/settings/{main_id}
+        if not path.isdir(
+            settings_self_dir:= path.join(
+                settings_all_dir, main_id
+            )
+        ):
+            mkdir_list.append( settings_self_dir )
+        #
+        # {main_root}/settings/default
+        if not path.isdir(
+            settings_default_dir:= path.join(
+                settings_all_dir, "default",
+            )
+        ):
+            mkdir_list.append( settings_default_dir )
+        #
+        
+        # TEST
+        paths_default_dict: dict[ str, str ] = {
+            '__main_root__': path.relpath(
+                main_root,
+                start = settings_default_dir,
+            ),
+            # Relative to main_root
+            '__data_root_default__': path.join(
+                "data",
+                "default",
+            )
+        }
+        print( paths_default_dict )
+        raise Exception("paths_default_dict")
+        
+        if mkdir_list:
+            print("Create directories?")
+            for _dir in mkdir_list:
+                print("  {}".format(_dir))
+            #
+            
+            if not input(
+                "'y' to continue\n".format(
+                    data_self_dir
+                )
+            ) == "y":
+                quit()
+            #/if not { verify making dirs }
+            from os import mkdir
+            
+            if verbose > 0:
+                print( "mkdir:")
+            #
+            for _dir in mkdir_list:
+                if verbose > 0:
+                    print("  {}".format( _dir ) )
+                #
+                mkdir( _dir )
+            #/for _dir in mkdir_list
+        #/if mkdir_list
+        
+        # Paths
+        import json
+        if not path.isfile(
+            paths_index_fp := path.join(
+                settings_all_dir, 'paths_index.json',
+            )
+        ):
+            paths_index_dict: dict[ str, str ] = {
+                'default': path.join(
+                    ".",
+                    "default",
+                    "paths.json",
+                ),
+                main_id: path.join(
+                    ".",
+                    main_id,
+                    "paths.json",
+                )
+            }
+            with open( paths_index_dict, "w", ) as f:
+                json.dump(
+                    paths_index_dict, f,
+                    indent = 2
+                )
+            #
+        #/if not path.isfile( { paths_index_fp } )
+        else:
+            # Check we're in paths_index
+            paths_index_dict: dict[ str, str ]
+            with open( paths_index_fp ) as f:
+                paths_index_dict = json.load( f )
+            #
+            if main_id not in paths_index_dict:
+                # Add main_id and save
+                paths_index_dict[ main_id ] = path.join(
+                    ".",
+                    main_id,
+                    "paths.json",
+                )
+                
+                with open( paths_index_fp, 'w', ) as f:
+                    json.dump(
+                        paths_index_dict, f,
+                        indent = 2,
+                    )
+                #
+            #
+        #/if not path.isfile( { paths_index_fp } )/else
+        
+        paths_default_dict: dict[ str, str ]
+        if not path.isfile(
+            paths_default_fp := path.join(
+                settings_default_dir,
+                'paths.json',
+            )
+        ):
+            paths_default_dict = {
+                '__main_root__': path.relpath(
+                    main_root,
+                    start = settings_default_dir,
+                ),
+                # Relative to main_root
+                '__data_root_default__': path.join(
+                    "data",
+                    "default",
+                )
+            }
+            with open( paths_default_fp, 'w', ) as f:
+                json.dump(
+                    paths_default_dict, f,
+                    indent = 2
+                )
+            #
+        #/if not path.isfile( { paths_default_fp } )
+        else:
+            with open( paths_default_fp, 'w', ) as f:
+                paths_default_dict = json.load( f )
+            #
+        #/if not path.isfile( { paths_default_fp } )/else
+        
+        paths_self_dict: dict[ str, str ]
+        if not path.isfile(
+            paths_self_fp := path.join(
+                settings_self_dir,
+                "paths.json",
+            )
+        ):
+            paths_self_dict = {
+                '__data_root__': path.join(
+                    "data",
+                    main_id,
+                )
+            }
+            with open( paths_self_fp, 'w', ) as f:
+                json.dump(
+                    paths_self_dict, f,
+                    indent = 2,
+                )
+            #
+        #/if not path.isfile( { paths_self_fp } )
+        else:
+            with open( paths_self_fp ) as f:
+                paths_self_dict = json.load( f )
+            #
+        #/if not path.isfile( { paths_self_fp } )/else
+        
+        return cls(
+            main_id = main_id,
+            rng = rng,
+            tables = {
+                'paths': utilities.paths_df_from_dict(
+                    paths_default_dict
+                    | paths_self_dict
+                ),
+            },
+            verbose = verbose,
+        )
+    #/def init_default_with_main_id
+    
+    @classmethod
+    def load_with_main_id(
+        cls,
+        main_id: str,
+        paths_index_fp: str | None = None,
+        paths_dict: dict[ str, str ] | None = None,
+        rng: np.random.Generator | None = None,
+        verbose: int = 0,
+        ) -> Self:
+        """
+            Find tables['paths'] resolving the paths using utilities.get_paths_for_main_id
+        """
+        if paths_dict is None:
+            paths_dict = utilities.get_paths_for_main_id(
+                main_id = main_id,
+                paths_index_fp = paths_index_fp,
+            )
+        #
+        
+        return cls(
+            main_id = main_id,
+            rng = rng,
+            tables = {
+                'paths': utilities.paths_df_from_dict(
+                    paths_dict,
+                ),
+            },
+            verbose = verbose,
+        )
+    #/def load_with_main_id
+    
     def init_table(
         self: Self,
         df: pl.DataFrame,
@@ -69,6 +372,7 @@ class Web():
         ) -> None:
         """
             Adds a new table to `self.tables`. If the `cellId` is already present, the value must be `None`, so we do not overwrite anything.
+            
         """
         if cellId in self.tables:
             assert self.tables[ cellId ] is None
