@@ -130,6 +130,28 @@ class TaggedTableCheck( Protocol ):
 TaggedTableProcessDict: Type = dict[ str, TaggedTableProcess | TaggedTableCheck ]
 
 
+# -- Web
+
+from queue import Queue
+
+class WebProtocol( Protocol ):
+    """
+        Structural interface for the subset of Web attributes used by
+        WebReceiver and OutboxSender in web_transport.  Any Web subclass
+        satisfies this automatically.
+    """
+    inputIds: list[ str ]
+    inbox:    Queue
+    outbox:   Queue
+    tables:   dict[ str, pl.DataFrame | None ]
+
+    def notify( self ) -> None:
+        """Signal the web that a new item has been placed in inbox."""
+        ...
+    #/def notify
+#/class WebProtocol
+
+
 
 
 

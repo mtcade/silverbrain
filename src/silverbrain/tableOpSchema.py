@@ -323,11 +323,11 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
         )
     #/def from_dict
 
-    def to_polars(
+    def to_polars_tuple(
         self: Self
         ) -> tuple[
-            pl.DataFrame,
-            pl.DataFrame,
+            pl.DataFrame, # tableOp_schema
+            pl.DataFrame, # tableOp_effects
         ]:
         """
         Serialize all ops into two DataFrames.
@@ -356,7 +356,7 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
             pl.concat( list( all_schemas ), how = 'vertical' ),
             pl.concat( list( all_effects ), how = 'vertical' ),
         )
-    #/def to_polars
+    #/def to_polars_tuple
 #/class TableOpSchemaDict
 
 

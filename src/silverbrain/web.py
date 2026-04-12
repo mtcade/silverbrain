@@ -4,14 +4,14 @@
 #//
 #//  Created by Evan Mason on 3/11/26.
 
-from . import tableOps, types, utilities
+from . import tableOps, tableProcesses, types, utilities, web_transport
 
+import threading
 import polars as pl
 import numpy as np
 
 from typing import Self
-from queue import Queue
-
+from queue import Queue, Empty
 
 class Web():
     """
@@ -61,6 +61,12 @@ class Web():
         self.log = log or Queue()
         
         self.verbose = verbose
+
+        self._receivers:       list[ web_transport.WebReceiver ]  = []
+        self._outbox_senders:  list[ web_transport.OutboxSender ] = []
+        self._heartbeat:      threading.Event                   = threading.Event()
+        self._transport_stop: threading.Event                   = threading.Event()
+        self._heartbeat_thread: threading.Thread | None         = None
 
         return
     #/def __init__
@@ -365,6 +371,135 @@ class Web():
         )
     #/def load_with_main_id
     
+    def notify(self) -> None:
+        """Signal the heartbeat thread that inbox has a new item."""
+        self._heartbeat.set()
+    #/def notify
+
+    def bind(
+        self,
+        address: str,
+        sender: 'web_transport.WebSender',
+        context: 'zmq.Context | None' = None,
+    ) -> None:
+        """
+        Attach a ZMQ listener on address.  May be called multiple times before
+        start() to listen on several addresses simultaneously.
+
+        The first call also creates an OutboxSender monitoring self.outbox.
+        Use bind_outbox() to monitor additional queues (e.g. original outboxes
+        captured by inherited send_ops after combine_web).
+        """
+        self._receivers.append( web_transport.WebReceiver( self, address, context ) )
+        if not self._outbox_senders:
+            self._outbox_senders.append( web_transport.OutboxSender( self, sender ) )
+    #/def bind
+
+    def bind_outbox(
+        self,
+        outbox: 'Queue',
+        sender: 'web_transport.WebSender',
+    ) -> None:
+        """
+        Add an OutboxSender that monitors ``outbox`` instead of self.outbox.
+        Useful after combine_web, where inherited tableProcesses write to the
+        original webs' queues rather than the combined web's own outbox.
+        Routes are still read from self.tables['routes'].
+        """
+        self._outbox_senders.append(
+            web_transport.OutboxSender( self, sender, outbox=outbox )
+        )
+    #/def bind_outbox
+
+    def start( self ) -> None:
+        """Start all receivers, all outbox senders, and heartbeat processor thread."""
+        self._transport_stop.clear()
+        for receiver in self._receivers:
+            receiver.start()
+        for outbox_sender in self._outbox_senders:
+            outbox_sender.start()
+        self._heartbeat_thread = threading.Thread(
+            target = self._heartbeat_loop, daemon=True
+        )
+        self._heartbeat_thread.start()
+    #/def start
+
+    def stop( self ) -> None:
+        """Stop all transport threads."""
+        self._transport_stop.set()
+        self._heartbeat.set()
+        for receiver in self._receivers:
+            receiver.stop()
+        for outbox_sender in self._outbox_senders:
+            outbox_sender.stop()
+    #/def stop
+
+    def _heartbeat_loop( self ) -> None:
+        while not self._transport_stop.is_set():
+            self._heartbeat.wait( timeout=0.2 )
+            self._heartbeat.clear()
+            if self._transport_stop.is_set():
+                break
+            self.process_inbox_all()
+        # Drain any items that arrived before the stop signal was detected
+        self.process_inbox_all()
+    #/def _heartbeat_loop
+
+    def join(
+        self: Self,
+        timeout: float | None = None,
+        ) -> None:
+        """Block until all transport threads have exited. Call after stop()."""
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join( timeout=timeout )
+        #
+        for receiver in self._receivers:
+            if receiver._thread is not None:
+                receiver._thread.join( timeout=timeout )
+        #
+        for outbox_sender in self._outbox_senders:
+            if outbox_sender._thread is not None:
+                outbox_sender._thread.join( timeout=timeout )
+        #
+    #/def join
+
+    def absorb_back(
+        self: Self,
+        sub_web: 'Web',
+        ) -> None:
+        """
+        Reverse a partition_out: swap the real processes from ``sub_web`` back
+        into this web and remove the routing entries for ``sub_web``.
+
+        Stop ``sub_web`` before calling this; once absorbed its threads are no
+        longer needed:
+
+            sub_web.stop()
+            sub_web.join()
+            web.absorb_back( sub_web )
+
+        No tableOps merge is performed — ``partition_out`` already copied
+        ``web.tableOps`` in full, so the re-installed processes resolve against
+        the existing tableOps without any additions.
+        """
+        for op_id in sub_web.inputIds:
+            if op_id not in sub_web.tableProcesses:
+                raise ValueError(
+                    "op_id '{}' in sub_web.inputIds but not in sub_web.tableProcesses".format(
+                        op_id
+                    )
+                )
+            self.tableProcesses[ op_id ] = sub_web.tableProcesses[ op_id ]
+        #
+
+        routes = self.tables.get( 'routes' )
+        if routes is not None:
+            self.tables[ 'routes' ] = routes.filter(
+                pl.col( 'web_id' ) != sub_web.main_id
+            )
+        #/if routes is not None
+    #/def absorb_back
+
     def init_table(
         self: Self,
         df: pl.DataFrame,
@@ -537,9 +672,81 @@ class Web():
             verbose_prefix = verbose_prefix,
         )
     #/def run_id
-    
-    
-    
+
+    def run_df(
+        self: Self,
+        df: pl.DataFrame,
+        op_id: str,
+        allow_new: bool = False,
+        verbose: int = 0,
+        verbose_prefix: str = "",
+        ) -> None:
+        top_row    = df.filter( pl.col( 'op_id' ) == op_id ).to_dicts()[ 0 ]
+        top_source = top_row[ 'source' ]
+        top_target = top_row[ 'target' ]
+        if not allow_new:
+            if not all( tid in self.tables for tid in top_target ):
+                raise ValueError( "Bad target={}".format( top_target ) )
+        dfs = tuple( self.tables[ tid ] for tid in top_source )
+        result = tableProcesses.run_from_df(
+            df             = df,
+            op_id          = op_id,
+            dfs            = dfs,
+            tableOps       = self.tableOps,
+            verbose        = verbose,
+            verbose_prefix = verbose_prefix,
+        )
+        self.tables |= dict( zip( top_target, result ) )
+        return
+    #/def run_df
+
+    def process_inbox_once(
+        self,
+        allow_new: bool = False,
+        verbose: int = 0,
+        verbose_prefix: str = "",
+    ) -> bool:
+        """
+            Consume one item from inbox and dispatch it to the matching tableProcess.
+            Items are (op_id, dfs) tuples placed there by WebReceiver.
+            Returns True if an item was processed, False if inbox was empty.
+        """
+        try:
+            item = self.inbox.get_nowait()
+        except Empty:
+            return False
+        op_id, dfs = item
+        self.put(
+            dfs = dfs,
+            taggedTableProcess = self.tableProcesses[ op_id ],
+            allow_new = allow_new,
+            verbose = verbose,
+            verbose_prefix = verbose_prefix,
+        )
+        return True
+    #/def process_inbox_once
+
+    def process_inbox_all(
+        self,
+        allow_new: bool = False,
+        verbose: int = 0,
+        verbose_prefix: str = "",
+    ) -> int:
+        """
+            Consume all pending inbox items. Returns count processed.
+        """
+        count = 0
+        while self.process_inbox_once(
+            allow_new = allow_new,
+            verbose = verbose,
+            verbose_prefix = verbose_prefix,
+        ):
+            count += 1
+        return count
+    #/def process_inbox_all
+
+
+
     # -- Web Graph Analysis
     
     def tableProcessSignature(

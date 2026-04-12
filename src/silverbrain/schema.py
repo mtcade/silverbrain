@@ -29,6 +29,10 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'fp':               pl.Utf8,
     'isfile':           pl.Boolean,
     'isdir':            pl.Boolean,
+    # routes / inter-web transport
+    'web_id':           pl.Utf8,
+    'address':          pl.Utf8,
+    'topic':            pl.Utf8,
     # tables schema
     'table_id':         pl.Utf8,
     # effects df
@@ -38,6 +42,19 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'path_column':      pl.Utf8,
     'output':           pl.Int32,
     'format':           pl.Utf8,
+    # table_processes serialization
+    'parent_op_id':     pl.Utf8,
+    'source':           pl.List( pl.Utf8 ),
+    'target':           pl.List( pl.Utf8 ),
+    'op':               pl.Utf8,
+    'term_ids':         pl.List( pl.Utf8 ),
+    'condition':        pl.Utf8,
+    'process':          pl.Utf8,
+    'max_iter':         pl.Int64,
+    'count':            pl.Int64,
+    'ifs':              pl.List( pl.Utf8 ),
+    'thens':            pl.List( pl.Utf8 ),
+    'otherwise':        pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
@@ -83,5 +100,15 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     )),
     'paths': cannonical_schema_for_keys((
         'key', 'fp', 'isfile', 'isdir',
+    )),
+    'routes': cannonical_schema_for_keys((
+        'web_id', 'op_id', 'address', 'topic',
+    )),
+    'table_processes': cannonical_schema_for_keys((
+        'op_id', 'parent_op_id', 'type',
+        'source', 'target', 'op',
+        'term_ids', 'condition', 'process',
+        'max_iter', 'count',
+        'ifs', 'thens', 'otherwise',
     )),
 }

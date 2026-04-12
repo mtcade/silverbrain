@@ -11,6 +11,7 @@ dependencies = [
     "polars >=1.32, <2",
     "numpy>=1.26.0",
     "pyarrow",
+    "pyzmq>=25",
     "uuid7",
 ]
 classifiers = [
@@ -27,5 +28,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
 
 [tool.uv.sources]

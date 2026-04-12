@@ -14,6 +14,135 @@ import polars as pl
 from dataclasses import dataclass
 from typing import Self, Sequence, Type
 
+# -- Serialization helper
+
+def _make_process_row( **kwargs ) -> pl.DataFrame:
+    """
+    Build a single-row DataFrame with the 'table_processes' schema.
+    Any column not supplied in kwargs is set to null.
+    """
+    defaults: dict = {
+        'op_id':        None,
+        'parent_op_id': None,
+        'type':         None,
+        'source':       None,
+        'target':       None,
+        'op':           None,
+        'term_ids':     None,
+        'condition':    None,
+        'process':      None,
+        'max_iter':     None,
+        'count':        None,
+        'ifs':          None,
+        'thens':        None,
+        'otherwise':    None,
+    }
+    defaults.update( kwargs )
+    return pl.DataFrame(
+        { k: [ v ] for k, v in defaults.items() },
+        schema = table_schemas[ 'table_processes' ],
+    )
+#/def _make_process_row
+
+# -- DataFrame interpreter helpers
+
+def _apply_process(
+    rows: dict,
+    op_id: str,
+    tables: dict[ str, 'pl.DataFrame' ],
+    tableOps: 'types.TableProcessDict',
+    verbose: int = 0,
+    verbose_prefix: str = '',
+    ) -> 'tuple[ pl.DataFrame, ... ]':
+    row = rows[ op_id ]
+    t   = row[ 'type' ]
+
+    if t == 'TableProcessRef':
+        return tableOps[ row[ 'op' ] ](
+            dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
+            verbose        = verbose,
+            verbose_prefix = verbose_prefix,
+        )
+    #
+    elif t == 'TableProcessSequence':
+        local = dict( tables )
+        for term_id in row[ 'term_ids' ]:
+            result = _apply_process( rows, term_id, local, tableOps, verbose, verbose_prefix + "  " )
+            local |= dict( zip( rows[ term_id ][ 'target' ], result ) )
+        #/for term_id
+        return tuple( local[ tid ] for tid in row[ 'target' ] )
+    #
+    elif t == 'TableProcessWhile':
+        local    = dict( tables )
+        max_iter = row[ 'max_iter' ] if row[ 'max_iter' ] is not None else 100
+        iterations = 0
+        while _apply_check( rows, row[ 'condition' ], local, tableOps, verbose, verbose_prefix + "  " ):
+            if iterations >= max_iter:
+                raise Exception( "reached max_iter={}".format( max_iter ) )
+            result = _apply_process( rows, row[ 'process' ], local, tableOps, verbose, verbose_prefix + "  " )
+            local |= dict( zip( rows[ row[ 'process' ] ][ 'target' ], result ) )
+            iterations += 1
+        #/while
+        return tuple( local[ tid ] for tid in row[ 'target' ] )
+    #
+    elif t == 'TableProcessCount':
+        local = dict( tables )
+        for _ in range( row[ 'count' ] ):
+            result = _apply_process( rows, row[ 'process' ], local, tableOps, verbose, verbose_prefix + "  " )
+            local |= dict( zip( rows[ row[ 'process' ] ][ 'target' ], result ) )
+        #/for
+        return tuple( local[ tid ] for tid in row[ 'target' ] )
+    #
+    elif t == 'TableProcessBranch':
+        local = dict( tables )
+        for if_id, then_id in zip( row[ 'ifs' ], row[ 'thens' ] ):
+            if _apply_check( rows, if_id, local, tableOps, verbose, verbose_prefix + "  " ):
+                result = _apply_process( rows, then_id, local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ then_id ][ 'target' ], result ) )
+                break
+            #/if
+        else:
+            if row[ 'otherwise' ] is not None:
+                result = _apply_process( rows, row[ 'otherwise' ], local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ row[ 'otherwise' ] ][ 'target' ], result ) )
+        #/for
+        return tuple( local[ tid ] for tid in row[ 'target' ] )
+    #
+    else:
+        raise ValueError( "Unknown type: {}".format( t ) )
+    #
+#/def _apply_process
+
+def _apply_check(
+    rows: dict,
+    op_id: str,
+    tables: dict[ str, 'pl.DataFrame' ],
+    tableOps: 'types.TableProcessDict',
+    verbose: int = 0,
+    verbose_prefix: str = '',
+    ) -> bool:
+    row = rows[ op_id ]
+    return tableOps[ row[ 'op' ] ](
+        dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
+        verbose        = verbose,
+        verbose_prefix = verbose_prefix,
+    )
+#/def _apply_check
+
+def run_from_df(
+    df: 'pl.DataFrame',
+    op_id: str,
+    dfs: 'tuple[ pl.DataFrame, ... ]',
+    tableOps: 'types.TableProcessDict',
+    verbose: int = 0,
+    verbose_prefix: str = '',
+    ) -> 'tuple[ pl.DataFrame, ... ]':
+    rows     = { r[ 'op_id' ]: r for r in df.to_dicts() }
+    top_row  = rows[ op_id ]
+    tables   = dict( zip( top_row[ 'source' ], dfs ) )
+    return _apply_process( rows, op_id, tables, tableOps, verbose, verbose_prefix )
+#/def run_from_df
+
 # -- Process Ref; Atomic types.TaggedTableProcess
 
 @dataclass
@@ -93,6 +222,20 @@ class TableProcessRef():
             schema = table_schemas['op_bindings'],
         )
     #/def get_op_bindings
+
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        return _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableProcessRef',
+            source       = list( self.source ),
+            target       = list( self.target ),
+            op           = self.op if isinstance( self.op, str ) else None,
+        )
+    #/def as_polars
 #/class TableProcessRef
 
 # -- Process Ref Shortcuts
@@ -202,7 +345,39 @@ class TableCheckRef():
             schema = table_schemas['op_bindings'],
         )
     #/def get_op_bindings
+
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        return _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableCheckRef',
+            source       = list( self.source ),
+            target       = [],
+            op           = self.op if isinstance( self.op, str ) else None,
+        )
+    #/def as_polars
 #/class TableCheckRef
+
+def always_true( opId: str = '_always_true' ) -> TableCheckRef:
+    """Return a TableCheckRef whose check always returns True."""
+    return TableCheckRef(
+        source = [],
+        op     = lambda dfs, verbose=0, verbose_prefix='': True,
+        opId   = opId,
+    )
+#/def always_true
+
+def always_false( opId: str = '_always_false' ) -> TableCheckRef:
+    """Return a TableCheckRef whose check always returns False."""
+    return TableCheckRef(
+        source = [],
+        op     = lambda dfs, verbose=0, verbose_prefix='': False,
+        opId   = opId,
+    )
+#/def always_false
 
 @dataclass
 class TableProcessSequence():
@@ -277,6 +452,24 @@ class TableProcessSequence():
             how = 'vertical',
         )
     #/def get_op_bindings
+
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        self_row = _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableProcessSequence',
+            source       = list( self.source ),
+            target       = list( self.target ),
+            term_ids     = [ t.opId for t in self.terms ],
+        )
+        return pl.concat(
+            [ self_row ] + [ t.as_polars( self.opId ) for t in self.terms ],
+            how = 'vertical',
+        )
+    #/def as_polars
 #/class TableProcessSequence
 
 @dataclass
@@ -363,6 +556,30 @@ class TableProcessWhile():
             how = 'vertical',
         )
     #/def get_op_bindings
+
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        self_row = _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableProcessWhile',
+            source       = list( self.source ),
+            target       = list( self.target ),
+            condition    = self.condition.opId,
+            process      = self.process.opId,
+            max_iter     = self.maxIter,
+        )
+        return pl.concat(
+            [
+                self_row,
+                self.condition.as_polars( self.opId ),
+                self.process.as_polars( self.opId ),
+            ],
+            how = 'vertical',
+        )
+    #/def as_polars
 #/class TableProcessWhile
 
 @dataclass
@@ -424,16 +641,38 @@ class TableProcessCount():
     def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
         return self.process.get_op_bindings( process_id )
     #/def get_op_bindings
+
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        self_row = _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableProcessCount',
+            source       = list( self.source ),
+            target       = list( self.target ),
+            process      = self.process.opId,
+            count        = self.count,
+        )
+        return pl.concat(
+            [
+                self_row,
+                self.process.as_polars( self.opId ),
+            ],
+            how = 'vertical',
+        )
+    #/def as_polars
 #/class TableProcessCount
 
 @dataclass
 class TableProcessBranch():
+    opId: str
     source: Sequence[ str ]
     target: Sequence[ str ]
-    ifs: Sequence[ types.TaggedTableCheck | bool ]
+    ifs: Sequence[ types.TaggedTableCheck ]
     thens: Sequence[ types.TaggedTableProcess ]
-    otherwise: types.TaggedTableProcess | None
-    opId: str
+    otherwise: types.TaggedTableProcess | None = None
 
     def __call__(
         self: Self,
@@ -449,7 +688,6 @@ class TableProcessBranch():
 
         j: int = 0
 
-        check: bool
         while j < len( self.ifs ):
             if verbose > 0:
                 print(
@@ -458,20 +696,16 @@ class TableProcessBranch():
                     )
                 )
             #
-            if isinstance( self.ifs[j], bool ):
-                check = self.ifs[j]
-            #
-            else:
-                check = self.ifs[j](
-                    dfs = tuple(
-                        tables[ tableId ]
-                        for tableId in self.ifs[j].source
-                    ),
-                    tableOps = tableOps,
-                    verbose = verbose,
-                    verbose_prefix = verbose_prefix + "  ",
-                )
-            #
+
+            check: bool = self.ifs[j](
+                dfs = tuple(
+                    tables[ tableId ]
+                    for tableId in self.ifs[j].source
+                ),
+                tableOps = tableOps,
+                verbose = verbose,
+                verbose_prefix = verbose_prefix + "  ",
+            )
 
             if check:
                 result: tuple[ pl.DataFrame,... ] = self.thens[j](
@@ -533,9 +767,7 @@ class TableProcessBranch():
         )
 
         for term in self.ifs:
-            if not isinstance( term, bool ):
-                signatureCollector |= term.get_signatureCollector()
-            #
+            signatureCollector |= term.get_signatureCollector()
         #
 
         for term in self.thens:
@@ -548,7 +780,7 @@ class TableProcessBranch():
     def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
         frames = [
             term.get_op_bindings( process_id )
-            for term in self.ifs if not isinstance( term, bool )
+            for term in self.ifs
         ] + [
             term.get_op_bindings( process_id )
             for term in self.thens
@@ -558,5 +790,29 @@ class TableProcessBranch():
         )
         return pl.concat( frames, how = 'vertical' )
     #/def get_op_bindings
-#/class TableProcessBranch
 
+    def as_polars(
+        self: Self,
+        parent_op_id: str | None = None,
+        ) -> pl.DataFrame:
+        self_row = _make_process_row(
+            op_id        = self.opId,
+            parent_op_id = parent_op_id,
+            type         = 'TableProcessBranch',
+            source       = list( self.source ),
+            target       = list( self.target ),
+            ifs          = [ t.opId for t in self.ifs ],
+            thens        = [ t.opId for t in self.thens ],
+            otherwise    = self.otherwise.opId if self.otherwise is not None else None,
+        )
+        child_frames = [
+            t.as_polars( self.opId ) for t in self.ifs
+        ] + [
+            t.as_polars( self.opId ) for t in self.thens
+        ] + (
+            [ self.otherwise.as_polars( self.opId ) ]
+            if self.otherwise is not None else []
+        )
+        return pl.concat( [ self_row ] + child_frames, how = 'vertical' )
+    #/def as_polars
+#/class TableProcessBranch
