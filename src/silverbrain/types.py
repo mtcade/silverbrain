@@ -97,7 +97,7 @@ class TaggedTableProcess( Protocol ):
         ...
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         ...
     #/def get_op_bindings
 #/class TaggedTableProcess
@@ -122,7 +122,7 @@ class TaggedTableCheck( Protocol ):
         ...
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         ...
     #/def get_op_bindings
 #/class TaggedTableCheck

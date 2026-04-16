@@ -396,11 +396,24 @@ def combine_web(
     return Web(
         main_id        = web_id,
         rng            = web_a.rng,
-        inputIds       = list( web_a.inputIds ) + list( web_b.inputIds ),
+        inputIds       = list(
+            web_a.inputIds
+        ) + list(
+            web_b.inputIds
+        ),
         tables         = tables_combined,
-        tableOps       = { **web_a.tableOps,       **web_b.tableOps       },
-        tableProcesses = { **web_a.tableProcesses, **web_b.tableProcesses },
-        verbose        = max( web_a.verbose, web_b.verbose ),
+        tableOps       = {
+            **web_a.tableOps,
+            **web_b.tableOps,
+        },
+        tableProcesses = {
+            **web_a.tableProcesses
+            **web_b.tableProcesses,
+        },
+        verbose        = max(
+            web_a.verbose,
+            web_b.verbose,
+        ),
     )
 #/def combine_web
 

@@ -13,10 +13,10 @@ from .polarsDataTypeStrings import dtype_to_str
 
 cannonical_schema: dict[ str, pl.DataType ] = {
     # op bindings
-    'process_id':       pl.Utf8,
+    'root_op_id':       pl.Utf8,            # op_id of the root process node (parent_id = null) that owns this op
     'op_id':            pl.Utf8,
-    'input_tables':     pl.List( pl.Utf8 ),
-    'output_tables':    pl.List( pl.Utf8 ),
+    'source':           pl.List( pl.Utf8 ),
+    'target':           pl.List( pl.Utf8 ),
     # schemas df
     'direction':        pl.Utf8,
     'index':            pl.UInt32,
@@ -42,19 +42,32 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'path_column':      pl.Utf8,
     'output':           pl.Int32,
     'format':           pl.Utf8,
+} | {
     # table_processes serialization
-    'parent_op_id':     pl.Utf8,
-    'source':           pl.List( pl.Utf8 ),
-    'target':           pl.List( pl.Utf8 ),
-    'op':               pl.Utf8,
-    'term_ids':         pl.List( pl.Utf8 ),
-    'condition':        pl.Utf8,
-    'process':          pl.Utf8,
-    'max_iter':         pl.Int64,
-    'count':            pl.Int64,
-    'ifs':              pl.List( pl.Utf8 ),
-    'thens':            pl.List( pl.Utf8 ),
-    'otherwise':        pl.Utf8,
+    # node_id    — unique signed-integer row ID; all cross-references use this, not op_id
+    # op_id      — human-readable node name; for process rows: unique within a single tree,
+    #              used for top-level lookup only; for 'Op' leaf rows: the tableOps dispatch key
+    # parent_id  — node_id of the enclosing parent row; null for root nodes
+    # type       — dispatch tag: TableProcessRef | TableCheckRef | TableProcessSequence |
+    #                TableProcessWhile | TableProcessCount | TableProcessBranch | Op
+    # source     — ordered input table keys read from local tables dict before this node runs
+    # target     — ordered output table keys written to local tables dict after this node runs
+    # term_ids   — for Ref/Check: [node_id of Op leaf]; for Sequence: node_ids of child nodes in order;
+    #              for While/Count: [node_id of the inner process node];
+    #              for Branch: [node_id of the fallback process], or null if no fallback
+    # condition  — (While/Branch) node_id of the condition TableCheckRef
+    # count      — (While) max iteration cap; (Count) exact iteration count
+    # ifs        — (Branch) node_ids of condition check nodes, parallel with thens
+    # thens      — (Branch) node_ids of branch-arm process nodes
+    'node_id':      pl.Int64,
+    'parent_id':    pl.Int64,
+    #'source':       pl.List( pl.Utf8 ), from op bindings
+    #'target':       pl.List( pl.Utf8 ), from op bindings
+    'term_ids':     pl.List( pl.Int64 ),
+    'condition':    pl.Int64,
+    'count':        pl.Int64,
+    'ifs':          pl.List( pl.Int64 ),
+    'thens':        pl.List( pl.Int64 ),
 }
 
 def cannonical_schema_for_keys(
@@ -82,8 +95,8 @@ def table_schemas_to_df(
 
 table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     'op_bindings': cannonical_schema_for_keys((
-        'process_id', 'op_id', 'input_tables',
-        'output_tables',
+        'root_op_id', 'op_id', 'source',
+        'target',
     )),
     'tableOp_schema':  cannonical_schema_for_keys((
         'op_id', 'direction', 'index',
@@ -105,10 +118,9 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
         'web_id', 'op_id', 'address', 'topic',
     )),
     'table_processes': cannonical_schema_for_keys((
-        'op_id', 'parent_op_id', 'type',
-        'source', 'target', 'op',
-        'term_ids', 'condition', 'process',
-        'max_iter', 'count',
-        'ifs', 'thens', 'otherwise',
+        'node_id', 'op_id', 'parent_id', 'type',
+        'source', 'target',
+        'term_ids', 'condition', 'count',
+        'ifs', 'thens',
     )),
 }

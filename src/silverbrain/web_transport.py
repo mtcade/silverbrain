@@ -17,7 +17,6 @@ import zmq
 
 from .types import WebProtocol
 
-
 # -- Serialization
 
 def pack_envelope(

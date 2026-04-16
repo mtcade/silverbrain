@@ -253,20 +253,25 @@ class TableOpSchema():
     outputs: list[ OutputSchema ]
     effects: list[ Effect ] = field( default_factory = list )
 
-    def to_polars( self: Self, op_id: str ) -> tuple[ pl.DataFrame, pl.DataFrame ]:
-        schemas_frames = [
+    def to_polars_schema( self: Self, op_id: str ) -> pl.DataFrame:
+        frames = [
             inp.to_polars( op_id, i ) for i, inp in enumerate( self.inputs )
         ] + [
             out.to_polars( op_id, i ) for i, out in enumerate( self.outputs )
         ]
-        effects_frames = [
-            eff.to_polars( op_id, i ) for i, eff in enumerate( self.effects )
-        ]
+        return pl.concat( frames, how = 'vertical' )
+    #/def to_polars_schema
+
+    def to_polars_effects( self: Self, op_id: str ) -> pl.DataFrame:
+        frames = [ eff.to_polars( op_id, i ) for i, eff in enumerate( self.effects ) ]
         return (
-            pl.concat( schemas_frames, how = 'vertical' ),
-            pl.concat( effects_frames, how = 'vertical' ) if effects_frames
-                else pl.DataFrame( schema = table_schemas['tableOp_effects'] ),
+            pl.concat( frames, how = 'vertical' ) if frames
+            else pl.DataFrame( schema = table_schemas['tableOp_effects'] )
         )
+    #/def to_polars_effects
+
+    def to_polars( self: Self, op_id: str ) -> tuple[ pl.DataFrame, pl.DataFrame ]:
+        return ( self.to_polars_schema( op_id ), self.to_polars_effects( op_id ) )
     #/def to_polars
 
     def to_dict( self: Self ) -> dict:
@@ -323,6 +328,26 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
         )
     #/def from_dict
 
+    def to_polars_schema( self: Self ) -> pl.DataFrame:
+        """Return tableOp_schema DataFrame (one row per input/output across all ops)."""
+        if not self.data:
+            return pl.DataFrame( schema = table_schemas['tableOp_schema'] )
+        return pl.concat(
+            [ op.to_polars_schema( op_id ) for op_id, op in self.data.items() ],
+            how = 'vertical',
+        )
+    #/def to_polars_schema
+
+    def to_polars_effects( self: Self ) -> pl.DataFrame:
+        """Return tableOp_effects DataFrame (one row per effect across all ops)."""
+        if not self.data:
+            return pl.DataFrame( schema = table_schemas['tableOp_effects'] )
+        return pl.concat(
+            [ op.to_polars_effects( op_id ) for op_id, op in self.data.items() ],
+            how = 'vertical',
+        )
+    #/def to_polars_effects
+
     def to_polars_tuple(
         self: Self
         ) -> tuple[
@@ -336,26 +361,7 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
             - tableOp_schema: one row per input/output (schema table_schemas['tableOp_schema'])
             - tableOp_effects: one row per effect (schema table_schemas['tableOp_effects'])
         """
-        if not self.data:
-            return (
-                pl.DataFrame(
-                    schema = table_schemas['tableOp_schema']
-                ),
-                pl.DataFrame(
-                    schema = table_schemas['tableOp_effects']
-                ),
-            )
-        #
-        all_schemas, all_effects = zip(
-            *(
-                op_schema.to_polars( op_id )
-                    for op_id, op_schema in self.data.items()
-            )
-        )
-        return (
-            pl.concat( list( all_schemas ), how = 'vertical' ),
-            pl.concat( list( all_effects ), how = 'vertical' ),
-        )
+        return ( self.to_polars_schema(), self.to_polars_effects() )
     #/def to_polars_tuple
 #/class TableOpSchemaDict
 

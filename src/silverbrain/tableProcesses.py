@@ -16,31 +16,34 @@ from typing import Self, Sequence, Type
 
 # -- Serialization helper
 
-def _make_process_row( **kwargs ) -> pl.DataFrame:
+def _make_process_row( node_id: int, **kwargs ) -> pl.DataFrame:
     """
     Build a single-row DataFrame with the 'table_processes' schema.
     Any column not supplied in kwargs is set to null.
+    node_id is the unique integer row identifier for tree navigation.
     """
     defaults: dict = {
-        'op_id':        None,
-        'parent_op_id': None,
-        'type':         None,
-        'source':       None,
-        'target':       None,
-        'op':           None,
-        'term_ids':     None,
-        'condition':    None,
-        'process':      None,
-        'max_iter':     None,
-        'count':        None,
-        'ifs':          None,
-        'thens':        None,
-        'otherwise':    None,
+        'node_id': node_id,
+        'op_id':      None,
+        'parent_id':  None,
+        'type':       None,
+        'source':     None,
+        'target':     None,
+        'term_ids':   None,
+        'condition':  None,
+        'count':      None,
+        'ifs':        None,
+        'thens':      None,
     }
     defaults.update( kwargs )
     return pl.DataFrame(
-        { k: [ v ] for k, v in defaults.items() },
-        schema = table_schemas[ 'table_processes' ],
+        {
+            k: [ v ]
+            for k, v in defaults.items()
+        },
+        schema = table_schemas[
+            'table_processes'
+        ],
     )
 #/def _make_process_row
 
@@ -48,17 +51,18 @@ def _make_process_row( **kwargs ) -> pl.DataFrame:
 
 def _apply_process(
     rows: dict,
-    op_id: str,
+    pid: int,
     tables: dict[ str, 'pl.DataFrame' ],
     tableOps: 'types.TableProcessDict',
     verbose: int = 0,
     verbose_prefix: str = '',
     ) -> 'tuple[ pl.DataFrame, ... ]':
-    row = rows[ op_id ]
+    row = rows[ pid ]
     t   = row[ 'type' ]
 
     if t == 'TableProcessRef':
-        return tableOps[ row[ 'op' ] ](
+        op_row = rows[ row[ 'term_ids' ][ 0 ] ]
+        return tableOps[ op_row[ 'op_id' ] ](
             dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
             verbose        = verbose,
             verbose_prefix = verbose_prefix,
@@ -73,23 +77,25 @@ def _apply_process(
         return tuple( local[ tid ] for tid in row[ 'target' ] )
     #
     elif t == 'TableProcessWhile':
-        local    = dict( tables )
-        max_iter = row[ 'max_iter' ] if row[ 'max_iter' ] is not None else 100
+        local      = dict( tables )
+        proc_id    = row[ 'term_ids' ][ 0 ]
+        max_iter   = row[ 'count' ] if row[ 'count' ] is not None else 100
         iterations = 0
         while _apply_check( rows, row[ 'condition' ], local, tableOps, verbose, verbose_prefix + "  " ):
             if iterations >= max_iter:
                 raise Exception( "reached max_iter={}".format( max_iter ) )
-            result = _apply_process( rows, row[ 'process' ], local, tableOps, verbose, verbose_prefix + "  " )
-            local |= dict( zip( rows[ row[ 'process' ] ][ 'target' ], result ) )
+            result = _apply_process( rows, proc_id, local, tableOps, verbose, verbose_prefix + "  " )
+            local |= dict( zip( rows[ proc_id ][ 'target' ], result ) )
             iterations += 1
         #/while
         return tuple( local[ tid ] for tid in row[ 'target' ] )
     #
     elif t == 'TableProcessCount':
-        local = dict( tables )
+        local   = dict( tables )
+        proc_id = row[ 'term_ids' ][ 0 ]
         for _ in range( row[ 'count' ] ):
-            result = _apply_process( rows, row[ 'process' ], local, tableOps, verbose, verbose_prefix + "  " )
-            local |= dict( zip( rows[ row[ 'process' ] ][ 'target' ], result ) )
+            result = _apply_process( rows, proc_id, local, tableOps, verbose, verbose_prefix + "  " )
+            local |= dict( zip( rows[ proc_id ][ 'target' ], result ) )
         #/for
         return tuple( local[ tid ] for tid in row[ 'target' ] )
     #
@@ -102,9 +108,10 @@ def _apply_process(
                 break
             #/if
         else:
-            if row[ 'otherwise' ] is not None:
-                result = _apply_process( rows, row[ 'otherwise' ], local, tableOps, verbose, verbose_prefix + "  " )
-                local |= dict( zip( rows[ row[ 'otherwise' ] ][ 'target' ], result ) )
+            if row[ 'term_ids' ]:
+                otherwise_id = row[ 'term_ids' ][ 0 ]
+                result = _apply_process( rows, otherwise_id, local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ otherwise_id ][ 'target' ], result ) )
         #/for
         return tuple( local[ tid ] for tid in row[ 'target' ] )
     #
@@ -115,32 +122,60 @@ def _apply_process(
 
 def _apply_check(
     rows: dict,
-    op_id: str,
+    pid: int,
     tables: dict[ str, 'pl.DataFrame' ],
     tableOps: 'types.TableProcessDict',
     verbose: int = 0,
     verbose_prefix: str = '',
     ) -> bool:
-    row = rows[ op_id ]
-    return tableOps[ row[ 'op' ] ](
+    row    = rows[ pid ]
+    op_row = rows[ row[ 'term_ids' ][ 0 ] ]
+    return tableOps[ op_row[ 'op_id' ] ](
         dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
         verbose        = verbose,
         verbose_prefix = verbose_prefix,
     )
 #/def _apply_check
 
+def find_root_pid( df: 'pl.DataFrame', op_id: str ) -> int:
+    """Find the node_id of the root row with the given op_id (parent_id is null)."""
+    matches = df.filter(
+        ( pl.col( 'op_id' ) == op_id ) & pl.col( 'parent_id' ).is_null()
+    ).to_dicts()
+    if not matches:
+        raise KeyError( "No root process with op_id={!r}".format( op_id ) )
+    return matches[ 0 ][ 'node_id' ]
+#/def find_root_pid
+
+def reindex_process_df(
+    df: pl.DataFrame,
+    offset: int,
+) -> pl.DataFrame:
+    """Add offset to every node_id reference in df (for collision-free merge)."""
+    return df.with_columns(
+        [
+            pl.col( 'node_id' ) + offset,
+            pl.col( 'parent_id' ) + offset,
+            pl.col( 'term_ids' ).list.eval( pl.element() + offset ),
+            pl.col( 'condition' ) + offset,
+            pl.col( 'ifs' ).list.eval( pl.element() + offset ),
+            pl.col( 'thens' ).list.eval( pl.element() + offset ),
+        ]
+    )
+#/def reindex_process_df
+
 def run_from_df(
-    df: 'pl.DataFrame',
-    op_id: str,
-    dfs: 'tuple[ pl.DataFrame, ... ]',
-    tableOps: 'types.TableProcessDict',
+    df: pl.DataFrame,
+    root_pid: int,
+    dfs: tuple[ pl.DataFrame, ... ],
+    tableOps: types.TableProcessDict,
     verbose: int = 0,
     verbose_prefix: str = '',
-    ) -> 'tuple[ pl.DataFrame, ... ]':
-    rows     = { r[ 'op_id' ]: r for r in df.to_dicts() }
-    top_row  = rows[ op_id ]
+    ) -> tuple[ pl.DataFrame, ... ]:
+    rows     = { r[ 'node_id' ]: r for r in df.to_dicts() }
+    top_row  = rows[ root_pid ]
     tables   = dict( zip( top_row[ 'source' ], dfs ) )
-    return _apply_process( rows, op_id, tables, tableOps, verbose, verbose_prefix )
+    return _apply_process( rows, root_pid, tables, tableOps, verbose, verbose_prefix )
 #/def run_from_df
 
 # -- Process Ref; Atomic types.TaggedTableProcess
@@ -149,10 +184,11 @@ def run_from_df(
 class TableProcessRef():
     source: Sequence[ str ]
     target: Sequence[ str ]
-    op: str | types.TableProcess
+    terms: Sequence[ str | types.TableProcess ]
     opId: str
     """
-        Holds a reference to an atomic types.TableProcess. All together acts as an atomic types.TaggedTableProcess
+        Holds a reference to an atomic types.TableProcess. All together acts as an atomic types.TaggedTableProcess.
+        terms is a single-element list: [op_key_string] or [callable].
     """
     def __call__(
         self: Self,
@@ -161,15 +197,16 @@ class TableProcessRef():
         verbose: int = 0,
         verbose_prefix: str = '',
         ) -> dict[ str, pl.DataFrame ]:
-        
+
         tableProcess: types.TableProcess
-        if isinstance( self.op, str ):
-            tableProcess = tableOps[ self.op ]
+        op = self.terms[ 0 ]
+        if isinstance( op, str ):
+            tableProcess = tableOps[ op ]
         #
         else:
-            tableProcess = self.op
+            tableProcess = op
         #
-        
+
         if verbose > 0:
             print(
                 verbose_prefix + self.opId
@@ -178,19 +215,19 @@ class TableProcessRef():
                 verbose_prefix + "  {}".format( self.source )
             )
         #/if verbose > 0
-        
+
         result: tuple[ pl.DataFrame,... ] = tableProcess(
             dfs = dfs,
             verbose = verbose,
             verbose_prefix = verbose_prefix + "    "
         )
-        
+
         if verbose > 0:
             print(
                 verbose_prefix + " >{}".format( self.target )
             )
         #
-        
+
         if ( resultCount:= len( result ) ) != len( self.target ):
             raise ValueError(
                 "Expected {} result tables, got {}".format(
@@ -198,10 +235,10 @@ class TableProcessRef():
                 )
             )
         #/if len( targetTables ) != len( processRef.target )
-            
+
         return result
     #/def __call__
-    
+
     def get_signatureCollector(
         self: Self,
         ) -> types.SignatureCollector:
@@ -211,13 +248,13 @@ class TableProcessRef():
         )
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         return pl.DataFrame(
             [{
-                'process_id':    process_id,
+                'root_op_id':  op_id,
                 'op_id':         self.opId,
-                'input_tables':  list( self.source ),
-                'output_tables': list( self.target ),
+                'source':  list( self.source ),
+                'target': list( self.target ),
             }],
             schema = table_schemas['op_bindings'],
         )
@@ -225,16 +262,29 @@ class TableProcessRef():
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
-        return _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableProcessRef',
-            source       = list( self.source ),
-            target       = list( self.target ),
-            op           = self.op if isinstance( self.op, str ) else None,
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id    = start_id
+        op       = self.terms[ 0 ]
+        child_id = start_id + 1
+        self_row = _make_process_row(
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableProcessRef',
+            source     = list( self.source ),
+            target     = list( self.target ),
+            term_ids   = [ child_id ],
         )
+        child_row = _make_process_row(
+            node_id = child_id,
+            parent_id  = my_id,
+            type       = 'Op',
+            op_id      = op if isinstance( op, str ) else None,
+        )
+        return pl.concat( [ self_row, child_row ], how = 'vertical' ), start_id + 2
     #/def as_polars
 #/class TableProcessRef
 
@@ -251,12 +301,12 @@ def get(
     if isinstance( target, str ):
         target = ( target, )
     #
-    
+
     return TableProcessRef(
         source = source,
         target = target,
-        op = SimpleGetOp(),
-        opId = opId,
+        terms  = [ SimpleGetOp() ],
+        opId   = opId,
     )
 #/def get
 
@@ -272,26 +322,25 @@ def transform(
     if isinstance( target, str ):
         target = ( target, )
     #
-    
+
     return TableProcessRef(
         source = source,
         target = target,
-        op = TransformOp(
-            lam = lam,
-        ),
-        opId = opId,
+        terms  = [ TransformOp( lam = lam ) ],
+        opId   = opId,
     )
 #/def transform
 
 @dataclass
 class TableCheckRef():
     """
-        Used mostly for `TableProcessWhile`. `TableProcessBranch`
+        Used mostly for `TableProcessWhile`. `TableProcessBranch`.
+        terms is a single-element list: [op_key_string] or [callable].
     """
     source: Sequence[ str ]
-    op: types.TableCheck | str
+    terms: Sequence[ types.TableCheck | str ]
     opId: str
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -299,21 +348,22 @@ class TableCheckRef():
         verbose: int = 0,
         verbose_prefix: str = '',
         ) -> bool:
-        
+
         tableCheck: types.TableCheck
-        if isinstance( self.op, str ):
-            tableCheck = tableOps[ self.op ]
+        op = self.terms[ 0 ]
+        if isinstance( op, str ):
+            tableCheck = tableOps[ op ]
         #
         else:
-            tableCheck = self.op
+            tableCheck = op
         #
-        
+
         check: bool = tableCheck(
             dfs,
             verbose = verbose,
             verbose_prefix = verbose_prefix,
         )
-        
+
         if verbose > 0:
             print(
                 verbose_prefix + self.opId + ': {}'.format(
@@ -321,10 +371,10 @@ class TableCheckRef():
                 )
             )
         #
-        
+
         return check
     #/def __call__
-    
+
     def get_signatureCollector(
         self: Self,
         ) -> types.SignatureCollector:
@@ -334,13 +384,13 @@ class TableCheckRef():
         )
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         return pl.DataFrame(
             [{
-                'process_id':    process_id,
+                'root_op_id':  op_id,
                 'op_id':         self.opId,
-                'input_tables':  list( self.source ),
-                'output_tables': [],
+                'source':  list( self.source ),
+                'target': [],
             }],
             schema = table_schemas['op_bindings'],
         )
@@ -348,16 +398,29 @@ class TableCheckRef():
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
-        return _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableCheckRef',
-            source       = list( self.source ),
-            target       = [],
-            op           = self.op if isinstance( self.op, str ) else None,
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id    = start_id
+        op       = self.terms[ 0 ]
+        child_id = start_id + 1
+        self_row = _make_process_row(
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableCheckRef',
+            source     = list( self.source ),
+            target     = [],
+            term_ids   = [ child_id ],
         )
+        child_row = _make_process_row(
+            node_id = child_id,
+            parent_id  = my_id,
+            type       = 'Op',
+            op_id      = op if isinstance( op, str ) else None,
+        )
+        return pl.concat( [ self_row, child_row ], how = 'vertical' ), start_id + 2
     #/def as_polars
 #/class TableCheckRef
 
@@ -365,7 +428,7 @@ def always_true( opId: str = '_always_true' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns True."""
     return TableCheckRef(
         source = [],
-        op     = lambda dfs, verbose=0, verbose_prefix='': True,
+        terms  = [ lambda dfs, verbose=0, verbose_prefix='': True ],
         opId   = opId,
     )
 #/def always_true
@@ -374,7 +437,7 @@ def always_false( opId: str = '_always_false' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns False."""
     return TableCheckRef(
         source = [],
-        op     = lambda dfs, verbose=0, verbose_prefix='': False,
+        terms  = [ lambda dfs, verbose=0, verbose_prefix='': False ],
         opId   = opId,
     )
 #/def always_false
@@ -385,7 +448,7 @@ class TableProcessSequence():
     target: Sequence[ str ]
     terms: Sequence[ types.TaggedTableProcess ]
     opId: str
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -397,7 +460,7 @@ class TableProcessSequence():
         tables: dict[ str, pl.DataFrame ] = dict(
             zip( self.source, dfs )
         )
-        
+
         taggedProcess: types.TaggedTableProcess
         result: tuple[ pl.DataFrame,... ]
         for j in range( len( self.terms ) ):
@@ -409,7 +472,7 @@ class TableProcessSequence():
                     )
                 )
             #
-            
+
             result = taggedProcess(
                 dfs = tuple(
                     tables[ tableId ]
@@ -419,7 +482,7 @@ class TableProcessSequence():
                 verbose = verbose,
                 verbose_prefix = verbose_prefix + "  ",
             )
-            
+
             tables |= dict(
                 zip(
                     taggedProcess.target,
@@ -427,13 +490,13 @@ class TableProcessSequence():
                 )
             )
         #/for j in range( len( self.terms ) )
-        
+
         return tuple(
             tables[ targetId ]
             for targetId in self.target
         )
     #/def __call__
-    
+
     def get_signatureCollector(
         self: Self,
         ) -> types.SignatureCollector:
@@ -446,29 +509,39 @@ class TableProcessSequence():
         return signatureCollector
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         return pl.concat(
-            [ term.get_op_bindings( process_id ) for term in self.terms ],
+            [ term.get_op_bindings( op_id ) for term in self.terms ],
             how = 'vertical',
         )
     #/def get_op_bindings
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id   = start_id
+        next_id = start_id + 1
+        frames  = []
+        term_ids = []
+        for term in self.terms:
+            term_id = next_id
+            term_df, next_id = term.as_polars( parent_id = my_id, start_id = term_id )
+            term_ids.append( term_id )
+            frames.append( term_df )
+        #/for
         self_row = _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableProcessSequence',
-            source       = list( self.source ),
-            target       = list( self.target ),
-            term_ids     = [ t.opId for t in self.terms ],
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableProcessSequence',
+            source     = list( self.source ),
+            target     = list( self.target ),
+            term_ids   = term_ids,
         )
-        return pl.concat(
-            [ self_row ] + [ t.as_polars( self.opId ) for t in self.terms ],
-            how = 'vertical',
-        )
+        return pl.concat( [ self_row ] + frames, how = 'vertical' ), next_id
     #/def as_polars
 #/class TableProcessSequence
 
@@ -477,7 +550,7 @@ class TableProcessWhile():
     source: Sequence[ str ]
     target: Sequence[ str ]
     condition: types.TaggedTableCheck
-    process: types.TaggedTableProcess
+    terms: Sequence[ types.TaggedTableProcess ]
     opId: str
     maxIter: int = 100
 
@@ -515,10 +588,10 @@ class TableProcessWhile():
                 )
             #/if iterations >= self.maxIter
 
-            result: tuple[ pl.DataFrame,... ] = self.process(
+            result: tuple[ pl.DataFrame,... ] = self.terms[ 0 ](
                 dfs = tuple(
                     tables[ tableId ]
-                    for tableId in self.process.source
+                    for tableId in self.terms[ 0 ].source
                 ),
                 tableOps = tableOps,
                 verbose = verbose,
@@ -526,7 +599,7 @@ class TableProcessWhile():
             )
 
             tables |= dict(
-                zip( self.process.target, result )
+                zip( self.terms[ 0 ].target, result )
             )
 
             iterations += 1
@@ -543,15 +616,15 @@ class TableProcessWhile():
         ) -> types.SignatureCollector:
         return (
             self.condition.get_signatureCollector()
-            | self.process.get_signatureCollector()
+            | self.terms[ 0 ].get_signatureCollector()
         )
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         return pl.concat(
             [
-                self.condition.get_op_bindings( process_id ),
-                self.process.get_op_bindings( process_id ),
+                self.condition.get_op_bindings( op_id ),
+                self.terms[ 0 ].get_op_bindings( op_id ),
             ],
             how = 'vertical',
         )
@@ -559,26 +632,27 @@ class TableProcessWhile():
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id    = start_id
+        cond_id  = start_id + 1
+        cond_df, next_id = self.condition.as_polars( parent_id = my_id, start_id = cond_id )
+        proc_id  = next_id
+        proc_df, next_id = self.terms[ 0 ].as_polars( parent_id = my_id, start_id = proc_id )
         self_row = _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableProcessWhile',
-            source       = list( self.source ),
-            target       = list( self.target ),
-            condition    = self.condition.opId,
-            process      = self.process.opId,
-            max_iter     = self.maxIter,
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableProcessWhile',
+            source     = list( self.source ),
+            target     = list( self.target ),
+            condition  = cond_id,
+            term_ids   = [ proc_id ],
+            count      = self.maxIter,
         )
-        return pl.concat(
-            [
-                self_row,
-                self.condition.as_polars( self.opId ),
-                self.process.as_polars( self.opId ),
-            ],
-            how = 'vertical',
-        )
+        return pl.concat( [ self_row, cond_df, proc_df ], how = 'vertical' ), next_id
     #/def as_polars
 #/class TableProcessWhile
 
@@ -587,7 +661,7 @@ class TableProcessCount():
     source: Sequence[ str ]
     target: Sequence[ str ]
     count: int
-    process: types.TaggedTableProcess
+    terms: Sequence[ types.TaggedTableProcess ]
     opId: str
 
     def __call__(
@@ -611,10 +685,10 @@ class TableProcessCount():
                 )
             #
 
-            result: tuple[ pl.DataFrame,... ] = self.process(
+            result: tuple[ pl.DataFrame,... ] = self.terms[ 0 ](
                 dfs = tuple(
                     tables[ tableId ]
-                    for tableId in self.process.source
+                    for tableId in self.terms[ 0 ].source
                 ),
                 tableOps = tableOps,
                 verbose = verbose,
@@ -622,7 +696,7 @@ class TableProcessCount():
             )
 
             tables |= dict(
-                zip( self.process.target, result )
+                zip( self.terms[ 0 ].target, result )
             )
         #/for j in range( self.count )
 
@@ -635,33 +709,33 @@ class TableProcessCount():
     def get_signatureCollector(
         self: Self,
         ) -> types.SignatureCollector:
-        return self.process.get_signatureCollector()
+        return self.terms[ 0 ].get_signatureCollector()
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
-        return self.process.get_op_bindings( process_id )
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
+        return self.terms[ 0 ].get_op_bindings( op_id )
     #/def get_op_bindings
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id   = start_id
+        proc_id = start_id + 1
+        proc_df, next_id = self.terms[ 0 ].as_polars( parent_id = my_id, start_id = proc_id )
         self_row = _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableProcessCount',
-            source       = list( self.source ),
-            target       = list( self.target ),
-            process      = self.process.opId,
-            count        = self.count,
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableProcessCount',
+            source     = list( self.source ),
+            target     = list( self.target ),
+            term_ids   = [ proc_id ],
+            count      = self.count,
         )
-        return pl.concat(
-            [
-                self_row,
-                self.process.as_polars( self.opId ),
-            ],
-            how = 'vertical',
-        )
+        return pl.concat( [ self_row, proc_df ], how = 'vertical' ), next_id
     #/def as_polars
 #/class TableProcessCount
 
@@ -777,15 +851,15 @@ class TableProcessBranch():
         return signatureCollector
     #/def get_signatureCollector
 
-    def get_op_bindings( self: Self, process_id: str ) -> pl.DataFrame:
+    def get_op_bindings( self: Self, op_id: str ) -> pl.DataFrame:
         frames = [
-            term.get_op_bindings( process_id )
+            term.get_op_bindings( op_id )
             for term in self.ifs
         ] + [
-            term.get_op_bindings( process_id )
+            term.get_op_bindings( op_id )
             for term in self.thens
         ] + (
-            [ self.otherwise.get_op_bindings( process_id ) ]
+            [ self.otherwise.get_op_bindings( op_id ) ]
             if self.otherwise is not None else []
         )
         return pl.concat( frames, how = 'vertical' )
@@ -793,26 +867,45 @@ class TableProcessBranch():
 
     def as_polars(
         self: Self,
-        parent_op_id: str | None = None,
-        ) -> pl.DataFrame:
+        parent_id: int | None = None,
+        start_id: int = 0,
+        ) -> 'tuple[ pl.DataFrame, int ]':
+        """Returns (df, next_id) where next_id is the first node_id not yet used."""
+        my_id   = start_id
+        next_id = start_id + 1
+        frames  = []
+        if_ids   = []
+        then_ids = []
+        for if_term in self.ifs:
+            if_id = next_id
+            if_df, next_id = if_term.as_polars( parent_id = my_id, start_id = if_id )
+            if_ids.append( if_id )
+            frames.append( if_df )
+        #/for
+        for then_term in self.thens:
+            then_id = next_id
+            then_df, next_id = then_term.as_polars( parent_id = my_id, start_id = then_id )
+            then_ids.append( then_id )
+            frames.append( then_df )
+        #/for
+        otherwise_term_ids = None
+        if self.otherwise is not None:
+            otherwise_id = next_id
+            ow_df, next_id = self.otherwise.as_polars( parent_id = my_id, start_id = otherwise_id )
+            frames.append( ow_df )
+            otherwise_term_ids = [ otherwise_id ]
+        #/if
         self_row = _make_process_row(
-            op_id        = self.opId,
-            parent_op_id = parent_op_id,
-            type         = 'TableProcessBranch',
-            source       = list( self.source ),
-            target       = list( self.target ),
-            ifs          = [ t.opId for t in self.ifs ],
-            thens        = [ t.opId for t in self.thens ],
-            otherwise    = self.otherwise.opId if self.otherwise is not None else None,
+            node_id = my_id,
+            op_id      = self.opId,
+            parent_id  = parent_id,
+            type       = 'TableProcessBranch',
+            source     = list( self.source ),
+            target     = list( self.target ),
+            ifs        = if_ids,
+            thens      = then_ids,
+            term_ids   = otherwise_term_ids,
         )
-        child_frames = [
-            t.as_polars( self.opId ) for t in self.ifs
-        ] + [
-            t.as_polars( self.opId ) for t in self.thens
-        ] + (
-            [ self.otherwise.as_polars( self.opId ) ]
-            if self.otherwise is not None else []
-        )
-        return pl.concat( [ self_row ] + child_frames, how = 'vertical' )
+        return pl.concat( [ self_row ] + frames, how = 'vertical' ), next_id
     #/def as_polars
 #/class TableProcessBranch
