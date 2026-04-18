@@ -18,7 +18,7 @@ from typing import Self, Sequence, Type
 
 def _make_process_row( node_id: int, **kwargs ) -> pl.DataFrame:
     """
-    Build a single-row DataFrame with the 'table_processes' schema.
+    Build a single-row DataFrame with the '__table_processes__' schema.
     Any column not supplied in kwargs is set to null.
     node_id is the unique integer row identifier for tree navigation.
     """
@@ -42,7 +42,7 @@ def _make_process_row( node_id: int, **kwargs ) -> pl.DataFrame:
             for k, v in defaults.items()
         },
         schema = table_schemas[
-            'table_processes'
+            '__table_processes__'
         ],
     )
 #/def _make_process_row
@@ -164,6 +164,31 @@ def reindex_process_df(
     )
 #/def reindex_process_df
 
+def embed_process_df(
+    process_df: pl.DataFrame,
+    parent_id:  int | None,
+    start_id:   int,
+) -> tuple[ pl.DataFrame, int ]:
+    """
+    Reindex a start_id=0 process DataFrame to start at `start_id` and set the
+    root row's parent_id.  Returns (reindexed_df, next_free_id).
+
+    Mirrors the behaviour of TaggedTableProcess.as_polars(parent_id=parent_id, start_id=start_id)
+    for an already-serialized DataFrame.
+    """
+    reindexed = reindex_process_df( process_df, offset = start_id )
+    # reindex_process_df adds start_id to every parent_id; the root row's original
+    # parent_id is null so null + start_id = null — still null after reindexing.
+    # Set it to the caller-supplied parent_id explicitly.
+    patched = reindexed.with_columns(
+        pl.when( pl.col( 'node_id' ) == start_id )
+          .then( pl.lit( parent_id ) )
+          .otherwise( pl.col( 'parent_id' ) )
+          .alias( 'parent_id' )
+    )
+    return patched, start_id + len( process_df )
+#/def embed_process_df
+
 def run_from_df(
     df: pl.DataFrame,
     root_pid: int,
@@ -185,7 +210,7 @@ class TableProcessRef():
     source: Sequence[ str ]
     target: Sequence[ str ]
     terms: Sequence[ str | types.TableProcess ]
-    opId: str
+    op_id: str
     """
         Holds a reference to an atomic types.TableProcess. All together acts as an atomic types.TaggedTableProcess.
         terms is a single-element list: [op_key_string] or [callable].
@@ -209,7 +234,7 @@ class TableProcessRef():
 
         if verbose > 0:
             print(
-                verbose_prefix + self.opId
+                verbose_prefix + self.op_id
             )
             print(
                 verbose_prefix + "  {}".format( self.source )
@@ -252,7 +277,7 @@ class TableProcessRef():
         return pl.DataFrame(
             [{
                 'root_op_id':  op_id,
-                'op_id':         self.opId,
+                'op_id':         self.op_id,
                 'source':  list( self.source ),
                 'target': list( self.target ),
             }],
@@ -271,7 +296,7 @@ class TableProcessRef():
         child_id = start_id + 1
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableProcessRef',
             source     = list( self.source ),
@@ -293,7 +318,7 @@ class TableProcessRef():
 def get(
     source: tuple[ str,... ] | str,
     target: tuple[ str,... ] | str,
-    opId: str = '_anonymous_simpleGetOp',
+    op_id: str = '_anonymous_simpleGetOp',
     ) -> TableProcessRef:
     if isinstance( source, str ):
         source = ( source, )
@@ -306,7 +331,7 @@ def get(
         source = source,
         target = target,
         terms  = [ SimpleGetOp() ],
-        opId   = opId,
+        op_id  = op_id,
     )
 #/def get
 
@@ -314,7 +339,7 @@ def transform(
     source: tuple[ str,... ] | str,
     target: tuple[ str,... ] | str,
     lam: types.TableProcess,
-    opId: str = '_anonymous_transformOp',
+    op_id: str = '_anonymous_transformOp',
     ) -> TransformOp:
     if isinstance( source, str ):
         source = ( source, )
@@ -327,7 +352,7 @@ def transform(
         source = source,
         target = target,
         terms  = [ TransformOp( lam = lam ) ],
-        opId   = opId,
+        op_id  = op_id,
     )
 #/def transform
 
@@ -339,7 +364,7 @@ class TableCheckRef():
     """
     source: Sequence[ str ]
     terms: Sequence[ types.TableCheck | str ]
-    opId: str
+    op_id: str
 
     def __call__(
         self: Self,
@@ -366,7 +391,7 @@ class TableCheckRef():
 
         if verbose > 0:
             print(
-                verbose_prefix + self.opId + ': {}'.format(
+                verbose_prefix + self.op_id + ': {}'.format(
                     check
                 )
             )
@@ -388,7 +413,7 @@ class TableCheckRef():
         return pl.DataFrame(
             [{
                 'root_op_id':  op_id,
-                'op_id':         self.opId,
+                'op_id':         self.op_id,
                 'source':  list( self.source ),
                 'target': [],
             }],
@@ -407,7 +432,7 @@ class TableCheckRef():
         child_id = start_id + 1
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableCheckRef',
             source     = list( self.source ),
@@ -424,21 +449,21 @@ class TableCheckRef():
     #/def as_polars
 #/class TableCheckRef
 
-def always_true( opId: str = '_always_true' ) -> TableCheckRef:
+def always_true( op_id: str = '_always_true' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns True."""
     return TableCheckRef(
         source = [],
         terms  = [ lambda dfs, verbose=0, verbose_prefix='': True ],
-        opId   = opId,
+        op_id  = op_id,
     )
 #/def always_true
 
-def always_false( opId: str = '_always_false' ) -> TableCheckRef:
+def always_false( op_id: str = '_always_false' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns False."""
     return TableCheckRef(
         source = [],
         terms  = [ lambda dfs, verbose=0, verbose_prefix='': False ],
-        opId   = opId,
+        op_id  = op_id,
     )
 #/def always_false
 
@@ -447,7 +472,7 @@ class TableProcessSequence():
     source: Sequence[ str ]
     target: Sequence[ str ]
     terms: Sequence[ types.TaggedTableProcess ]
-    opId: str
+    op_id: str
 
     def __call__(
         self: Self,
@@ -467,7 +492,7 @@ class TableProcessSequence():
             taggedProcess = self.terms[j]
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({}/{})".format(
+                    verbose_prefix + self.op_id + " ({}/{})".format(
                         j+1, len( self.terms )
                     )
                 )
@@ -534,7 +559,7 @@ class TableProcessSequence():
         #/for
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableProcessSequence',
             source     = list( self.source ),
@@ -551,7 +576,7 @@ class TableProcessWhile():
     target: Sequence[ str ]
     condition: types.TaggedTableCheck
     terms: Sequence[ types.TaggedTableProcess ]
-    opId: str
+    op_id: str
     maxIter: int = 100
 
     def __call__(
@@ -579,7 +604,7 @@ class TableProcessWhile():
         ):
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({})".format( iterations )
+                    verbose_prefix + self.op_id + " ({})".format( iterations )
                 )
             #
             if iterations >= self.maxIter:
@@ -643,7 +668,7 @@ class TableProcessWhile():
         proc_df, next_id = self.terms[ 0 ].as_polars( parent_id = my_id, start_id = proc_id )
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableProcessWhile',
             source     = list( self.source ),
@@ -662,7 +687,7 @@ class TableProcessCount():
     target: Sequence[ str ]
     count: int
     terms: Sequence[ types.TaggedTableProcess ]
-    opId: str
+    op_id: str
 
     def __call__(
         self: Self,
@@ -679,7 +704,7 @@ class TableProcessCount():
         for j in range( self.count ):
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({}/{})".format(
+                    verbose_prefix + self.op_id + " ({}/{})".format(
                         j+1, self.count
                     )
                 )
@@ -727,7 +752,7 @@ class TableProcessCount():
         proc_df, next_id = self.terms[ 0 ].as_polars( parent_id = my_id, start_id = proc_id )
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableProcessCount',
             source     = list( self.source ),
@@ -741,7 +766,7 @@ class TableProcessCount():
 
 @dataclass
 class TableProcessBranch():
-    opId: str
+    op_id: str
     source: Sequence[ str ]
     target: Sequence[ str ]
     ifs: Sequence[ types.TaggedTableCheck ]
@@ -765,7 +790,7 @@ class TableProcessBranch():
         while j < len( self.ifs ):
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({}/{})".format(
+                    verbose_prefix + self.op_id + " ({}/{})".format(
                         j+1, len( self.ifs )
                     )
                 )
@@ -897,7 +922,7 @@ class TableProcessBranch():
         #/if
         self_row = _make_process_row(
             node_id = my_id,
-            op_id      = self.opId,
+            op_id      = self.op_id,
             parent_id  = parent_id,
             type       = 'TableProcessBranch',
             source     = list( self.source ),

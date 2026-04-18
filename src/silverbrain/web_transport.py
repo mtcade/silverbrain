@@ -93,7 +93,7 @@ def make_send_op(
                 source=['result'],
                 target=[],
                 op=make_send_op('web_b', 'compute', web.outbox),
-                opId='send_result',
+                op_id='send_result',
             )
     """
     def send_op(

@@ -632,12 +632,12 @@ class TableOpWhile():
         self: Self,
         condition: types.TableCheck,
         process: types.TableProcess,
-        opId: str,
+        op_id: str,
         maxIter: int = 100,
         ) -> None:
         self.condition = condition
         self.process = process
-        self.opId = opId
+        self.op_id = op_id
         self.maxIter = maxIter
         return
     #/def __init__
@@ -658,7 +658,7 @@ class TableOpWhile():
         ):
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({})".format( iterations )
+                    verbose_prefix + self.op_id + " ({})".format( iterations )
                 )
             #
             if iterations >= self.maxIter:
@@ -689,11 +689,11 @@ class TableOpCount():
         self: Self,
         count: int,
         process: types.TableProcess,
-        opId: str,
+        op_id: str,
         ) -> None:
         self.count = count
         self.process = process
-        self.opId = opId
+        self.op_id = op_id
         return
     #/def __init__
 
@@ -708,7 +708,7 @@ class TableOpCount():
             if verbose > 0:
                 print(
                     verbose_prefix\
-                        + self.opId\
+                        + self.op_id\
                         + " ({}/{})".format( j+1, self.count )
                     #/
                 )
@@ -738,7 +738,7 @@ class TableOpBranch():
         ifs: Sequence[ types.TableCheck | bool ],
         thens: Sequence[ types.TableProcess ],
         otherwise: types.TableProcess | None,
-        opId: str,
+        op_id: str,
         ) -> None:
 
         assert len( ifs ) == len( thens )
@@ -746,7 +746,7 @@ class TableOpBranch():
         self.ifs = ifs
         self.thens = thens
         self.otherwise = otherwise
-        self.opId = opId
+        self.op_id = op_id
         return
     #/def __init__
 
@@ -763,7 +763,7 @@ class TableOpBranch():
         while j < len( self.ifs ):
             if verbose > 0:
                 print(
-                    verbose_prefix + self.opId + " ({}/{})".format(
+                    verbose_prefix + self.op_id + " ({}/{})".format(
                         j+1, len( self.ifs )
                     )
                 )

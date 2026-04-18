@@ -144,7 +144,7 @@ def split_web(
         ZMQ address that web_b will bind.  Added to web_a's routes table so
         OutboxSender can reach web_b.
     recv_op_id:
-        The opId/inputId web_b exposes for the incoming message.
+        The op_id/inputId web_b exposes for the incoming message.
     context_tables_b:
         Extra tables needed by web_b's steps (e.g. 'paths').  The caller is
         responsible for supplying these; only the step_idx outputs are
@@ -178,13 +178,13 @@ def split_web(
         source = transmitted,
         target = [],
         op     = make_send_op( web_b_id, recv_op_id, web_a.outbox ),
-        opId   = 'send_split',
+        op_id  = 'send_split',
     )
 
     web_a.tableProcesses[ process_id ] = TableProcessSequence(
         source = list( seq.source ),
         target = [],
-        opId   = process_id,
+        op_id  = process_id,
         terms  = list( seq.terms[ :step_idx + 1 ] ) + [ send_ref ],
     )
 
@@ -206,7 +206,7 @@ def split_web(
             recv_op_id: TableProcessSequence(
                 source = transmitted,
                 target = list( seq.target ),
-                opId   = recv_op_id,
+                op_id  = recv_op_id,
                 terms  = list( seq.terms[ step_idx + 1: ] ),
             ),
         },
@@ -239,7 +239,7 @@ def join_web(
     web_c_id:
         main_id for the new Web.
     recv_a_op_id, recv_b_op_id:
-        opId values web_a and web_b use when addressing web_c's inbox.
+        op_id values web_a and web_b use when addressing web_c's inbox.
     tables_a, tables_b:
         Ordered lists of table names carried in each sender's message.  These
         become the keys under which the data is stored in web_c.tables.
@@ -284,13 +284,13 @@ def join_web(
         source = tables_a,
         target = [],
         op     = recv_a_op,
-        opId   = recv_a_op_id,
+        op_id  = recv_a_op_id,
     )
     web_c.tableProcesses[ recv_b_op_id ] = TableProcessRef(
         source = tables_b,
         target = [],
         op     = recv_b_op,
-        opId   = recv_b_op_id,
+        op_id  = recv_b_op_id,
     )
 
     route_row = pl.DataFrame(
@@ -478,7 +478,7 @@ def partition_out(
             source = list( original.source ),
             target = [],
             op     = make_send_op( new_web_id, op_id, web.outbox ),
-            opId   = op_id,
+            op_id  = op_id,
         )
         web.tableProcesses[ op_id ] = stub
         _append_route( web.tables, new_web_id, op_id, new_address )

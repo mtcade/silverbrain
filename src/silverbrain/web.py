@@ -13,7 +13,7 @@ import polars as pl
 import numpy as np
 import zmq
 
-from typing import Self
+from typing import Callable, Self
 from queue import Queue, Empty
 
 def _collect_subtree_pids(
@@ -107,6 +107,10 @@ class Web():
             str,
             tableInit.ProcessInitRef
         ] | None = None,
+        tableProcessFactories: dict[
+            str,
+            Callable
+        ] | None = None,
         inbox: Queue | None = None,
         outbox: Queue | None = None,
         log: Queue | None = None,
@@ -133,12 +137,13 @@ class Web():
             self.tables[ '__table_processes__' ] = pl.concat( frames, how = 'vertical' )
         else:
             self.tables[ '__table_processes__' ] = pl.DataFrame(
-                schema = table_schemas[ 'table_processes' ]
+                schema = table_schemas[ '__table_processes__' ]
             )
         #
 
         self._init_tables: dict[ str, tableInit.TableInitRef ] = table_inits or {}
         self._init_processes: dict[ str, tableInit.ProcessInitRef ] = process_inits or {}
+        self.tableProcessFactories: dict[ str, 'Callable' ] = tableProcessFactories or {}
 
         _init_ops = init_table_ops or {}
         for _ref in self._init_tables.values():
@@ -616,7 +621,7 @@ class Web():
         """
         sub_df = sub_web.tables.get(
             '__table_processes__',
-            pl.DataFrame( schema = table_schemas[ 'table_processes' ] ),
+            pl.DataFrame( schema = table_schemas[ '__table_processes__' ] ),
         )
         if sub_df.shape[0] > 0:
             sub_rows = { r[ 'node_id' ]: r for r in sub_df.to_dicts() }

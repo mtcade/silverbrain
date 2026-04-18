@@ -79,7 +79,7 @@ class TaggedTableProcessSignature():
 class TaggedTableProcess( Protocol ):
     source: Sequence[ str ]
     target: Sequence[ str ]
-    opId: str
+    op_id: str
     
     def __call__(
         self: Self,
@@ -104,7 +104,7 @@ class TaggedTableProcess( Protocol ):
 
 class TaggedTableCheck( Protocol ):
     source: Sequence[ str ]
-    opId: str
+    op_id: str
 
     def __call__(
         self: Self,

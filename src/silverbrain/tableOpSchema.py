@@ -32,7 +32,7 @@ class DiskWrite:
                 'output': [ None ],
                 'format': [ None ],
             },
-            schema = table_schemas['tableOp_effects'],
+            schema = table_schemas['__table_op_effects__'],
         )
     #/def to_polars
 
@@ -75,7 +75,7 @@ class DiskRead:
                 'output': [ self.output ],
                 'format': [ self.format ],
             },
-            schema = table_schemas['tableOp_effects'],
+            schema = table_schemas['__table_op_effects__'],
         )
     #/def to_polars
 
@@ -118,7 +118,7 @@ class Mkdir:
                 'output': [ None ],
                 'format': [ None ],
             },
-            schema = table_schemas['tableOp_effects'],
+            schema = table_schemas['__table_op_effects__'],
         )
     #/def to_polars
 
@@ -175,7 +175,7 @@ class InputSchema():
                 'extra':            [ self.extra ],
                 'passthrough_from': [ None ],
             },
-            schema = table_schemas['tableOp_schema'],
+            schema = table_schemas['__table_op_schema__'],
         )
     #/def to_polars
 
@@ -222,7 +222,7 @@ class OutputSchema():
             ],
             'extra':            [ None ],
             'passthrough_from': [ self.passthrough_from ],
-        }, schema = table_schemas['tableOp_schema'] )
+        }, schema = table_schemas['__table_op_schema__'] )
     #/def to_polars
 
     def to_dict( self: Self ) -> dict:
@@ -266,7 +266,7 @@ class TableOpSchema():
         frames = [ eff.to_polars( op_id, i ) for i, eff in enumerate( self.effects ) ]
         return (
             pl.concat( frames, how = 'vertical' ) if frames
-            else pl.DataFrame( schema = table_schemas['tableOp_effects'] )
+            else pl.DataFrame( schema = table_schemas['__table_op_effects__'] )
         )
     #/def to_polars_effects
 
@@ -331,7 +331,7 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
     def to_polars_schema( self: Self ) -> pl.DataFrame:
         """Return tableOp_schema DataFrame (one row per input/output across all ops)."""
         if not self.data:
-            return pl.DataFrame( schema = table_schemas['tableOp_schema'] )
+            return pl.DataFrame( schema = table_schemas['__table_op_schema__'] )
         return pl.concat(
             [ op.to_polars_schema( op_id ) for op_id, op in self.data.items() ],
             how = 'vertical',
@@ -341,7 +341,7 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
     def to_polars_effects( self: Self ) -> pl.DataFrame:
         """Return tableOp_effects DataFrame (one row per effect across all ops)."""
         if not self.data:
-            return pl.DataFrame( schema = table_schemas['tableOp_effects'] )
+            return pl.DataFrame( schema = table_schemas['__table_op_effects__'] )
         return pl.concat(
             [ op.to_polars_effects( op_id ) for op_id, op in self.data.items() ],
             how = 'vertical',
@@ -358,8 +358,8 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
         Serialize all ops into two DataFrames.
 
         Returns:
-            - tableOp_schema: one row per input/output (schema table_schemas['tableOp_schema'])
-            - tableOp_effects: one row per effect (schema table_schemas['tableOp_effects'])
+            - tableOp_schema: one row per input/output (schema table_schemas['__table_op_schema__'])
+            - tableOp_effects: one row per effect (schema table_schemas['__table_op_effects__'])
         """
         return ( self.to_polars_schema(), self.to_polars_effects() )
     #/def to_polars_tuple

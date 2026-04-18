@@ -42,6 +42,10 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'path_column':      pl.Utf8,
     'output':           pl.Int32,
     'format':           pl.Utf8,
+    # table_init / process_init serialization
+    'written_by':       pl.List( pl.Utf8 ),
+    'factory_id':       pl.Utf8,
+    'always_run':       pl.Boolean,
 } | {
     # table_processes serialization
     # node_id    — unique signed-integer row ID; all cross-references use this, not op_id
@@ -89,7 +93,7 @@ def table_schemas_to_df(
                 for schema in ts.values()
             ],
         },
-        schema = table_schemas['tables_schema'],
+        schema = table_schemas['__tables_schema__'],
     )
 #/table_schemas_to_df
 
@@ -98,17 +102,17 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
         'root_op_id', 'op_id', 'source',
         'target',
     )),
-    'tableOp_schema':  cannonical_schema_for_keys((
+    '__table_op_schema__':  cannonical_schema_for_keys((
         'op_id', 'direction', 'index',
         'column_names', 'column_types',
         'extra', 'passthrough_from',
     )),
-    'tableOp_effects':  cannonical_schema_for_keys((
+    '__table_op_effects__':  cannonical_schema_for_keys((
         'op_id', 'effect_index', 'type',
         'path_input', 'path_column', 'output',
         'format',
     )),
-    'tables_schema': cannonical_schema_for_keys((
+    '__tables_schema__': cannonical_schema_for_keys((
         'table_id', 'column_names', 'column_types',
     )),
     'paths': cannonical_schema_for_keys((
@@ -117,7 +121,13 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     'routes': cannonical_schema_for_keys((
         'web_id', 'op_id', 'address', 'topic',
     )),
-    'table_processes': cannonical_schema_for_keys((
+    '__table_init__': cannonical_schema_for_keys((
+        'table_id', 'source', 'op_id', 'written_by', 'always_run',
+    )),
+    '__process_init__': cannonical_schema_for_keys((
+        'op_id', 'source', 'factory_id', 'always_run',
+    )),
+    '__table_processes__': cannonical_schema_for_keys((
         'node_id', 'op_id', 'parent_id', 'type',
         'source', 'target',
         'term_ids', 'condition', 'count',
