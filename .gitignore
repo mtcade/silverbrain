@@ -1,0 +1,5 @@
+.DS_Store
+*.egg-info/
+__pycache__/
+*.py[cod]
+/silverbrain.xcodeproj
