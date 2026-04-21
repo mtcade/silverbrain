@@ -61,7 +61,7 @@ class ProcessInitRef():
     """
     op_id:      str
     source:     tuple[ str, ... ]
-    factory_id: str
+    factory_id: str | None
     always_run: bool = False
 
     def as_polars(self) -> pl.DataFrame:

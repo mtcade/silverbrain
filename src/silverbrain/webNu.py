@@ -5,11 +5,12 @@
 #//  Created by Evan Mason on 3/11/26.
 
 from . import tableOps, tableProcesses, types
+from .tableOps import TableOpSchema
 from .schema import table_schemas, table_schemas_to_df
 from .polarsDataTypeStrings import dtype_to_str
 from .tableInit import (
     TableInitRef, ProcessInitRef,
-    table_init_df_from_dict, process_init_df_from_dict,
+    process_init_df_from_dict,
     topological_init_order_from_df,
 )
 
@@ -60,79 +61,88 @@ _register_op_effects_op = tableOps.TransformOp(
     )
 )
 
-def _collect_subtree_pids(
-    rows: dict,
-    pid:  int,
-) -> set[ int ]:
-    """Return the set of all node_ids in the subtree rooted at pid."""
-    pids = { pid }
-    row  = rows[ pid ]
-    for child in ( row.get( 'term_ids' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    if row.get( 'condition' ) is not None:
-        pids |= _collect_subtree_pids( rows, row[ 'condition' ] )
-    #
-    for child in ( row.get( 'ifs' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    for child in ( row.get( 'thens' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    return pids
-#/def _collect_subtree_pids
-
-
-def _build_op_bindings(
-    table_processes_df: pl.DataFrame,
-) -> pl.DataFrame:
+class _ComputeOpBindingsOp( tableOps.TableOp ):
     """
-    Derive op_bindings from the serialised process tree.
-    For every root process (parent_id is null, type != 'Op') walk its full
-    subtree and emit one row per non-Op node that has a non-empty source.
+        Compute the op_bindings for each tableProcess, from __table_processes__ to __op_bindings__. Gets run in `web.init_data`, once all table processes have been registered
     """
-    rows      = { r[ 'node_id' ]: r for r in table_processes_df.to_dicts() }
-    root_rows = table_processes_df.filter(
-        pl.col( 'parent_id' ).is_null() & ( pl.col( 'type' ) != 'Op' )
-    ).to_dicts()
-    frames: list[ pl.DataFrame ] = []
-    for root_row in root_rows:
-        root_op_id = root_row[ 'op_id' ]
-        for pid in _collect_subtree_pids( rows, root_row[ 'node_id' ] ):
-            r = rows[ pid ]
-            if r[ 'type' ] == 'Op' or not r.get( 'source' ):
-                continue
-            frames.append( pl.DataFrame(
-                [{
-                    'root_op_id': root_op_id,
-                    'op_id':      r[ 'op_id' ],
-                    'source':     r[ 'source' ] or [],
-                    'target':     r[ 'target' ] or [],
-                }],
-                schema = table_schemas[ 'op_bindings' ],
-            ) )
+    def _collect_subtree_pids(
+        self: Self,
+        rows: dict,
+        pid:  int,
+        ) -> set[ int ]:
+        """
+        Return the set of all node_ids in the subtree rooted at pid.
+        """
+        pids = { pid }
+        row  = rows[ pid ]
+        for child in ( row.get( 'term_ids' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
         #
-    #
-    return (
-        pl.concat( frames, how = 'vertical' )
-        if frames
-        else pl.DataFrame( schema = table_schemas[ 'op_bindings' ] )
-    )
-#/def _build_op_bindings
-
-
-# build op_bindings from __table_processes__
-_compute_op_bindings_op = tableOps.TransformOp(
-    lam = lambda dfs, verbose, verbose_prefix: (
-        _build_op_bindings( dfs[ 0 ] ),
-    )
-)
+        if row.get( 'condition' ) is not None:
+            pids |= self._collect_subtree_pids( rows, row[ 'condition' ] )
+        #
+        for child in ( row.get( 'ifs' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
+        #
+        for child in ( row.get( 'thens' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
+        #
+        return pids
+    #/def _collect_subtree_pids
+    
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        """
+            :param dfs:
+                - [0]: __table_processes__
+            :returns:
+                - [0]: __op_bindings__
+        """
+        rows      = {
+            r[ 'node_id' ]: r for r in dfs[0].to_dicts()
+        }
+        root_rows = dfs[0].filter(
+            pl.col( 'parent_id' ).is_null() & ( pl.col( 'type' ) != 'Op' )
+        ).to_dicts()
+        
+        frames: list[ pl.DataFrame ] = []
+        for root_row in root_rows:
+            root_op_id = root_row[ 'op_id' ]
+            for pid in self._collect_subtree_pids( rows, root_row[ 'node_id' ] ):
+                r = rows[ pid ]
+                if r[ 'type' ] == 'Op' or not r.get( 'source' ):
+                    continue
+                frames.append( pl.DataFrame(
+                    [{
+                        'root_op_id': root_op_id,
+                        'op_id':      r[ 'op_id' ],
+                        'source':     r[ 'source' ] or [],
+                        'target':     r[ 'target' ] or [],
+                    }],
+                    schema = table_schemas[ 'op_bindings' ],
+                ) )
+            #
+        #
+        
+        op_bindings_df: pl.DataFrame = (
+            pl.concat( frames, how = 'vertical' )
+            if frames
+            else pl.DataFrame( schema = table_schemas[ 'op_bindings' ] )
+        )
+        
+        return ( op_bindings_df, )
+    #/def __call__
+#/class _ComputeOpBindingsOp
 
 _BUILTIN_OPS: types.TableProcessDict = {
     '_register_process_op':     _register_process_op,
     '_register_op_schema_op':   _register_op_schema_op,
     '_register_op_effects_op':  _register_op_effects_op,
-    '_compute_op_bindings_op':  _compute_op_bindings_op,
+    '_compute_op_bindings_op':  _ComputeOpBindingsOp(),
 }
 
 # -- Built-in process definitions
@@ -226,17 +236,20 @@ class Web:
         }
 
         # -- Seed __table_processes__ with built-in process definitions
+        # -- process to register new processes
         _df, _ = _REGISTER_PROCESS.as_polars( start_id = 0 )
         self.tables[ '__table_processes__' ] = pl.concat(
             [ self.tables[ '__table_processes__' ], _df ], how = 'vertical'
         )
-
+        
+        # -- process to register table ops
         _next_id = int( self.tables[ '__table_processes__' ][ 'node_id' ].max() + 1 )
         _df2, _  = _REGISTER_TABLEOPS.as_polars( start_id = _next_id )
         self.tables[ '__table_processes__' ] = pl.concat(
             [ self.tables[ '__table_processes__' ], _df2 ], how = 'vertical'
         )
-
+        
+        # -- process to compute op bindings
         _next_id = int( self.tables[ '__table_processes__' ][ 'node_id' ].max() + 1 )
         _df3, _  = _COMPUTE_OP_BINDINGS.as_polars( start_id = _next_id )
         self.tables[ '__table_processes__' ] = pl.concat(
@@ -313,18 +326,32 @@ class Web:
     ) -> None:
         """
         Merge `ops` into self.tableOps and update __table_op_schema__ /
-        __table_op_effects__ for any op exposing get_schema_df / get_effects_df.
+        __table_op_effects__ for ops that expose input / output / effects.
         Dispatches 'register_tableOps' via apply_id(), passing new rows directly
         as dfs and writing the results back to self.tables.
         """
         self.tableOps |= ops
+        
+        # Check for schema
         _schema_rows:  list[ pl.DataFrame ] = []
         _effects_rows: list[ pl.DataFrame ] = []
         for op_id, op in ops.items():
-            if hasattr( op, 'get_schema_df' ):
-                _schema_rows.append( op.get_schema_df( op_id ) )
-            if hasattr( op, 'get_effects_df' ):
-                _effects_rows.append( op.get_effects_df( op_id ) )
+            _has_schema  = getattr( op, 'input', None ) is not None or getattr( op, 'output',  None ) is not None
+            _has_effects = getattr( op, 'effects', None ) is not None
+            if _has_schema:
+                _schema_df, _effects_df = TableOpSchema(
+                    inputs  = op.input  or [],
+                    outputs = op.output or [],
+                    effects = op.effects or [],
+                ).to_polars( op_id )
+                _schema_rows.append( _schema_df )
+                if not _effects_df.is_empty():
+                    _effects_rows.append( _effects_df )
+            elif _has_effects and op.effects:
+                _, _effects_df = TableOpSchema(
+                    inputs = [], outputs = [], effects = op.effects,
+                ).to_polars( op_id )
+                _effects_rows.append( _effects_df )
         #/for op_id, op in ops.items()
         
         _new_schema  = (
@@ -337,6 +364,7 @@ class Web:
             if _effects_rows
             else pl.DataFrame( schema = table_schemas[ '__table_op_effects__' ] )
         )
+        
         (
             self.tables[ '__table_op_schema__'  ],
             self.tables[ '__table_op_effects__' ],
@@ -379,6 +407,11 @@ class Web:
         Appends a __tables_schema__ row for each new entry that is a DataFrame
         (None-valued placeholders are merged silently with no schema row).
         """
+        
+        
+        self.tables |= tables
+        
+        # Collect schema of new tables to add to __tables_schema__
         new_rows: list[ dict ] = []
         for tid, df in tables.items():
             if isinstance( df, pl.DataFrame ) and tid not in self.tables:
@@ -389,7 +422,7 @@ class Web:
                 })
             #/if isinstance( df, pl.DataFrame ) and tid not in self.tables
         #/for tid, df
-        self.tables |= tables
+        
         if new_rows:
             self.tables[ '__tables_schema__' ] = pl.concat(
                 [
@@ -400,14 +433,6 @@ class Web:
             )
         #/if new_rows
     #/def register_tables
-
-    def _register_process_df(
-        self: Self,
-        process: types.TaggedTableProcess,
-    ) -> None:
-        """Alias for register_process(); maintains API compatibility with web.Web."""
-        self.register_process( process )
-    #/def _register_process_df
 
     def init_data(
         self: Self,
@@ -420,6 +445,7 @@ class Web:
         __process_init__:
           - table:   run_id( ref.op_id )   if always_run or table not yet populated
           - process: run_id( ref.factory_id ) if process not yet in __table_processes__
+          
         Factory processes are TaggedTableProcesses already registered in
         __table_processes__; when run they produce and register the target process.
         """
@@ -446,6 +472,11 @@ class Web:
                     ( pl.col( 'op_id' ) == row[ 'op_id' ] )
                     & pl.col( 'parent_id' ).is_null()
                 ).is_empty():
+                    if row[ 'factory_id' ] is None:
+                        raise RuntimeError(
+                            f"Process '{row[ 'op_id' ]}' has factory_id=None "
+                            f"but is absent from __table_processes__"
+                        )
                     self.run_id(
                         row[ 'factory_id' ],
                         verbose        = verbose,

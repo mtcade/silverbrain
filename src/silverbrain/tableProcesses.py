@@ -577,7 +577,7 @@ class TableProcessWhile():
     condition: types.TaggedTableCheck
     terms: Sequence[ types.TaggedTableProcess ]
     op_id: str
-    maxIter: int = 100
+    maxIter: int = 2**31 - 1
 
     def __call__(
         self: Self,

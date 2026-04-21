@@ -14,7 +14,7 @@ from typing import Callable, Protocol, Self, Sequence, Type
 
 import polars as pl
 
-# Simple Table processes; input is only a tuple. Mostly used for TableOp and similar as building blocks for a ModTableProcess
+# Simple Table processes; input is only a tuple. Mostly used for TableOp
 
 class TableProcess( Protocol ):
     def __call__(
