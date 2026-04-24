@@ -1,697 +1,348 @@
 #
-#//  web.py
+#//  webNu.py
 #//  silverbrain
 #//
 #//  Created by Evan Mason on 3/11/26.
 
-from . import tableInit, tableOps, tableProcesses, types, utilities, web_transport
+from . import tableOps, tableProcesses, types
+from .tableOps import TableOpSchema
 from .schema import table_schemas, table_schemas_to_df
 from .polarsDataTypeStrings import dtype_to_str
+from .tableInit import (
+    TableInitRef, ProcessInitRef,
+    process_init_df_from_dict,
+    topological_init_order_from_df,
+)
 
-import threading
 import polars as pl
-import numpy as np
-import zmq
 
-from typing import Callable, Self
-from queue import Queue, Empty
+from typing import Self
 
-def _collect_subtree_pids(
-    rows: dict,
-    pid: int,
-    ) -> set[int]:
-    """Return the set of all node_ids in the subtree rooted at pid."""
-    pids = { pid }
-    row  = rows[ pid ]
-    for child in ( row.get( 'term_ids' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    if row.get( 'condition' ) is not None:
-        pids |= _collect_subtree_pids( rows, row[ 'condition' ] )
-    #
-    for child in ( row.get( 'ifs' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    for child in ( row.get( 'thens' ) or [] ):
-        pids |= _collect_subtree_pids( rows, child )
-    #
-    return pids
-#/def _collect_subtree_pids
+# -- System table schemas
+_SYSTEM_SCHEMAS: dict[ str, dict ] = {
+    '__tables_schema__':    table_schemas[ '__tables_schema__'   ],
+    '__table_processes__':  table_schemas[ '__table_processes__' ],
+    '__table_op_schema__':  table_schemas[ '__table_op_schema__'  ],
+    '__table_op_effects__': table_schemas[ '__table_op_effects__' ],
+    '__table_init__':       table_schemas[ '__table_init__'  ],
+    '__process_init__':     table_schemas[ '__process_init__'],
+}
 
-def _collect_subtree_sources_targets(
-    rows: dict,
-    pid: int,
-    ) -> tuple[ set[str], set[str] ]:
-    """Walk the subtree and union all source/target table keys."""
-    row = rows[ pid ]
-    if row[ 'type' ] == 'Op':
-        return set(), set()
-    sources  = set( row.get( 'source' ) or [] )
-    targets  = set( row.get( 'target' ) or [] )
-    children = list( row.get( 'term_ids' ) or [] )
-    if row.get( 'condition' ) is not None:
-        children.append( row[ 'condition' ] )
-    children += list( row.get( 'ifs' ) or [] )
-    children += list( row.get( 'thens' ) or [] )
-    for child_pid in children:
-        cs, ct = _collect_subtree_sources_targets( rows, child_pid )
-        sources |= cs
-        targets |= ct
-    return sources, targets
-#/def _collect_subtree_sources_targets
+# -- Built-in tableOps (shared across all Web instances)
 
+# concat new process rows (reindexed to avoid ID collisions) onto __table_processes__
+_register_process_op = tableOps.TransformOp(
+    lam = lambda dfs, verbose, verbose_prefix: (
+        pl.concat(
+            [
+                dfs[ 1 ],  # existing __table_processes__
+                tableProcesses.reindex_process_df(
+                    dfs[ 0 ],  # __new_process__ (serialized at start_id=0)
+                    offset = int( dfs[ 1 ][ 'node_id' ].max() + 1 )
+                             if dfs[ 1 ].shape[ 0 ] > 0 else 0,
+                ),
+            ],
+            how = 'vertical',
+        ),
+    )
+)
 
-class Web():
+# concat new schema rows onto __table_op_schema__
+_register_op_schema_op = tableOps.TransformOp(
+    lam = lambda dfs, verbose, verbose_prefix: (
+        pl.concat( [ dfs[ 1 ], dfs[ 0 ] ], how = 'vertical' ),
+    )
+)
+
+# concat new effects rows onto __table_op_effects__
+_register_op_effects_op = tableOps.TransformOp(
+    lam = lambda dfs, verbose, verbose_prefix: (
+        pl.concat( [ dfs[ 1 ], dfs[ 0 ] ], how = 'vertical' ),
+    )
+)
+
+class _ComputeOpBindingsOp( tableOps.TableOp ):
     """
-        Holds tables, TableOps, and TableSequences to acccept, transform, return, and potentially write tables
-
-        - inputIds: list[ str ] | None = None
-            List of op_ids from `tables['__table_processes__']` which are taken as inputs
-        - tableProcesses: TaggedTableProcessDict | pl.DataFrame | None
-        - tables: dict[ str, pl.DataFrame | None ]
-            str -> pl.DataFrame | None
-                key references from a TableProcessRef.source[*] or TableProcesspRef.target[*]
-        - tableOps: types.TableProcessDict
-        - table_inits: dict[ str, TableInitRef ] | None = None
-            Declarative table initializers; ops are registered into tableProcesses and
-            stored as self._init_tables for use by init_data()
-        - process_inits: dict[ str, ProcessInitRef ] | None = None
-            Lazy process factories; stored as self._init_processes for use by init_data()
-        - inbox: Queue | None = None
-        - outbox: Queue | None = None
-        - log: Queue | None = None
-        - verbose: int = 0
+        Compute the op_bindings for each tableProcess, from __table_processes__ to __op_bindings__. Gets run in `web.init_data`, once all table processes have been registered
     """
-    def __init__(
+    def _collect_subtree_pids(
         self: Self,
-        main_id: str = '',
-        rng: np.random.Generator | None = None,
-        inputIds: list[
-            str
-        ] | None = None,
-        tables: dict[
-            str,
-            pl.DataFrame | None
-        ] | None = None,
-        tableOps: types.TableProcessDict | None = None,
-        tableProcesses: types.TaggedTableProcessDict | pl.DataFrame | None = None,
-        table_inits: dict[
-            str,
-            tableInit.TableInitRef
-        ] | None = None,
-        init_table_ops: dict[
-            str,
-            types.TaggedTableProcess
-        ] | None = None,
-        process_inits: dict[
-            str,
-            tableInit.ProcessInitRef
-        ] | None = None,
-        tableProcessFactories: dict[
-            str,
-            Callable
-        ] | None = None,
-        inbox: Queue | None = None,
-        outbox: Queue | None = None,
-        log: Queue | None = None,
+        rows: dict,
+        pid:  int,
+        ) -> set[ int ]:
+        """
+        Return the set of all node_ids in the subtree rooted at pid.
+        """
+        pids = { pid }
+        row  = rows[ pid ]
+        for child in ( row.get( 'term_ids' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
+        #
+        if row.get( 'condition' ) is not None:
+            pids |= self._collect_subtree_pids( rows, row[ 'condition' ] )
+        #
+        for child in ( row.get( 'ifs' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
+        #
+        for child in ( row.get( 'thens' ) or [] ):
+            pids |= self._collect_subtree_pids( rows, child )
+        #
+        return pids
+    #/def _collect_subtree_pids
+    
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
         verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        """
+            :param dfs:
+                - [0]: __table_processes__
+            :returns:
+                - [0]: __op_bindings__
+        """
+        rows      = {
+            r[ 'node_id' ]: r for r in dfs[0].to_dicts()
+        }
+        root_rows = dfs[0].filter(
+            pl.col( 'parent_id' ).is_null() & ( pl.col( 'type' ) != 'Op' )
+        ).to_dicts()
+        
+        frames: list[ pl.DataFrame ] = []
+        for root_row in root_rows:
+            root_op_id = root_row[ 'op_id' ]
+            for pid in self._collect_subtree_pids( rows, root_row[ 'node_id' ] ):
+                r = rows[ pid ]
+                if r[ 'type' ] == 'Op' or not r.get( 'source' ):
+                    continue
+                frames.append( pl.DataFrame(
+                    [{
+                        'root_op_id': root_op_id,
+                        'op_id':      r[ 'op_id' ],
+                        'source':     r[ 'source' ] or [],
+                        'target':     r[ 'target' ] or [],
+                    }],
+                    schema = table_schemas[ 'op_bindings' ],
+                ) )
+            #
+        #
+        
+        op_bindings_df: pl.DataFrame = (
+            pl.concat( frames, how = 'vertical' )
+            if frames
+            else pl.DataFrame( schema = table_schemas[ 'op_bindings' ] )
+        )
+        
+        return ( op_bindings_df, )
+    #/def __call__
+#/class _ComputeOpBindingsOp
+
+_BUILTIN_OPS: types.TableProcessDict = {
+    '_register_process_op':     _register_process_op,
+    '_register_op_schema_op':   _register_op_schema_op,
+    '_register_op_effects_op':  _register_op_effects_op,
+    '_compute_op_bindings_op':  _ComputeOpBindingsOp(),
+    '_always_true':  lambda dfs, verbose=0, verbose_prefix='': True,
+    '_always_false': lambda dfs, verbose=0, verbose_prefix='': False,
+}
+
+# -- Built-in process definitions
+
+_COMPUTE_OP_BINDINGS_PROCESS = tableProcesses.TableProcessRef(
+    op_id  = 'compute_op_bindings',
+    source = ( '__table_processes__', ),
+    target = ( 'op_bindings', ),
+    terms  = [ '_compute_op_bindings_op' ],
+)
+
+_REGISTER_PROCESS_PROCESS = tableProcesses.TableProcessRef(
+    op_id   = 'register_process',
+    source = ( '__new_process__', '__table_processes__' ),
+    target = ( '__table_processes__', ),
+    terms  = [ '_register_process_op' ],
+)
+
+_REGISTER_TABLEOPS_PROCESS = tableProcesses.TableProcessSequence(
+    op_id   = 'register_tableOps',
+    source = ( '__new_op_schema__', '__new_op_effects__', '__table_op_schema__', '__table_op_effects__' ),
+    target = ( '__table_op_schema__', '__table_op_effects__' ),
+    terms  = [
+        tableProcesses.TableProcessRef(
+            op_id   = '_reg_op_schema',
+            source = ( '__new_op_schema__', '__table_op_schema__' ),
+            target = ( '__table_op_schema__', ),
+            terms  = [ '_register_op_schema_op' ],
+        ),
+        tableProcesses.TableProcessRef(
+            op_id   = '_reg_op_effects',
+            source = ( '__new_op_effects__', '__table_op_effects__' ),
+            target = ( '__table_op_effects__', ),
+            terms  = [ '_register_op_effects_op' ],
+        ),
+    ],
+)
+
+
+_BUILTIN_ROOT_OP_IDS: frozenset[ str ] = frozenset({
+    'register_process',
+    'register_tableOps',
+    'compute_op_bindings',
+})
+
+
+def _domain_process_df( df: pl.DataFrame ) -> pl.DataFrame:
+    """Return __table_processes__ rows not belonging to built-in trees."""
+    rows_by_id = { r[ 'node_id' ]: r for r in df.to_dicts() }
+    children: dict[ int, list[ int ] ] = { nid: [] for nid in rows_by_id }
+    for nid, r in rows_by_id.items():
+        if r[ 'parent_id' ] is not None:
+            children[ r[ 'parent_id' ] ].append( nid )
+    builtin_ids: set[ int ] = set()
+    for r in rows_by_id.values():
+        if r[ 'parent_id' ] is None and r[ 'op_id' ] in _BUILTIN_ROOT_OP_IDS:
+            stack = [ r[ 'node_id' ] ]
+            while stack:
+                nid = stack.pop()
+                builtin_ids.add( nid )
+                stack.extend( children.get( nid, [] ) )
+    return df.filter( ~pl.col( 'node_id' ).is_in( list( builtin_ids ) ) )
+#/def _domain_process_df
+
+
+def _extract_op_subtree( df: pl.DataFrame, op_id: str ) -> pl.DataFrame:
+    """Return all rows in __table_processes__ belonging to op_id's tree."""
+    rows_by_id = { r[ 'node_id' ]: r for r in df.to_dicts() }
+    children: dict[ int, list[ int ] ] = { nid: [] for nid in rows_by_id }
+    for nid, r in rows_by_id.items():
+        if r[ 'parent_id' ] is not None:
+            children[ r[ 'parent_id' ] ].append( nid )
+    roots = [
+        r for r in rows_by_id.values()
+        if r[ 'parent_id' ] is None and r[ 'op_id' ] == op_id
+    ]
+    if not roots:
+        return df.slice( 0, 0 )
+    subtree_ids: set[ int ] = set()
+    stack = [ roots[ 0 ][ 'node_id' ] ]
+    while stack:
+        nid = stack.pop()
+        subtree_ids.add( nid )
+        stack.extend( children.get( nid, [] ) )
+    return df.filter( pl.col( 'node_id' ).is_in( list( subtree_ids ) ) )
+#/def _extract_op_subtree
+
+
+class Web:
+    """
+    Fresh implementation of Web with a fixed set of system tables that every
+    instance carries.
+
+    System tables (always present, named with dunder convention):
+        __tables_schema__    — schema registry; one row per table
+                               (table_id, column_names, column_types)
+        __table_processes__  — serialized process trees; dispatched by apply()
+        __table_op_schema__  — per-column schema declarations for registered tableOps
+        __table_op_effects__ — side-effect declarations for registered tableOps
+        __table_init__       — serialized TableInitRef rows
+        __process_init__     — serialized ProcessInitRef rows
+
+    All system-table schemas are themselves rows in __tables_schema__, so the
+    table is self-describing from construction.
+
+    Running:
+        apply(op_id)  — the single dispatch entry point; looks up op_id in
+                        __table_processes__, pulls inputs from self.tables,
+                        runs the process, and writes outputs back to self.tables.
+
+    Extension:
+        register_tableOps(ops)    — merge ops into self.tableOps and update
+                                    __table_op_schema__ / __table_op_effects__.
+        register_process(process) — serialize and append a TaggedTableProcess to
+                                    __table_processes__ via the staging-table pattern.
+        register_tables(tables)   — merge tables into self.tables and append
+                                    schema rows to __tables_schema__ for each new
+                                    DataFrame.
+
+    The built-in 'register_process' and 'register_tableOps' processes are
+    themselves registered during __init__, so they are available via apply().
+    """
+
+    def __init__(
+        self:      Self,
+        main_id:   str,
+        input_ids: list[ str ]                = [],
+        ops:       types.TableProcessDict | None = None,
+        verbose:   int                        = 0,
         ) -> None:
+        self.main_id:   str                   = main_id
+        self.input_ids: list[ str ]           = list( input_ids )
+        self.verbose:   int                   = verbose
+        self.tableOps:  types.TableProcessDict = dict( _BUILTIN_OPS )
 
-        self.main_id = main_id
-        self.rng = rng
+        # -- Initialise system tables
+        self.tables: dict[ str, pl.DataFrame ] = {
+            '__table_processes__':  pl.DataFrame( schema = table_schemas[ '__table_processes__'   ] ),
+            '__table_op_schema__':  pl.DataFrame( schema = table_schemas[ '__table_op_schema__'    ] ),
+            '__table_op_effects__': pl.DataFrame( schema = table_schemas[ '__table_op_effects__'   ] ),
+            '__table_init__':       pl.DataFrame( schema = table_schemas[ '__table_init__'    ] ),
+            '__process_init__':     pl.DataFrame( schema = table_schemas[ '__process_init__'  ] ),
+            # __tables_schema__ bootstraps itself — its own schema is one of the rows
+            '__tables_schema__':    table_schemas_to_df( _SYSTEM_SCHEMAS ),
+        }
 
-        self.inputIds = inputIds or []
-        self.tables = tables or {}
-        self.tableOps = tableOps or {}
-
-        # -- build __table_processes__ DataFrame
-        if isinstance( tableProcesses, pl.DataFrame ):
-            self.tables[ '__table_processes__' ] = tableProcesses
-        #
-        elif tableProcesses:
-            frames, next_id = [], 0
-            for p in tableProcesses.values():
-                df, next_id = p.as_polars( start_id = next_id )
-                frames.append( df )
-            #
-            self.tables[ '__table_processes__' ] = pl.concat( frames, how = 'vertical' )
-        else:
-            self.tables[ '__table_processes__' ] = pl.DataFrame(
-                schema = table_schemas[ '__table_processes__' ]
-            )
-        #
-
-        self._init_tables: dict[ str, tableInit.TableInitRef ] = table_inits or {}
-        self._init_processes: dict[ str, tableInit.ProcessInitRef ] = process_inits or {}
-        self.tableProcessFactories: dict[ str, 'Callable' ] = tableProcessFactories or {}
-
-        _init_ops = init_table_ops or {}
-        for _ref in self._init_tables.values():
-            existing_ops = self.tables[ '__table_processes__' ].filter(
-                pl.col( 'parent_id' ).is_null()
-            )[ 'op_id' ].to_list()
-            if _ref.op_id not in existing_ops:
-                self._register_process_df( _init_ops[ _ref.op_id ] )
-            #
-        #/for _ref in self._init_tables.values()
-
-        self.inbox = inbox or Queue()
-        self.outbox = outbox or Queue()
-        self.log = log or Queue()
-
-        self.verbose = verbose
+        # -- Seed __table_processes__ with built-in process definitions
+        # -- process to register new processes
+        _df, _ = _REGISTER_PROCESS_PROCESS.as_polars( start_id = 0 )
+        self.tables[ '__table_processes__' ] = pl.concat(
+            [ self.tables[ '__table_processes__' ], _df ], how = 'vertical'
+        )
         
-        # -- web_transport input and output
+        # -- process to register table ops
+        _next_id = int( self.tables[ '__table_processes__' ][ 'node_id' ].max() + 1 )
+        _df2, _  = _REGISTER_TABLEOPS_PROCESS.as_polars( start_id = _next_id )
+        self.tables[ '__table_processes__' ] = pl.concat(
+            [ self.tables[ '__table_processes__' ], _df2 ], how = 'vertical'
+        )
         
-        self._receivers:       list[ web_transport.WebReceiver ]  = []
-        self._outbox_senders:  list[ web_transport.OutboxSender ] = []
-        self._heartbeat:      threading.Event                   = threading.Event()
-        self._transport_stop: threading.Event                   = threading.Event()
-        self._heartbeat_thread: threading.Thread | None         = None
+        # -- process to compute op bindings
+        _next_id = int( self.tables[ '__table_processes__' ][ 'node_id' ].max() + 1 )
+        _df3, _  = _COMPUTE_OP_BINDINGS_PROCESS.as_polars( start_id = _next_id )
+        self.tables[ '__table_processes__' ] = pl.concat(
+            [ self.tables[ '__table_processes__' ], _df3 ], how = 'vertical'
+        )
 
-        return
+        if ops:
+            self.register_tableOps( ops )
     #/def __init__
     
-    @classmethod
-    def init_default_with_main_id(
-        cls,
-        main_id: str,
-        rng: np.random.Generator | None = None,
-        main_root: str | None = None,
-        verbose: int = 0,
-        ) -> Self:
-        """
-            Initialize from main_root or getcwd();
-            
-            {main_root}/
-                settings/
-                    paths_index.json
-                        - 'default': "./default/paths.json"
-                        - {main_id}: "./{main_id}/paths.json"
-                    default/
-                        paths.json
-                            - '__main_root__': "../.."
-                            - '__data_root_default__': "data/default"
-                    {main_id}/
-                        paths.json
-                            - '__data_root__': "data/{main_id}"
-                data/
-                    default/
-                    {main_id}/
-                    
-            Setup a data root at main_root/data/{main_id}
-        """
-        from os import path
-        if main_root is None:
-            from os import getcwd
-            main_root = getcwd()
-        #
-        
-        if verbose > 0:
-            print(
-                "Initializing default"
-            )
-            print(
-                "  main_id='{}'".format(
-                    main_id
-                )
-            )
-            print(
-                "  main_root='{}'".format(
-                    main_root
-                )
-            )
-        #/if verbose > 0
-
-        
-        # Get a list of dirs we need to make
-        mkdir_list: list[ str ] = []
-        
-        # Data
-        # {main_root}/data
-        if not path.isdir(
-            data_all_dir:= path.join(
-                main_root, "data"
-            )
-        ):
-            mkdir_list.append( data_all_dir )
-        #
-        
-        # {main_root}/data/{main_id}
-        if not path.isdir(
-            data_self_dir:= path.join(
-                data_all_dir, main_id
-            )
-        ):
-            mkdir_list.append( data_self_dir )
-        #
-        # {main_root}/data/default
-        if not path.isdir(
-            data_default_dir:= path.join(
-                data_all_dir, "default",
-            )
-        ):
-            mkdir_list.append( data_default_dir )
-        #
-        
-        # Settings
-        # {main_root}/settings
-        if not path.isdir(
-            settings_all_dir:= path.join(
-                main_root, "settings"
-            )
-        ):
-            mkdir_list.append( settings_all_dir )
-        #
-        
-        # {main_root}/settings/{main_id}
-        if not path.isdir(
-            settings_self_dir:= path.join(
-                settings_all_dir, main_id
-            )
-        ):
-            mkdir_list.append( settings_self_dir )
-        #
-        # {main_root}/settings/default
-        if not path.isdir(
-            settings_default_dir:= path.join(
-                settings_all_dir, "default",
-            )
-        ):
-            mkdir_list.append( settings_default_dir )
-        #
-        
-        # TEST
-        paths_default_dict: dict[ str, str ] = {
-            '__main_root__': path.relpath(
-                main_root,
-                start = settings_default_dir,
-            ),
-            # Relative to main_root
-            '__data_root_default__': path.join(
-                "data",
-                "default",
-            )
-        }
-        print( paths_default_dict )
-        raise Exception("paths_default_dict")
-        
-        if mkdir_list:
-            print("Create directories?")
-            for _dir in mkdir_list:
-                print("  {}".format(_dir))
-            #
-            
-            if not input(
-                "'y' to continue\n".format(
-                    data_self_dir
-                )
-            ) == "y":
-                quit()
-            #/if not { verify making dirs }
-            from os import mkdir
-            
-            if verbose > 0:
-                print( "mkdir:")
-            #
-            for _dir in mkdir_list:
-                if verbose > 0:
-                    print("  {}".format( _dir ) )
-                #
-                mkdir( _dir )
-            #/for _dir in mkdir_list
-        #/if mkdir_list
-        
-        # Paths
-        import json
-        if not path.isfile(
-            paths_index_fp := path.join(
-                settings_all_dir, 'paths_index.json',
-            )
-        ):
-            paths_index_dict: dict[ str, str ] = {
-                'default': path.join(
-                    ".",
-                    "default",
-                    "paths.json",
-                ),
-                main_id: path.join(
-                    ".",
-                    main_id,
-                    "paths.json",
-                )
-            }
-            with open( paths_index_dict, "w", ) as f:
-                json.dump(
-                    paths_index_dict, f,
-                    indent = 2
-                )
-            #
-        #/if not path.isfile( { paths_index_fp } )
-        else:
-            # Check we're in paths_index
-            paths_index_dict: dict[ str, str ]
-            with open( paths_index_fp ) as f:
-                paths_index_dict = json.load( f )
-            #
-            if main_id not in paths_index_dict:
-                # Add main_id and save
-                paths_index_dict[ main_id ] = path.join(
-                    ".",
-                    main_id,
-                    "paths.json",
-                )
-                
-                with open( paths_index_fp, 'w', ) as f:
-                    json.dump(
-                        paths_index_dict, f,
-                        indent = 2,
-                    )
-                #
-            #
-        #/if not path.isfile( { paths_index_fp } )/else
-        
-        paths_default_dict: dict[ str, str ]
-        if not path.isfile(
-            paths_default_fp := path.join(
-                settings_default_dir,
-                'paths.json',
-            )
-        ):
-            paths_default_dict = {
-                '__main_root__': path.relpath(
-                    main_root,
-                    start = settings_default_dir,
-                ),
-                # Relative to main_root
-                '__data_root_default__': path.join(
-                    "data",
-                    "default",
-                )
-            }
-            with open( paths_default_fp, 'w', ) as f:
-                json.dump(
-                    paths_default_dict, f,
-                    indent = 2
-                )
-            #
-        #/if not path.isfile( { paths_default_fp } )
-        else:
-            with open( paths_default_fp, 'w', ) as f:
-                paths_default_dict = json.load( f )
-            #
-        #/if not path.isfile( { paths_default_fp } )/else
-        
-        paths_self_dict: dict[ str, str ]
-        if not path.isfile(
-            paths_self_fp := path.join(
-                settings_self_dir,
-                "paths.json",
-            )
-        ):
-            paths_self_dict = {
-                '__data_root__': path.join(
-                    "data",
-                    main_id,
-                )
-            }
-            with open( paths_self_fp, 'w', ) as f:
-                json.dump(
-                    paths_self_dict, f,
-                    indent = 2,
-                )
-            #
-        #/if not path.isfile( { paths_self_fp } )
-        else:
-            with open( paths_self_fp ) as f:
-                paths_self_dict = json.load( f )
-            #
-        #/if not path.isfile( { paths_self_fp } )/else
-        
-        return cls(
-            main_id = main_id,
-            rng = rng,
-            tables = {
-                'paths': utilities.paths_df_from_dict(
-                    paths_default_dict
-                    | paths_self_dict
-                ),
-            },
-            verbose = verbose,
-        )
-    #/def init_default_with_main_id
-    
-    @classmethod
-    def load_with_main_id(
-        cls,
-        main_id: str,
-        paths_index_fp: str | None = None,
-        paths_dict: dict[ str, str ] | None = None,
-        rng: np.random.Generator | None = None,
-        verbose: int = 0,
-        ) -> Self:
-        """
-            Find tables['paths'] resolving the paths using utilities.get_paths_for_main_id
-        """
-        if paths_dict is None:
-            paths_dict = utilities.get_paths_for_main_id(
-                main_id = main_id,
-                paths_index_fp = paths_index_fp,
-            )
-        #
-        
-        return cls(
-            main_id = main_id,
-            rng = rng,
-            tables = {
-                'paths': utilities.paths_df_from_dict(
-                    paths_dict,
-                ),
-            },
-            verbose = verbose,
-        )
-    #/def load_with_main_id
-    
-    def _register_process_df(
-        self: Self,
-        process: types.TaggedTableProcess,
-    ) -> None:
-        """Serialize `process` and append its rows to tables['__table_processes__']."""
-        existing = self.tables[ '__table_processes__' ]
-        next_id  = int( existing[ 'node_id' ].max() + 1 ) if existing.shape[0] > 0 else 0
-        df, _    = process.as_polars( start_id = next_id )
-        self.tables[ '__table_processes__' ] = pl.concat( [ existing, df ], how = 'vertical' )
-    #/def _register_process_df
-
-    def notify(self) -> None:
-        """Signal the heartbeat thread that inbox has a new item."""
-        self._heartbeat.set()
-    #/def notify
-
     def bind(
-        self,
+        self: Self,
         address: str,
-        sender: web_transport.WebSender,
-        context: zmq.Context | None = None,
-    ) -> None:
+        context: 'zmq.Context | None' = None,
+        ) -> None:
         """
-        Attach a ZMQ listener on address.  May be called multiple times before
-        start() to listen on several addresses simultaneously.
-
-        The first call also creates an OutboxSender monitoring self.outbox.
-        Use bind_outbox() to monitor additional queues (e.g. original outboxes
-        captured by inherited send_ops after combine_web).
+            No op, makes Web conform to types.WebNode
         """
-        self._receivers.append(
-            web_transport.WebReceiver(
-                self,
-                address,
-                context
-            )
-        )
-        if not self._outbox_senders:
-            self._outbox_senders.append( web_transport.OutboxSender( self, sender ) )
-        #
-        
-        return
+        pass
     #/def bind
-
-    def bind_outbox(
-        self,
-        outbox: Queue,
-        sender: web_transport.WebSender,
-    ) -> None:
-        """
-        Add an OutboxSender that monitors ``outbox`` instead of self.outbox.
-        Useful after combine_web, where inherited tableProcesses write to the
-        original webs' queues rather than the combined web's own outbox.
-        Routes are still read from self.tables['routes'].
-        """
-        self._outbox_senders.append(
-            web_transport.OutboxSender( self, sender, outbox=outbox )
-        )
-    #/def bind_outbox
-
-    def start( self ) -> None:
-        """Start all receivers, all outbox senders, and heartbeat processor thread."""
-        self._transport_stop.clear()
-        for receiver in self._receivers:
-            receiver.start()
-        #
-        for outbox_sender in self._outbox_senders:
-            outbox_sender.start()
-        #
-        self._heartbeat_thread = threading.Thread(
-            target = self._heartbeat_loop, daemon=True
-        )
-        self._heartbeat_thread.start()
-        
-        return
-    #/def start
-
-    def stop( self ) -> None:
-        """Stop all transport threads."""
-        self._transport_stop.set()
-        self._heartbeat.set()
-        for receiver in self._receivers:
-            receiver.stop()
-        #
-        
-        for outbox_sender in self._outbox_senders:
-            outbox_sender.stop()
-        #
-        return
-    #/def stop
-
-    def _heartbeat_loop( self ) -> None:
-        while not self._transport_stop.is_set():
-            self._heartbeat.wait( timeout=0.2 )
-            self._heartbeat.clear()
-            if self._transport_stop.is_set():
-                break
-            #
-            self.process_inbox_all()
-        #/while not self._transport_stop.is_set()
-        
-        # Drain any items that arrived before the stop signal was detected
-        self.process_inbox_all()
-        
-        return
-    #/def _heartbeat_loop
-
-    def join(
-        self: Self,
-        timeout: float | None = None,
-        ) -> None:
-        """Block until all transport threads have exited. Call after stop()."""
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join( timeout=timeout )
-        #
-        for receiver in self._receivers:
-            if receiver._thread is not None:
-                receiver._thread.join( timeout=timeout )
-            #
-        #
-        for outbox_sender in self._outbox_senders:
-            if outbox_sender._thread is not None:
-                outbox_sender._thread.join( timeout=timeout )
-            #
-        #
-        return
-    #/def join
-
-    def absorb_back(
-        self: Self,
-        sub_web: Self,
-        ) -> None:
-        """
-        Reverse a partition_out: swap the real processes from ``sub_web`` back
-        into this web and remove the routing entries for ``sub_web``.
-
-        Stop ``sub_web`` before calling this; once absorbed its threads are no
-        longer needed:
-
-            sub_web.stop()
-            sub_web.join()
-            web.absorb_back( sub_web )
-
-        No tableOps merge is performed — ``partition_out`` already copied
-        ``web.tableOps`` in full, so the re-installed processes resolve against
-        the existing tableOps without any additions.
-        """
-        sub_df = sub_web.tables.get(
-            '__table_processes__',
-            pl.DataFrame( schema = table_schemas[ '__table_processes__' ] ),
-        )
-        if sub_df.shape[0] > 0:
-            sub_rows = { r[ 'node_id' ]: r for r in sub_df.to_dicts() }
-            all_pids: set[int] = set()
-            for op_id in sub_web.inputIds:
-                root_pid = tableProcesses.find_root_pid( sub_df, op_id )
-                all_pids |= _collect_subtree_pids( sub_rows, root_pid )
-            #
-            subtree_df = sub_df.filter( pl.col( 'node_id' ).is_in( list( all_pids ) ) )
-            existing = self.tables[ '__table_processes__' ]
-            offset = int( existing[ 'node_id' ].max() + 1 ) if existing.shape[0] > 0 else 0
-            self.tables[ '__table_processes__' ] = pl.concat(
-                [ existing, tableProcesses.reindex_process_df( subtree_df, offset ) ],
-                how = 'vertical',
-            )
-        #
-
-        routes = self.tables.get( 'routes' )
-        if routes is not None:
-            self.tables[ 'routes' ] = routes.filter(
-                pl.col( 'web_id' ) != sub_web.main_id
-            )
-        #/if routes is not None
-    #/def absorb_back
-
-    def init_table(
-        self: Self,
-        df: pl.DataFrame,
-        cellId: str,
-        ) -> None:
-        """
-            Adds a new table to `self.tables`. If the `cellId` is already present, the value must be `None`, so we do not overwrite anything.
-            
-        """
-        if cellId in self.tables:
-            assert self.tables[ cellId ] is None
-        #
-        
-        self.tables[ cellId ] = df
-        
-        return
-    #/def init_table
     
-    # Processing
-    
+    # -- Dispatch
+
     def apply(
         self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        taggedTableProcess: types.TaggedTableProcess,
+        dfs: tuple[ pl.DataFrame,... ],
+        op_id: str,
+        processes_table_id: str = '__table_processes__',
         verbose: int = 0,
-        verbose_prefix: str = "",
+        verbose_prefix: str = '',
         ) -> tuple[ pl.DataFrame,... ]:
-        return taggedTableProcess(
-            dfs = dfs,
-            tableOps = self.tableOps,
-            verbose = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-    #/def apply
-    
-    def apply_id(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        id: str,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-        ) -> tuple[ pl.DataFrame,... ]:
-        """Run a process by op_id with explicit dfs; does not write to self.tables."""
-        df       = self.tables[ '__table_processes__' ]
-        root_pid = tableProcesses.find_root_pid( df, id )
+        """
+        Stateless dispatch: look up op_id in __table_processes__, run it against
+        the provided dfs, and return the result tuple.
+        """
+        df       = self.tables[ processes_table_id ]
+        root_pid = tableProcesses.find_root_pid( df, op_id )
         return tableProcesses.run_from_df(
             df             = df,
             root_pid       = root_pid,
@@ -700,296 +351,352 @@ class Web():
             verbose        = verbose,
             verbose_prefix = verbose_prefix,
         )
-    #/def apply_id
-    
+    #/def apply
+
     def put(
-        self,
-        dfs: tuple[ pl.DataFrame,... ],
-        taggedTableProcess: types.TaggedTableProcess,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-        ) -> None:
-        """
-            Apply dfs as the whole source to the taggedTableProcess instead of self.tables, but write the result to self.tables based on taggedTableProcess.target
-            
-            :param dfs: New dataframe tuple matching taggedTableProcess.source
-            :allow_new: If any tableId in taggedTableProcess.target is not in self.tables, write it. Otherwise, raises an error.
-        """
-        if len( taggedTableProcess.source ) != len( dfs ):
-            raise ValueError(
-                "len( taggedTableProcess.source )={}, expected {}".format(
-                    len( taggedTableProcess.source ), len( dfs )
-                )
-            )
-        #
-        
-        if not allow_new:
-            if not all( tableId in self.tables for tableId in taggedTableProcess.target ):
-                raise ValueError("Bad taggedTableProcess.target={}".format(taggedTableProcess.target))
-            #
-        #
-        
-        result: tuple[ pl.DataFrame,... ] = self.apply(
-            dfs = dfs,
-            taggedTableProcess = taggedTableProcess,
-            verbose = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-        
-        # Update self.tables with the result
-        self.tables |= dict(
-            zip(
-                taggedTableProcess.target,
-                result,
-            )
-        )
-        
-        return
-    #/def put
-    
-    def put_id(
-        self,
-        dfs: tuple[ pl.DataFrame,... ],
-        id: str,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-        ) -> None:
-        """Run a process by op_id with explicit dfs and write results to self.tables."""
-        df       = self.tables[ '__table_processes__' ]
-        root_pid = tableProcesses.find_root_pid( df, id )
-        rows     = { r[ 'node_id' ]: r for r in df.to_dicts() }
-        top_row  = rows[ root_pid ]
-        if not allow_new and not all( tid in self.tables for tid in top_row[ 'target' ] ):
-            raise ValueError( "Bad target={}".format( top_row[ 'target' ] ) )
-        result = tableProcesses.run_from_df(
-            df             = df,
-            root_pid       = root_pid,
-            dfs            = dfs,
-            tableOps       = self.tableOps,
-            verbose        = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-        self.tables |= dict( zip( top_row[ 'target' ], result ) )
-    #/def put_id
-    
-    def run(
         self: Self,
-        taggedTableProcess: types.TaggedTableProcess,
-        verify: bool = False,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-        ) -> None:
-        """
-            Runs the tagged tableProcess with the entire source coming from self.tables
-        """
-        if verify:
-            processSignature: types.TaggedTableProcessSignature = self.tableProcessSignature(
-                taggedTableProcess,
-            )
-            if processSignature.source != []:
-                raise ValueError(
-                    "processSignature.source={}, expected []".format(
-                        processSignature,
-                    )
-                )
-            #
-        #/if verify
-        
-        dfs: tuple[ pl.DataFrame,... ] = tuple(
-            self.tables[ tableId ]
-            for tableId in taggedTableProcess.source
-        )
-        
-        return self.put(
-            dfs = dfs,
-            taggedTableProcess = taggedTableProcess,
-            allow_new = allow_new,
-            verbose = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-    #/def run
-    
-    def run_id(
-        self,
-        id: str,
-        verify: bool = False,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-        ) -> None:
-        return self.run_df(
-            op_id          = id,
-            allow_new      = allow_new,
-            verbose        = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-    #/def run_id
-
-    def run_df(
-        self: Self,
+        dfs: tuple[ pl.DataFrame, ... ],
         op_id: str,
-        df: pl.DataFrame | None = None,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
+        processes_table_id: str = '__table_processes__',
+        verbose: int | None = None,
+        verbose_prefix: str = '',
         ) -> None:
-        if df is None:
-            df = self.tables[ '__table_processes__' ]
-        root_pid   = tableProcesses.find_root_pid( df, op_id )
-        rows       = { r[ 'node_id' ]: r for r in df.to_dicts() }
-        top_row    = rows[ root_pid ]
-        top_source = top_row[ 'source' ]
-        top_target = top_row[ 'target' ]
-        if not allow_new:
-            if not all( tid in self.tables for tid in top_target ):
-                raise ValueError( "Bad target={}".format( top_target ) )
-        dfs = tuple( self.tables[ tid ] for tid in top_source )
-        result = tableProcesses.run_from_df(
-            df             = df,
-            root_pid       = root_pid,
-            dfs            = dfs,
-            tableOps       = self.tableOps,
-            verbose        = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-        self.tables |= dict( zip( top_target, result ) )
-        return
-    #/def run_df
-
-    def process_inbox_once(
-        self,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-    ) -> bool:
         """
-            Consume one item from inbox and dispatch it to the matching tableProcess.
-            Items are (op_id, dfs) tuples placed there by WebReceiver.
-            Returns True if an item was processed, False if inbox was empty.
+        Run op_id against the provided dfs and write the results back to
+        self.tables by target name.  Like run but the caller supplies the
+        input dfs directly instead of reading them from self.tables.
         """
-        try:
-            item = self.inbox.get_nowait()
-        except Empty:
-            return False
-        op_id, dfs = item
-        df       = self.tables[ '__table_processes__' ]
+        _verbose = self.verbose if verbose is None else verbose
+        df       = self.tables[ processes_table_id ]
         root_pid = tableProcesses.find_root_pid( df, op_id )
         rows     = { r[ 'node_id' ]: r for r in df.to_dicts() }
         top_row  = rows[ root_pid ]
-        result   = tableProcesses.run_from_df(
-            df             = df,
-            root_pid       = root_pid,
-            dfs            = dfs,
-            tableOps       = self.tableOps,
-            verbose        = verbose,
-            verbose_prefix = verbose_prefix,
+        result   = self.apply(
+            dfs                = dfs,
+            op_id              = op_id,
+            processes_table_id = processes_table_id,
+            verbose            = _verbose,
+            verbose_prefix     = verbose_prefix,
         )
-        if allow_new or all( tid in self.tables for tid in top_row[ 'target' ] ):
-            self.tables |= dict( zip( top_row[ 'target' ], result ) )
-        return True
-    #/def process_inbox_once
-
-    def process_inbox_all(
-        self,
-        allow_new: bool = False,
-        verbose: int = 0,
-        verbose_prefix: str = "",
-    ) -> int:
-        """
-            Consume all pending inbox items. Returns count processed.
-        """
-        count = 0
-        while self.process_inbox_once(
-            allow_new = allow_new,
-            verbose = verbose,
-            verbose_prefix = verbose_prefix,
-        ):
-            count += 1
-        return count
-    #/def process_inbox_all
-    
-    # -- Web Graph Analysis
-    
-    def tableProcessSignature(
-        self: Self,
-        taggedTableProcess: types.TaggedTableProcess
-        ) -> types.TaggedTableProcessSignature:
-        """
-            Signature for one TaggedTableProcess in the context of self
-        """
-        tableKeys: set[ str ] = set( self.tables.keys() )
-        collector: types.SignatureCollector = taggedTableProcess.get_signatureCollector()
-
-        # Subtract collector.target from collector.source to exclude intermediates:
-        # intermediate tables appear in collector.source (consumed by a later step)
-        # but were produced within the process, not supplied externally.
-        external_inputs: set[ str ] = collector.source - collector.target
-
-        return types.TaggedTableProcessSignature(
-            source = list( sorted( external_inputs - tableKeys ) ),
-            context = list( sorted( collector.source & tableKeys ) ),
-            intermediate = list( sorted( collector.target - tableKeys ) ),
-            target = list( sorted( collector.target & tableKeys ) ),
+        self.tables |= dict(
+            zip( top_row[ 'target' ], result )
         )
-    #/def tableProcessSignature
+    #/def put
     
-    def get_tableProcessesSignatures(
+    def get(
         self: Self,
-        ) -> dict[
-            str, # modTableProcess key
-            types.TaggedTableProcessSignature
-        ]:
+        op_id: str,
+        extra: dict[ str, pl.DataFrame ] | None = None,
+        processes_table_id: str = '__table_processes__',
+        verbose: int | None = None,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame, ... ]:
         """
-            Trawl each `self.modTableProcess` to get its ModTableProcessSignature, which must be done in the context of `self.tables`
-            
-            source: Tables which are inputs to some TableProcess but not in self.tables
-            context: Tables which are inputs to some TableProcess, and are in self.tables.
-            target: Tables which are either the target of the top level ModTableProcess, or which are outputs of some TableProcess and are in self.tables. They might change when calling the process.
-            intermediate: Tables which are the output of some TableProcess, but which are neither in the top level target nor in self.tables; they will not persist between calls.
-            
-            Note that there might be overlap:
-                - between context and target since existing tables can get modified
-            
-            There should not be overlap between:
-                - source and context: Source should be 'inputs' to the ModTableProcess while context should be in self.tables
-                - source and target: If we are modifying a table, putting it in target, then it should exist before calling the ModTableProcess; thus, it would not be in source.
+            Stateful get, but no change: pull inputs named in source from self.tables merged with extra, run the process, return the result.
+        """
+        _verbose   = self.verbose if verbose is None else verbose
+        df         = self.tables[ processes_table_id ]
+        root_pid   = tableProcesses.find_root_pid( df, op_id )
+        rows       = {
+            r[ 'node_id' ]: r for r in df.to_dicts()
+        }
+        top_row    = rows[ root_pid ]
+        all_tables = dict( self.tables ) | dict( extra or {} )
+        dfs        = tuple(
+            all_tables[ tid ]
+            for tid in top_row[ 'source' ]
+        )
+        
+        return self.apply(
+            dfs                 = dfs,
+            op_id               = op_id,
+            processes_table_id  = processes_table_id,
+            verbose             = _verbose,
+            verbose_prefix      = verbose_prefix,
+        )
+    #/def get
+    
+    def run(
+        self: Self,
+        op_id: str,
+        extra: dict[ str, pl.DataFrame ] | None = None,
+        processes_table_id: str = '__table_processes__',
+        verbose: int | None = None,
+        verbose_prefix: str = '',
+        ) -> None:
+        """
+        Stateful dispatch: pull all inputs named in source from self.tables merged
+        with extra, run the process, and write outputs back to self.tables by target.
+        Pass extra to inject tables not yet in self.tables (e.g. staged inputs).
+        """
+        _verbose   = self.verbose if verbose is None else verbose
+        df         = self.tables[ processes_table_id ]
+        root_pid   = tableProcesses.find_root_pid( df, op_id )
+        rows       = {
+            r[ 'node_id' ]: r for r in df.to_dicts()
+        }
+        top_row    = rows[ root_pid ]
+        all_tables = dict( self.tables ) | dict( extra or {} )
+        dfs        = tuple(
+            all_tables[ tid ]
+            for tid in top_row[ 'source' ]
+        )
+        
+        result     = self.apply(
+            dfs                 = dfs,
+            op_id               = op_id,
+            processes_table_id  = processes_table_id,
+            verbose             = _verbose,
+            verbose_prefix      = verbose_prefix,
+        )
+        self.tables |= dict(
+            zip( top_row[ 'target' ], result )
+        )
+    #/def run
+
+    # -- Registration
+
+    def register_tableOps(
+        self: Self,
+        ops: types.TableProcessDict,
+        ) -> None:
+        """
+        Merge `ops` into self.tableOps and update __table_op_schema__ /
+        __table_op_effects__ for ops that expose input / output / effects.
+        Dispatches 'register_tableOps' via apply(), passing new rows directly
+        as dfs and writing the results back to self.tables.
+        """
+        self.tableOps |= ops
+        
+        # Check for schema
+        _schema_rows:  list[ pl.DataFrame ] = []
+        _effects_rows: list[ pl.DataFrame ] = []
+        for op_id, op in ops.items():
+            _has_schema  = getattr( op, 'input', None ) is not None or getattr( op, 'output',  None ) is not None
+            _has_effects = getattr( op, 'effects', None ) is not None
+            if _has_schema:
+                _schema_df, _effects_df = TableOpSchema(
+                    inputs  = op.input  or [],
+                    outputs = op.output or [],
+                    effects = op.effects or [],
+                ).to_polars( op_id )
+                _schema_rows.append( _schema_df )
+                if not _effects_df.is_empty():
+                    _effects_rows.append( _effects_df )
+            elif _has_effects and op.effects:
+                _, _effects_df = TableOpSchema(
+                    inputs = [], outputs = [], effects = op.effects,
+                ).to_polars( op_id )
+                _effects_rows.append( _effects_df )
+        #/for op_id, op in ops.items()
+        
+        _new_schema  = (
+            pl.concat( _schema_rows,  how = 'vertical' )
+            if _schema_rows
+            else pl.DataFrame( schema = table_schemas[ '__table_op_schema__' ] )
+        )
+        _new_effects = (
+            pl.concat( _effects_rows, how = 'vertical' )
+            if _effects_rows
+            else pl.DataFrame( schema = table_schemas[ '__table_op_effects__' ] )
+        )
+        
+        (
+            self.tables[ '__table_op_schema__'  ],
+            self.tables[ '__table_op_effects__' ],
+        ) = self.apply(
+            dfs = (
+                _new_schema,
+                _new_effects,
+                self.tables[ '__table_op_schema__'  ],
+                self.tables[ '__table_op_effects__' ],
+            ),
+            op_id = 'register_tableOps',
+        )
+    #/def register_tableOps
+
+    def register_process(
+        self: Self,
+        process: types.TaggedTableProcess,
+        ) -> None:
+        """
+        Serialize `process` and append it to __table_processes__.
+        The new rows are serialized at start_id=0; run('register_process')
+        reindexes them to avoid collisions before appending.
+
+        NOTE: If you have a process already serialized as a DataFrame, you can call
+        run( 'register_process', extra = { '__new_process__': process_df } ) directly.
+        """
+        _df, _ = process.as_polars( start_id = 0 )
+        self.run(
+            'register_process',
+            extra = { '__new_process__': _df }
+        )
+    #/def register_process
+
+    def register_tables(
+        self: Self,
+        tables: dict[ str, pl.DataFrame | None ],
+        ) -> None:
+        """
+        Merge `tables` into self.tables.
+        Appends a __tables_schema__ row for each new entry that is a DataFrame
+        (None-valued placeholders are merged silently with no schema row).
         """
         
-        df        = self.tables[ '__table_processes__' ]
-        rows      = { r[ 'node_id' ]: r for r in df.to_dicts() }
-        root_rows = df.filter( pl.col( 'parent_id' ).is_null() ).to_dicts()
-        tableKeys = set( self.tables.keys() )
-        result: dict[ str, types.TaggedTableProcessSignature ] = {}
-
-        for root_row in root_rows:
-            if root_row[ 'type' ] == 'Op':
-                continue
-            sources, targets = _collect_subtree_sources_targets( rows, root_row[ 'node_id' ] )
-            external_inputs  = sources - targets
-            result[ root_row[ 'op_id' ] ] = types.TaggedTableProcessSignature(
-                source       = sorted( external_inputs - tableKeys ),
-                context      = sorted( sources & tableKeys ),
-                target       = sorted( targets & tableKeys ),
-                intermediate = sorted( targets - tableKeys ),
+        
+        self.tables |= tables
+        
+        # Collect schema of new tables to add to __tables_schema__
+        new_rows: list[ dict ] = []
+        for tid, df in tables.items():
+            if isinstance( df, pl.DataFrame ) and tid not in self.tables:
+                new_rows.append({
+                    'table_id':     tid,
+                    'column_names': list( df.columns ),
+                    'column_types': [ dtype_to_str( df.schema[ c ] ) for c in df.columns ],
+                })
+            #/if isinstance( df, pl.DataFrame ) and tid not in self.tables
+        #/for tid, df
+        
+        if new_rows:
+            self.tables[ '__tables_schema__' ] = pl.concat(
+                [
+                    self.tables[ '__tables_schema__' ],
+                    pl.DataFrame( new_rows, schema = table_schemas[ '__tables_schema__' ] ),
+                ],
+                how = 'vertical',
             )
-        #/for root_row in root_rows
+        #/if new_rows
+    #/def register_tables
 
-        return result
-    #/def get_tableProcessesSignatures
+    def init_data(
+        self: Self,
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> None:
+        """
+        Run all registered init ops in topological dependency order.
+        For each entry in topological order derived from __table_init__ and
+        __process_init__:
+          - table:   run( ref.op_id )   if always_run or table not yet populated
+          - process: run( ref.factory_id ) if process not yet in __table_processes__
+          
+        Factory processes are TaggedTableProcesses already registered in
+        __table_processes__; when run they produce and register the target process.
+        """
+        for _type, _init_id in topological_init_order_from_df(
+            self.tables[ '__table_init__'   ],
+            self.tables[ '__process_init__' ],
+        ):
+            if _type == 'table':
+                row = self.tables[ '__table_init__' ].filter(
+                    pl.col( 'table_id' ) == _init_id
+                ).row( 0, named = True )
+                if row[ 'always_run' ] or self.tables.get( row[ 'table_id' ] ) is None:
+                    self.run(
+                        row[ 'op_id' ],
+                        verbose        = verbose,
+                        verbose_prefix = verbose_prefix,
+                    )
+                #
+            else:
+                row = self.tables[ '__process_init__' ].filter(
+                    pl.col( 'op_id' ) == _init_id
+                ).row( 0, named = True )
+                if self.tables[ '__table_processes__' ].filter(
+                    ( pl.col( 'op_id' ) == row[ 'op_id' ] )
+                    & pl.col( 'parent_id' ).is_null()
+                ).is_empty():
+                    if row[ 'factory_id' ] is None:
+                        raise RuntimeError(
+                            f"Process '{row[ 'op_id' ]}' has factory_id=None "
+                            f"but is absent from __table_processes__"
+                        )
+                    self.run(
+                        row[ 'factory_id' ],
+                        verbose        = verbose,
+                        verbose_prefix = verbose_prefix,
+                    )
+                #
+            #
+        #/for _type, _init_id
+
+        self.run( 'compute_op_bindings' )
+    #/def init_data
+
+    @classmethod
+    def merge(
+        cls,
+        a: Self,
+        b: Self,
+        main_id: str = '',
+        ) -> Self:
+        """
+        Produce a new Web combining a and b.
+        main_id is '{a.main_id}_{b.main_id}'.
+        tableOps: non-builtin ops from both (b overwrites a on conflict).
+        __table_processes__: non-builtin trees from both, reindexed to avoid
+            node_id collisions; on op_id conflict, a's tree is shadowed by b's.
+        __table_init__ / __process_init__: concatenated and deduplicated on
+            their primary keys (b wins on conflict).
+        Domain tables (non-system keys): a's, then b's (b overwrites a).
+        """
+        merged = cls(
+            main_id   = main_id or f"{ a.main_id }_{ b.main_id }",
+            input_ids = list( dict.fromkeys( a.input_ids + b.input_ids ) ),
+        )
+
+        _builtin_keys = set( _BUILTIN_OPS )
+        ops: types.TableProcessDict = {
+            k: v for k, v in a.tableOps.items() if k not in _builtin_keys
+        } | {
+            k: v for k, v in b.tableOps.items() if k not in _builtin_keys
+        }
+        
+        if ops:
+            merged.register_tableOps( ops )
+        #
+        
+        for web in ( a, b ):
+            domain_df = _domain_process_df( web.tables[ '__table_processes__' ] )
+            if domain_df.is_empty():
+                continue
+            _max = merged.tables[ '__table_processes__' ][ 'node_id' ].max()
+            offset = int( _max + 1 ) if _max is not None else 0
+            reindexed = tableProcesses.reindex_process_df( domain_df, offset )
+            merged.tables[ '__table_processes__' ] = pl.concat(
+                [ merged.tables[ '__table_processes__' ], reindexed ], how = 'vertical',
+            )
+        #
+
+        for key, pk in (
+            ( '__table_init__',    'table_id' ),
+            ( '__process_init__',  'op_id'    ),
+        ):
+            combined = pl.concat(
+                [ a.tables[ key ], b.tables[ key ] ],
+                how = 'vertical',
+            )
+            merged.tables[ key ] = combined.unique(
+                subset = [ pk ],
+                keep = 'last',
+            )
+        #/for key, pk in (...)
+
+        _system_keys = set( _SYSTEM_SCHEMAS )
+        for k, v in a.tables.items():
+            if k not in _system_keys:
+                merged.tables[ k ] = v
+            #/if k not in _system_keys
+        #/for k, v in a.tables.items()
+        
+        for k, v in b.tables.items():
+            if k not in _system_keys:
+                merged.tables[ k ] = v
+            #/if k not in _system_keys
+        #/for k, v in b.tables.items()
+
+        return merged
+    #/def merge
 #/class Web
-
-
-def from_polars(
-    df: pl.DataFrame,
-    inbox: Queue | None = None,
-    outbox: Queue | None = None,
-    log: Queue | None = None
-    ) -> Web:
-    """
-        :param df: ...
-    """
-    raise Exception("UC")
-#/def from_polars

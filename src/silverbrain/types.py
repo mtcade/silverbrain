@@ -132,26 +132,65 @@ TaggedTableProcessDict: Type = dict[ str, TaggedTableProcess | TaggedTableCheck 
 
 # -- Web
 
-from queue import Queue
-
-class WebProtocol( Protocol ):
+class WebNode( Protocol ):
     """
-        Structural interface for the subset of Web attributes used by
-        WebReceiver and OutboxSender in web_transport.  Any Web subclass
-        satisfies this automatically.
+    Minimal structural interface shared by web.Web and all webNetwork
+    implementations.  Anything that exposes put and input_ids satisfies this.
     """
-    inputIds: list[ str ]
-    inbox:    Queue
-    outbox:   Queue
-    tables:   dict[ str, pl.DataFrame | None ]
+    input_ids: list[ str ]
 
-    def notify( self ) -> None:
-        """Signal the web that a new item has been placed in inbox."""
-        ...
-    #/def notify
-#/class WebProtocol
+    def put(
+        self,
+        dfs:                tuple[ pl.DataFrame, ... ],
+        op_id:              str,
+        processes_table_id: str       = '__table_processes__',
+        verbose:            int | None = None,
+        verbose_prefix:     str       = '',
+    ) -> None: ...
+    #/def put
+
+    def bind(
+        self,
+        address: str,
+        context: 'zmq.Context | None' = None,
+    ) -> None: ...
+    #/def bind
+#/class WebNode
 
 
+class WebNetwork( Protocol ):
+    """
+    Full network lifecycle interface: WebNode extended with start/stop/join.
+    Satisfied by all webNetwork implementations but not by web.Web directly.
+    """
+    input_ids: list[ str ]
+
+    def put(
+        self,
+        dfs:                tuple[ pl.DataFrame, ... ],
+        op_id:              str,
+        processes_table_id: str       = '__table_processes__',
+        verbose:            int | None = None,
+        verbose_prefix:     str       = '',
+    ) -> None: ...
+    #/def put
+
+    def bind(
+        self,
+        address: str,
+        context: 'zmq.Context | None' = None,
+    ) -> None: ...
+    #/def bind
+
+    def start( self ) -> None: ...
+    def stop( self )  -> None: ...
+
+    def join(
+        self,
+        timeout: float | None = None,
+    ) -> None: ...
+    #/def join
+#/class WebNetwork
 
 
 

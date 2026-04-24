@@ -7,7 +7,7 @@
 
 import polars as pl
 
-from ..web import Web
+from ..webOld import Web
 from ..tableProcesses import TableProcessRef
 from ..schema import table_schemas
 
@@ -52,11 +52,9 @@ def make_router_web(
         Usage:
             router = make_router_web()
             ctx = zmq.Context()
-            sender = WebSender(context=ctx)
-            receiver = WebReceiver(web=router, address='inproc://router', context=ctx)
-            outbox_sender = OutboxSender(web=router, sender=sender)
-            receiver.start()
-            outbox_sender.start()
+            net = LocalWebNode( router, input_ids=[ 'update_routes' ] )
+            net.bind( 'inproc://router', ctx )
+            net.start()
     """
     routes = initial_routes if initial_routes is not None else _empty_routes()
 

@@ -6,7 +6,6 @@
 #//
 
 from . import types
-from .tableOps import TransformOp
 from .schema import table_schemas
 
 import polars as pl
@@ -209,11 +208,11 @@ def run_from_df(
 class TableProcessRef():
     source: Sequence[ str ]
     target: Sequence[ str ]
-    terms: Sequence[ str | types.TableProcess ]
+    terms: Sequence[ str ]
     op_id: str
     """
         Holds a reference to an atomic types.TableProcess. All together acts as an atomic types.TaggedTableProcess.
-        terms is a single-element list: [op_key_string] or [callable].
+        terms is a single-element list: [op_key_string].
     """
     def __call__(
         self: Self,
@@ -223,14 +222,7 @@ class TableProcessRef():
         verbose_prefix: str = '',
         ) -> dict[ str, pl.DataFrame ]:
 
-        tableProcess: types.TableProcess
-        op = self.terms[ 0 ]
-        if isinstance( op, str ):
-            tableProcess = tableOps[ op ]
-        #
-        else:
-            tableProcess = op
-        #
+        tableProcess: types.TableProcess = tableOps[ self.terms[ 0 ] ]
 
         if verbose > 0:
             print(
@@ -307,63 +299,20 @@ class TableProcessRef():
             node_id = child_id,
             parent_id  = my_id,
             type       = 'Op',
-            op_id      = op if isinstance( op, str ) else None,
+            op_id      = self.terms[ 0 ],
         )
         return pl.concat( [ self_row, child_row ], how = 'vertical' ), start_id + 2
     #/def as_polars
 #/class TableProcessRef
 
-# -- Process Ref Shortcuts
-
-def get(
-    source: tuple[ str,... ] | str,
-    target: tuple[ str,... ] | str,
-    op_id: str = '_anonymous_simpleGetOp',
-    ) -> TableProcessRef:
-    if isinstance( source, str ):
-        source = ( source, )
-    #
-    if isinstance( target, str ):
-        target = ( target, )
-    #
-
-    return TableProcessRef(
-        source = source,
-        target = target,
-        terms  = [ SimpleGetOp() ],
-        op_id  = op_id,
-    )
-#/def get
-
-def transform(
-    source: tuple[ str,... ] | str,
-    target: tuple[ str,... ] | str,
-    lam: types.TableProcess,
-    op_id: str = '_anonymous_transformOp',
-    ) -> TransformOp:
-    if isinstance( source, str ):
-        source = ( source, )
-    #
-    if isinstance( target, str ):
-        target = ( target, )
-    #
-
-    return TableProcessRef(
-        source = source,
-        target = target,
-        terms  = [ TransformOp( lam = lam ) ],
-        op_id  = op_id,
-    )
-#/def transform
-
 @dataclass
 class TableCheckRef():
     """
         Used mostly for `TableProcessWhile`. `TableProcessBranch`.
-        terms is a single-element list: [op_key_string] or [callable].
+        terms is a single-element list: [op_key_string].
     """
     source: Sequence[ str ]
-    terms: Sequence[ types.TableCheck | str ]
+    terms: Sequence[ str ]
     op_id: str
 
     def __call__(
@@ -374,14 +323,7 @@ class TableCheckRef():
         verbose_prefix: str = '',
         ) -> bool:
 
-        tableCheck: types.TableCheck
-        op = self.terms[ 0 ]
-        if isinstance( op, str ):
-            tableCheck = tableOps[ op ]
-        #
-        else:
-            tableCheck = op
-        #
+        tableCheck: types.TableCheck = tableOps[ self.terms[ 0 ] ]
 
         check: bool = tableCheck(
             dfs,
@@ -443,7 +385,7 @@ class TableCheckRef():
             node_id = child_id,
             parent_id  = my_id,
             type       = 'Op',
-            op_id      = op if isinstance( op, str ) else None,
+            op_id      = self.terms[ 0 ],
         )
         return pl.concat( [ self_row, child_row ], how = 'vertical' ), start_id + 2
     #/def as_polars
@@ -453,7 +395,7 @@ def always_true( op_id: str = '_always_true' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns True."""
     return TableCheckRef(
         source = [],
-        terms  = [ lambda dfs, verbose=0, verbose_prefix='': True ],
+        terms  = [ '_always_true' ],
         op_id  = op_id,
     )
 #/def always_true
@@ -462,7 +404,7 @@ def always_false( op_id: str = '_always_false' ) -> TableCheckRef:
     """Return a TableCheckRef whose check always returns False."""
     return TableCheckRef(
         source = [],
-        terms  = [ lambda dfs, verbose=0, verbose_prefix='': False ],
+        terms  = [ '_always_false' ],
         op_id  = op_id,
     )
 #/def always_false
