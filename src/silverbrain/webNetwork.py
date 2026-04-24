@@ -636,6 +636,53 @@ class ZmqSenderNode:
 #/class ZmqSenderNode
 
 
+# TODO: replace with a general wiring API once the pairing abstraction stabilises
+def wire_parameter_calculator(
+    param_node:       'LocalWebNode',
+    calc_node:        'LocalWebNode',
+    param_brain:      object,
+    continuation_map: dict,
+    step_source_map:  dict,
+) -> None:
+    """
+    Wire ParameterBrain ↔ CalculatorBrain for the async branch/step loop.
+
+    1. Registers a put_to_{step_id} op on param_brain for every step in
+       step_source_map, so each branch body can enqueue work on calc_node.
+    2. Registers a continuation on calc_node for every step in continuation_map
+       so that after each step, the corresponding branch is re-fired on param_node.
+
+    Must be called after both nodes exist and before start().
+
+    Args:
+        param_node:       LocalWebNode wrapping a ParameterBrain instance.
+        calc_node:        LocalWebNode wrapping a CalculatorBrain instance.
+        param_brain:      The ParameterBrain Web instance (param_node._web).
+        continuation_map: brainProcessesMap.CONTINUATION_MAP
+        step_source_map:  brainProcessesMap.CALCULATOR_STEP_SOURCE_MAP
+    """
+    from silverknockoff import brainOpsMap
+
+    for step_id in step_source_map:
+        op_key = f'put_to_{step_id}'
+        param_brain.register_tableOps({
+            op_key: brainOpsMap.make_put_to_node_op( calc_node, step_id ),
+        })
+
+    for step_id, ( branch_id, branch_source, calc_tables ) in continuation_map.items():
+        table_sources = [
+            ( calc_node if t in calc_tables else param_node, t )
+            for t in branch_source
+        ]
+        calc_node.register_continuation(
+            op_id         = step_id,
+            target_node   = param_node,
+            target_op_id  = branch_id,
+            table_sources = table_sources,
+        )
+#/def wire_parameter_calculator
+
+
 def _make_split_web(
     source:   Web,
     op_ids:   list[ str ],
