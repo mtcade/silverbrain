@@ -7,6 +7,7 @@
 import io
 import json
 import threading
+import time
 from queue import Empty, Queue
 from threading import Lock
 from typing import Callable, Self
@@ -117,6 +118,7 @@ class LocalWebNode:
         self._thread:       threading.Thread | None      = None
         self._bindings:     list[ tuple[ str, zmq.Context, bool ] ] = []
         self._zmq_threads:  list[ threading.Thread ]                = []
+        self._n_active:     int                                     = 0
         self._continuations: dict[
             str,
             tuple[
@@ -231,22 +233,37 @@ class LocalWebNode:
     #/def _fire_continuation
 
     def _run( self: Self ) -> None:
+        import traceback as _tb
         while not self._stop.is_set():
             try:
                 item = self._inbox.get( timeout=0.2 )
             except Empty:
                 continue
             dfs, op_id, processes_table_id, verbose, verbose_prefix = item
-            self._web.put( dfs, op_id, processes_table_id, verbose, verbose_prefix )
-            self._fire_continuation( op_id, processes_table_id, verbose, verbose_prefix )
+            self._n_active += 1
+            try:
+                self._web.put( dfs, op_id, processes_table_id, verbose, verbose_prefix )
+                self._fire_continuation( op_id, processes_table_id, verbose, verbose_prefix )
+            except Exception:
+                _tb.print_exc()
+                raise
+            finally:
+                self._n_active -= 1
         while True:
             try:
                 item = self._inbox.get_nowait()
             except Empty:
                 break
             dfs, op_id, processes_table_id, verbose, verbose_prefix = item
-            self._web.put( dfs, op_id, processes_table_id, verbose, verbose_prefix )
-            self._fire_continuation( op_id, processes_table_id, verbose, verbose_prefix )
+            self._n_active += 1
+            try:
+                self._web.put( dfs, op_id, processes_table_id, verbose, verbose_prefix )
+                self._fire_continuation( op_id, processes_table_id, verbose, verbose_prefix )
+            except Exception:
+                _tb.print_exc()
+                raise
+            finally:
+                self._n_active -= 1
     #/def _run
 #/class LocalWebNode
 
@@ -258,8 +275,10 @@ class CompositeWebNode:
     """
 
     def __init__(
-        self:   Self,
-        routes: dict[ str, types.WebNode ],
+        self:        Self,
+        routes:      dict[ str, types.WebNode ],
+        state_node:  LocalWebNode | None  = None,
+        op_aliases:  dict[ str, str ] | None = None,
     ) -> None:
         self._routes        = routes
         self.input_ids      = list( routes.keys() )
@@ -267,7 +286,59 @@ class CompositeWebNode:
         self._started:      bool                                    = False
         self._bindings:     list[ tuple[ str, zmq.Context, bool ] ] = []
         self._zmq_threads:  list[ threading.Thread ]                = []
+        self._state_node    = state_node
+        self._op_aliases    = op_aliases or {}
     #/def __init__
+
+    def init_data(
+        self:           Self,
+        verbose:        int = 0,
+        verbose_prefix: str = '',
+    ) -> None:
+        if self._state_node is None:
+            raise RuntimeError( "CompositeWebNode.init_data requires a state_node" )
+        self._state_node._web.init_data( verbose=verbose, verbose_prefix=verbose_prefix )
+    #/def init_data
+
+    def run(
+        self:               Self,
+        op_id:              str,
+        extra:              'dict | None' = None,
+        processes_table_id: str           = '__table_processes__',
+        verbose:            int | None    = None,
+        verbose_prefix:     str           = '',
+    ) -> None:
+        """
+        Blocking run: map op_id via aliases, fire the first iteration on the
+        child's Web directly (so it reads source tables from child._web.tables),
+        then poll until all LocalWebNode child inboxes have been idle for three
+        consecutive 20 ms checks.  Starts child nodes automatically on first call.
+
+        Subsequent iterations are driven by async continuations that supply the
+        full cont_dfs tuple, so they go through the normal LocalWebNode._run /
+        Web.put path.
+        """
+        if not self._started:
+            self.start()
+        mapped = self._op_aliases.get( op_id, op_id )
+        child  = self._routes.get( mapped )
+        if child is not None and isinstance( child, LocalWebNode ):
+            child._web.run(
+                op_id              = mapped,
+                extra              = extra,
+                processes_table_id = processes_table_id,
+                verbose            = verbose,
+                verbose_prefix     = verbose_prefix,
+            )
+        _local = [ c for c in self._unique_children() if isinstance( c, LocalWebNode ) ]
+        idle = 0
+        while idle < 3:
+            time.sleep( 0.02 )
+            if all( c._inbox.empty() and getattr( c, '_n_active', 0 ) == 0 for c in _local ):
+                idle += 1
+            else:
+                idle = 0
+    #/def run
 
     def put(
         self:               Self,

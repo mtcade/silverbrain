@@ -136,6 +136,9 @@ class WebNode( Protocol ):
     """
     Minimal structural interface shared by web.Web and all webNetwork
     implementations.  Anything that exposes put and input_ids satisfies this.
+
+    init_data and run are included so that pipeline entrypoints can accept
+    either a Web or a CompositeWebNode without caring about the concrete type.
     """
     input_ids: list[ str ]
 
@@ -155,8 +158,24 @@ class WebNode( Protocol ):
         context: 'zmq.Context | None' = None,
     ) -> None: ...
     #/def bind
-#/class WebNode
 
+    def init_data(
+        self,
+        verbose:        int = 0,
+        verbose_prefix: str = '',
+    ) -> None: ...
+    #/def init_data
+
+    def run(
+        self,
+        op_id:              str,
+        extra:              'dict[ str, pl.DataFrame ] | None' = None,
+        processes_table_id: str       = '__table_processes__',
+        verbose:            int | None = None,
+        verbose_prefix:     str       = '',
+    ) -> None: ...
+    #/def run
+#/class WebNode
 
 class WebNetwork( Protocol ):
     """
