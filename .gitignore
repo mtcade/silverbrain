@@ -1,0 +1,18 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcodeproj/
+
+# Scratch files
+tasks.txt

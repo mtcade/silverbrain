@@ -1,0 +1,36 @@
+[project]
+name = "silverbrain"
+version = "0.1.0"
+description = "AI for Tabular Engineering"
+readme = "README.md"
+authors = [
+    { name = "Evan Mason" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "polars >=1.32, <2",
+    "numpy>=1.26.0",
+    "pyarrow",
+    "pyzmq>=25",
+    "uuid7",
+    "platformdirs>=4.0",
+    "huggingface_hub>=0.20",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+
+[build-system]
+requires = ["uv_build>=0.6.0"]
+build-backend = "uv_build"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv.sources]
