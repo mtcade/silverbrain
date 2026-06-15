@@ -52,6 +52,8 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'if_exists':         pl.Utf8,
     'connection_string': pl.Utf8,
     'schema_name':       pl.Utf8,
+    # parameter spec rows
+    'par_idx':          pl.UInt32,
     # table_init / process_init serialization
     'written_by':       pl.List( pl.Utf8 ),
     'factory_idn':      pl.Utf8,

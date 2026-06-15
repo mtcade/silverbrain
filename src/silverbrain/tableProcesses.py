@@ -89,75 +89,76 @@ def _apply_process(
         print( verbose_prefix + "{} {}".format( row[ 'op_idn' ], row[ 'source' ] ) )
     #
 
-    if t == 'TableProcessRef':
-        result = tableOps[ row[ 'term_idns' ][ 0 ] ](
-            dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
-            verbose        = verbose,
-            verbose_prefix = verbose_prefix,
-        )
-    #
-    elif t == 'TableProcessSequence':
-        local = dict( tables )
-        for term_op_idn in row[ 'term_idns' ]:
-            r = _apply_process( rows, term_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
-            local |= dict( zip( rows[ term_op_idn ][ 'target' ], r ) )
-        #/for term_op_idn
-        result = tuple( local[ tid ] for tid in row[ 'target' ] )
-    #
-    elif t == 'TableProcessWhile':
-        local       = dict( tables )
-        proc_op_idn = row[ 'term_idns' ][ 0 ]
-        max_iter    = row[ 'count' ] if row[ 'count' ] is not None else 100
-        iterations  = 0
-        while _apply_check( rows, row[ 'condition' ], local, tableOps, verbose, verbose_prefix + "  " ):
-            if iterations >= max_iter:
-                raise Exception( "reached max_iter={}".format( max_iter ) )
+    try:
+        if t == 'TableProcessRef':
+            result = tableOps[ row[ 'term_idns' ][ 0 ] ](
+                dfs            = tuple( tables[ tid ] for tid in row[ 'source' ] ),
+                verbose        = verbose,
+                verbose_prefix = verbose_prefix,
+            )
+        #
+        elif t == 'TableProcessSequence':
+            local = dict( tables )
+            for term_op_idn in row[ 'term_idns' ]:
+                r = _apply_process( rows, term_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ term_op_idn ][ 'target' ], r ) )
+            #/for term_op_idn
+            result = tuple( local[ tid ] for tid in row[ 'target' ] )
+        #
+        elif t == 'TableProcessWhile':
+            local       = dict( tables )
+            proc_op_idn = row[ 'term_idns' ][ 0 ]
+            max_iter    = row[ 'count' ] if row[ 'count' ] is not None else 100
+            iterations  = 0
+            while _apply_check( rows, row[ 'condition' ], local, tableOps, verbose, verbose_prefix + "  " ):
+                if iterations >= max_iter:
+                    raise Exception( "reached max_iter={}".format( max_iter ) )
+                r = _apply_process( rows, proc_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ proc_op_idn ][ 'target' ], r ) )
+                iterations += 1
+            #/while
+            result = tuple( local[ tid ] for tid in row[ 'target' ] )
+        #
+        elif t == 'TableProcessCount':
+            local       = dict( tables )
+            proc_op_idn = row[ 'term_idns' ][ 0 ]
+            for _ in range( row[ 'count' ] ):
+                r = _apply_process( rows, proc_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
+                local |= dict( zip( rows[ proc_op_idn ][ 'target' ], r ) )
+            #/for
+            result = tuple( local[ tid ] for tid in row[ 'target' ] )
+        #
+        elif t == 'TableProcessSleep':
+            local       = dict( tables )
+            proc_op_idn = row[ 'term_idns' ][ 0 ]
             r = _apply_process( rows, proc_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
             local |= dict( zip( rows[ proc_op_idn ][ 'target' ], r ) )
-            iterations += 1
-        #/while
-        result = tuple( local[ tid ] for tid in row[ 'target' ] )
-    #
-    elif t == 'TableProcessCount':
-        local       = dict( tables )
-        proc_op_idn = row[ 'term_idns' ][ 0 ]
-        for _ in range( row[ 'count' ] ):
-            r = _apply_process( rows, proc_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
-            local |= dict( zip( rows[ proc_op_idn ][ 'target' ], r ) )
-        #/for
-        result = tuple( local[ tid ] for tid in row[ 'target' ] )
-    #
-    elif t == 'TableProcessSleep':
-        local       = dict( tables )
-        proc_op_idn = row[ 'term_idns' ][ 0 ]
-        r = _apply_process( rows, proc_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
-        local |= dict( zip( rows[ proc_op_idn ][ 'target' ], r ) )
-        time.sleep( float( row[ 'condition' ] ) )
-        result = tuple( local[ tid ] for tid in row[ 'target' ] )
-    #
-    elif t == 'TableProcessBranch':
-        local = dict( tables )
-        for if_op_idn, then_op_idn in zip( row[ 'ifs' ], row[ 'thens' ] ):
-            if _apply_check( rows, if_op_idn, local, tableOps, verbose, verbose_prefix + "  " ):
-                r = _apply_process( rows, then_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
-                local |= dict( zip( rows[ then_op_idn ][ 'target' ], r ) )
-                break
-            #/if
+            time.sleep( float( row[ 'condition' ] ) )
+            result = tuple( local[ tid ] for tid in row[ 'target' ] )
+        #
+        elif t == 'TableProcessBranch':
+            local = dict( tables )
+            for if_op_idn, then_op_idn in zip( row[ 'ifs' ], row[ 'thens' ] ):
+                if _apply_check( rows, if_op_idn, local, tableOps, verbose, verbose_prefix + "  " ):
+                    r = _apply_process( rows, then_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
+                    local |= dict( zip( rows[ then_op_idn ][ 'target' ], r ) )
+                    break
+                #/if
+            else:
+                if row[ 'term_idns' ]:
+                    otherwise_op_idn = row[ 'term_idns' ][ 0 ]
+                    r = _apply_process( rows, otherwise_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
+                    local |= dict( zip( rows[ otherwise_op_idn ][ 'target' ], r ) )
+            #/for
+            result = tuple( local.get( tid ) for tid in row[ 'target' ] )
+        #
         else:
-            if row[ 'term_idns' ]:
-                otherwise_op_idn = row[ 'term_idns' ][ 0 ]
-                r = _apply_process( rows, otherwise_op_idn, local, tableOps, verbose, verbose_prefix + "  " )
-                local |= dict( zip( rows[ otherwise_op_idn ][ 'target' ], r ) )
-        #/for
-        result = tuple( local.get( tid ) for tid in row[ 'target' ] )
-    #
-    else:
-        raise ValueError( "Unknown type: {}".format( t ) )
-    #
-
-    if verbose > 0:
-        print( verbose_prefix + "/{} {}".format( row[ 'op_idn' ], row[ 'target' ] ) )
-    #
+            raise ValueError( "Unknown type: {}".format( t ) )
+        #
+    finally:
+        if verbose > 0:
+            print( verbose_prefix + "/{} {}".format( row[ 'op_idn' ], row[ 'target' ] ) )
+        #
 
     return result
 #/def _apply_process

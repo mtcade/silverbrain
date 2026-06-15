@@ -870,7 +870,7 @@ def cell_from_toml(
 
     TOML schema expected
     --------------------
-    [brain]
+    [cell]
         class     = "..."       # informational only
         input_ids = [...]       # optional; defaults to all process op_idns
 
@@ -974,7 +974,7 @@ def cell_from_toml(
     )
 
     # -- Resolve input_ids (empty list → all process op_idns)
-    brain_cfg  = data.get( 'brain', {} )
+    brain_cfg  = data.get( 'cell', data.get( 'brain', {} ) )
     input_ids  = brain_cfg.get( 'input_ids' ) or [ p.op_idn for p in processes ]
 
     # -- Construct and populate the Web

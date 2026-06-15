@@ -15,11 +15,11 @@ class BundleDirs:
     Resolves platformdirs paths for a named bundle.
 
     Layout under user_data_path/<app_name>/:
-        brains/                 — common/shared brain TOMLs
+        cells/                  — common/shared cell TOMLs
         webs/                   — common/shared web map TOMLs
         bundles/<bundle_id>/
             bundle.toml
-            brains/             — bundle-specific (overrides common)
+            cells/              — bundle-specific (overrides common)
             webs/               — bundle-specific web TOMLs
             settings/           — parameter JSON files, paths.json
             data/               — parquet outputs
@@ -39,8 +39,8 @@ class BundleDirs:
         return self.root / 'webs'
 
     @property
-    def brains( self ) -> Path:
-        return self.root / 'brains'
+    def cells( self ) -> Path:
+        return self.root / 'cells'
 
     @property
     def settings( self ) -> Path:
@@ -59,19 +59,19 @@ class BundleDirs:
         return self._app_root / 'webs'
 
     @property
-    def common_brains( self ) -> Path:
-        return self._app_root / 'brains'
+    def common_cells( self ) -> Path:
+        return self._app_root / 'cells'
 
-    def brain_path( self, name: str ) -> Path:
-        """Bundle-specific brains/ first, then common brains/ fallback."""
-        bundle_p = self.brains / f'{name}.toml'
+    def cell_path( self, name: str ) -> Path:
+        """Bundle-specific cells/ first, then common cells/ fallback."""
+        bundle_p = self.cells / f'{name}.toml'
         if bundle_p.exists():
             return bundle_p
-        common_p = self.common_brains / f'{name}.toml'
+        common_p = self.common_cells / f'{name}.toml'
         if common_p.exists():
             return common_p
         raise FileNotFoundError(
-            f"Brain {name!r} not found in {self.brains} or {self.common_brains}"
+            f"Cell {name!r} not found in {self.cells} or {self.common_cells}"
         )
 
     def web_path( self, name: str ) -> Path:
@@ -86,11 +86,11 @@ class BundleDirs:
             f"Web {name!r} not found in {self.webs} or {self.common_webs}"
         )
 
-    def _brains_root( self ) -> Path:
-        """The directory to expose as {brains_root}: bundle-specific if non-empty, else common."""
-        if self.brains.exists() and any( self.brains.glob( '*.toml' ) ):
-            return self.brains
-        return self.common_brains
+    def _cells_root( self ) -> Path:
+        """The directory to expose as {cells_root}: bundle-specific if non-empty, else common."""
+        if self.cells.exists() and any( self.cells.glob( '*.toml' ) ):
+            return self.cells
+        return self.common_cells
 
     def _webs_root( self ) -> Path:
         """The directory to expose as {webs_root}: bundle-specific if non-empty, else common."""
@@ -99,9 +99,9 @@ class BundleDirs:
         return self.common_webs
 
     def ensure_dirs( self ) -> None:
-        for d in ( self.webs, self.brains, self.settings, self.data, self.notebooks ):
+        for d in ( self.webs, self.cells, self.settings, self.data, self.notebooks ):
             d.mkdir( parents=True, exist_ok=True )
-        self.common_brains.mkdir( parents=True, exist_ok=True )
+        self.common_cells.mkdir( parents=True, exist_ok=True )
         self.common_webs.mkdir( parents=True, exist_ok=True )
 
 
@@ -112,13 +112,13 @@ def web_from_bundle(
     app_name:  str = 'silverknockoff',
     **kwargs,
 ):
-    """Load a Web from an installed bundle by id, resolving {brains_root}/{webs_root}."""
+    """Load a Web from an installed bundle by id, resolving {cells_root}/{webs_root}."""
     from .web import web_from_toml
 
     dirs  = BundleDirs( bundle_id, app_name )
     toml  = dirs.web_path( bundle_id )
     template_vars = {
-        'brains_root':  str( dirs._brains_root() ),
+        'cells_root':   str( dirs._cells_root() ),
         'webs_root':    str( dirs._webs_root() ),
         'bundle_root':  str( dirs.root ),
         'app_bundles':  str( dirs._app_root / 'bundles' ),
@@ -149,7 +149,7 @@ def push_to_hub(
     app_name:   str       = 'silverknockoff',
     token:      str | None = None,
 ) -> None:
-    """Upload bundle dir (webs + brains + settings + data + notebooks) to HF Hub."""
+    """Upload bundle dir (webs + cells + settings + data + notebooks) to HF Hub."""
     from huggingface_hub import upload_folder
 
     dirs = BundleDirs( bundle_id, app_name )
@@ -169,7 +169,7 @@ def pull_from_hub(
 ) -> 'BundleDirs':
     """
     Download bundle from HF Hub into platformdirs bundles location.
-    Reads required_brains/required_webs from bundle.toml and fetches
+    Reads required_cells/required_webs from bundle.toml and fetches
     missing common items from the configured commons repo.
     """
     from huggingface_hub import snapshot_download
@@ -193,7 +193,7 @@ def _fetch_missing_commons(
     app_name: str,
     token:    str | None,
 ) -> None:
-    """Pull missing required brains/webs from the commons HF repo."""
+    """Pull missing required cells/webs from the commons HF repo."""
     bundle_toml = dirs.root / 'bundle.toml'
     if not bundle_toml.exists():
         return
@@ -206,13 +206,13 @@ def _fetch_missing_commons(
         'BigBrainStuff/sk-commons',
     )
 
-    required_brains: list[ str ] = meta.get( 'required_brains', [] )
-    required_webs:   list[ str ] = meta.get( 'required_webs', [] )
+    required_cells: list[ str ] = meta.get( 'required_cells', [] )
+    required_webs:  list[ str ] = meta.get( 'required_webs', [] )
 
-    missing_brains = [
-        b for b in required_brains
-        if not ( dirs.common_brains / f'{b}.toml' ).exists()
-        and not ( dirs.brains / f'{b}.toml' ).exists()
+    missing_cells = [
+        c for c in required_cells
+        if not ( dirs.common_cells / f'{c}.toml' ).exists()
+        and not ( dirs.cells / f'{c}.toml' ).exists()
     ]
     missing_webs = [
         w for w in required_webs
@@ -220,14 +220,14 @@ def _fetch_missing_commons(
         and not ( dirs.webs / f'{w}.toml' ).exists()
     ]
 
-    if not missing_brains and not missing_webs:
+    if not missing_cells and not missing_webs:
         return
 
     from huggingface_hub import snapshot_download
 
     app_root = dirs._app_root
     patterns = (
-        [ f'brains/{b}.toml' for b in missing_brains ]
+        [ f'cells/{c}.toml' for c in missing_cells ]
         + [ f'webs/{w}.toml' for w in missing_webs ]
     )
     snapshot_download(
@@ -244,7 +244,7 @@ def push_commons_to_hub(
     app_name:   str       = 'silverknockoff',
     token:      str | None = None,
 ) -> None:
-    """Upload common brains/ and webs/ to a single HF Hub dataset repo."""
+    """Upload common cells/ and webs/ to a single HF Hub dataset repo."""
     from huggingface_hub import upload_folder
 
     app_root = PlatformDirs( app_name ).user_data_path
@@ -252,7 +252,7 @@ def push_commons_to_hub(
         folder_path    = str( app_root ),
         repo_id        = hf_repo_id,
         repo_type      = 'dataset',
-        allow_patterns = [ 'brains/*', 'webs/*' ],
+        allow_patterns = [ 'cells/*', 'webs/*' ],
         token          = token,
     )
 
@@ -262,7 +262,7 @@ def pull_commons_from_hub(
     app_name:   str       = 'silverknockoff',
     token:      str | None = None,
 ) -> None:
-    """Download common brains/ and webs/ from HF Hub into platformdirs."""
+    """Download common cells/ and webs/ from HF Hub into platformdirs."""
     from huggingface_hub import snapshot_download
 
     app_root = PlatformDirs( app_name ).user_data_path
@@ -271,7 +271,7 @@ def pull_commons_from_hub(
         repo_id        = hf_repo_id,
         repo_type      = 'dataset',
         local_dir      = str( app_root ),
-        allow_patterns = [ 'brains/*', 'webs/*' ],
+        allow_patterns = [ 'cells/*', 'webs/*' ],
         token          = token,
     )
 
