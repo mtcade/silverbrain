@@ -42,11 +42,22 @@ def _make_web( name: str, op_idn: str, source: list, target: list ) -> Cell:
 #/def _make_web
 
 
+def _make_node( name: str, op_idn: str, source: list, target: list ) -> WebNode:
+    return WebNode(
+        _cell = _make_web( name, op_idn, source, target ),
+        _declarations = [ NodeDecl(
+            op_idn = op_idn,
+            source = tuple( source ),
+            target = tuple( target ),
+        ) ],
+    )
+#/def _make_node
+
+
 # -- WebNode
 
 def test_web_node_declare() -> None:
-    w = _make_web( 'a', 'store', [ 'inp' ], [ 'out' ] )
-    node = WebNode( _cell=w )
+    node = _make_node( 'a', 'store', [ 'inp' ], [ 'out' ] )
     decls = node.declare()
     assert len( decls ) == 1
     assert decls[ 0 ] == NodeDecl( op_idn='store', source=( 'inp', ), target=( 'out', ) )
@@ -80,8 +91,8 @@ def test_web_node_run_concurrent() -> None:
 # -- Web
 
 def test_composite_routes_by_op_idn() -> None:
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'in_a' ], [ 'out_a' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'op_b', [ 'in_b' ], [ 'out_b' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'in_a' ], [ 'out_a' ] )
+    node_b = _make_node( 'b', 'op_b', [ 'in_b' ], [ 'out_b' ] )
     composite = Web( _nodes={ 'a': node_a, 'b': node_b } )
 
     df = pl.DataFrame( { 'x': [ 7 ] } )
@@ -94,8 +105,8 @@ def test_composite_routes_by_op_idn() -> None:
 
 def test_composite_chains_two_nodes() -> None:
     """op_a produces 'mid'; op_b declares 'mid' as source — should auto-chain."""
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'inp' ], [ 'mid' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'op_b', [ 'mid' ], [ 'final' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'inp' ], [ 'mid' ] )
+    node_b = _make_node( 'b', 'op_b', [ 'mid' ], [ 'final' ] )
     composite = Web( _nodes={ 'a': node_a, 'b': node_b } )
 
     df = pl.DataFrame( { 'v': [ 42 ] } )
@@ -108,8 +119,8 @@ def test_composite_chains_two_nodes() -> None:
 
 def test_composite_declare_exposes_entry_points_only() -> None:
     """Chain op_a→op_b: only op_a is an entry point; op_b is internal."""
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'x' ], [ 'y' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'op_b', [ 'y' ], [ 'z' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'x' ], [ 'y' ] )
+    node_b = _make_node( 'b', 'op_b', [ 'y' ], [ 'z' ] )
     composite = Web( _nodes={ 'a': node_a, 'b': node_b } )
     decls = composite.declare()
     assert len( decls ) == 1
@@ -120,8 +131,8 @@ def test_composite_declare_exposes_entry_points_only() -> None:
 
 def test_composite_declare_independent_ops_both_exposed() -> None:
     """Two independent ops (no shared tables): both are entry points."""
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'in_a' ], [ 'out_a' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'op_b', [ 'in_b' ], [ 'out_b' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'in_a' ], [ 'out_a' ] )
+    node_b = _make_node( 'b', 'op_b', [ 'in_b' ], [ 'out_b' ] )
     composite = Web( _nodes={ 'a': node_a, 'b': node_b } )
     decls = composite.declare()
     assert { d.op_idn for d in decls } == { 'op_a', 'op_b' }
@@ -129,15 +140,15 @@ def test_composite_declare_independent_ops_both_exposed() -> None:
 
 
 def test_composite_rejects_duplicate_op_idn() -> None:
-    node_a = WebNode( _cell=_make_web( 'a', 'dup', [ 'x' ], [ 'y' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'dup', [ 'p' ], [ 'q' ] ) )
+    node_a = _make_node( 'a', 'dup', [ 'x' ], [ 'y' ] )
+    node_b = _make_node( 'b', 'dup', [ 'p' ], [ 'q' ] )
     with pytest.raises( ValueError, match='Duplicate op_idn' ):
         Web( _nodes={ 'a': node_a, 'b': node_b } )
 #/def test_composite_rejects_duplicate_op_idn
 
 
 def test_composite_raises_on_unknown_op_idn() -> None:
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'x' ], [ 'y' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'x' ], [ 'y' ] )
     composite = Web( _nodes={ 'a': node_a } )
     with pytest.raises( KeyError ):
         composite.run( 'does_not_exist', str( uuid.uuid4() ), {} )
@@ -146,8 +157,8 @@ def test_composite_raises_on_unknown_op_idn() -> None:
 
 def test_composite_nested() -> None:
     """Web inside Web."""
-    node_a = WebNode( _cell=_make_web( 'a', 'op_a', [ 'inp' ], [ 'mid' ] ) )
-    node_b = WebNode( _cell=_make_web( 'b', 'op_b', [ 'mid' ], [ 'out' ] ) )
+    node_a = _make_node( 'a', 'op_a', [ 'inp' ], [ 'mid' ] )
+    node_b = _make_node( 'b', 'op_b', [ 'mid' ], [ 'out' ] )
     inner = Web( _nodes={ 'a': node_a, 'b': node_b } )
     outer = Web( _nodes={ 'inner': inner } )
 
@@ -178,7 +189,7 @@ def test_async_web_node_run() -> None:
 
 def test_composite_with_async_node() -> None:
     """Composite chains a WebNode leaf into an AsyncWebNode leaf."""
-    sync_node = WebNode( _cell=_make_web( 'a', 'step1', [ 'raw' ], [ 'processed' ] ) )
+    sync_node = _make_node( 'a', 'step1', [ 'raw' ], [ 'processed' ] )
 
     async def _fetch( op_idn: str, process_id: str, inputs: dict ) -> dict:
         await asyncio.sleep( 0 )

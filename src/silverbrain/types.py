@@ -116,9 +116,10 @@ class ExecutionStrategy( Protocol ):
 
 @dataclass
 class NodeDecl:
-    op_idn: str
-    source: tuple[ str, ... ]
-    target: tuple[ str, ... ]
+    op_idn:      str
+    source:      tuple[ str, ... ]
+    target:      tuple[ str, ... ]
+    node_op_idn: str | None = None
 #/class NodeDecl
 
 

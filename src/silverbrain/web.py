@@ -41,18 +41,15 @@ from .cell import Cell, _domain_process_df, cell_from_toml
 # -- Helpers
 
 def _decls_from_cell( cell: Cell ) -> list[ types.NodeDecl ]:
-    """Read non-builtin, non-check process rows that have both source and target."""
+    """Read non-builtin, non-check process rows."""
     domain_df = _domain_process_df( cell.tables[ '__table_processes__' ] )
     decls = []
     for row in domain_df.to_dicts():
-        src = row.get( 'source' ) or []
-        tgt = row.get( 'target' ) or []
-        if src and tgt:
-            decls.append( types.NodeDecl(
-                op_idn = row[ 'op_idn' ],
-                source = tuple( src ),
-                target = tuple( tgt ),
-            ) )
+        decls.append( types.NodeDecl(
+            op_idn = row[ 'op_idn' ],
+            source = tuple( row.get( 'source' ) or [] ),
+            target = tuple( row.get( 'target' ) or [] ),
+        ) )
     return decls
 #/def _decls_from_cell
 
@@ -212,6 +209,36 @@ class AsyncWebNode:
 #/class AsyncWebNode
 
 
+# -- Declaration override wrapper
+
+class _AliasedNode:
+    """Wraps any node, presenting a fixed aliased declaration list to the parent Web."""
+
+    def __init__(
+        self,
+        _inner:        Any,
+        _declarations: list[ types.NodeDecl ],
+    ) -> None:
+        self._inner        = _inner
+        self._declarations = _declarations
+
+    def declare( self ) -> list[ types.NodeDecl ]:
+        return list( self._declarations )
+
+    def run(
+        self,
+        op_idn:     str,
+        process_id: str,
+        inputs:     dict[ str, pl.DataFrame ],
+    ) -> Future[ dict[ str, pl.DataFrame ] ]:
+        return self._inner.run( op_idn, process_id, inputs )
+
+    def init_data( self, **kwargs ) -> None:
+        if hasattr( self._inner, 'init_data' ):
+            self._inner.init_data( **kwargs )
+#/class _AliasedNode
+
+
 # -- Composite node
 
 class Web:
@@ -331,7 +358,8 @@ class Web:
                     f"nested webs must not be called synchronously via [[processes]]."
                 )
             term_inputs = { s: accumulated[ s ] for s in decl.source if s in accumulated }
-            return node.run( term, process_id, term_inputs ).result()
+            actual_op = decl.node_op_idn or term
+            return node.run( actual_op, process_id, term_inputs ).result()
         raise KeyError( f"Unknown term {term!r} — not in [[processes]] or [[nodes.ops]]" )
     #/def _run_term_sync
 
@@ -457,14 +485,16 @@ class Web:
                     } )
 
             for op, op_inputs in to_fire:
-                node_id, _ = self._routing[ op ]
-                f = self._nodes[ node_id ].run( op, process_id, op_inputs )
+                node_id, op_decl = self._routing[ op ]
+                actual_op = op_decl.node_op_idn or op
+                f = self._nodes[ node_id ].run( actual_op, process_id, op_inputs )
                 f.add_done_callback( lambda fut, _op=op: _on_done( fut, _op ) )
         #/def _on_done
 
-        node_id, _ = self._routing[ op_idn ]
+        node_id, decl = self._routing[ op_idn ]
+        actual_op = decl.node_op_idn or op_idn
         pending.add( op_idn )
-        f = self._nodes[ node_id ].run( op_idn, process_id, inputs )
+        f = self._nodes[ node_id ].run( actual_op, process_id, inputs )
         f.add_done_callback( lambda fut: _on_done( fut, op_idn ) )
 
         return outer
@@ -550,15 +580,35 @@ def web_from_toml(
         is_composite = 'composite' in node_header
 
         if is_composite:
-            # Recursively load the child web. paths/ops on the node entry are ignored —
-            # the child web is self-contained and manages its own node paths.
-            nodes[ node_id ] = web_from_toml(
+            child_web = web_from_toml(
                 path          = toml_path,
                 ops_module    = ops_module,
                 rng           = rng,
                 verbose       = verbose,
                 template_vars = tvars,
             )
+            if 'ops' in node_desc:
+                child_declared = { d.op_idn: d for d in child_web.declare() }
+                sub_declarations: list[ types.NodeDecl ] = []
+                for op in node_desc[ 'ops' ]:
+                    child_op = op[ 'op_idn' ]
+                    alias    = op.get( 'alias_idn' )
+                    exposed  = alias if alias else child_op
+                    if child_op not in child_declared:
+                        raise ValueError(
+                            f"op_idn {child_op!r} not found in subweb {node_id!r}; "
+                            f"available: {sorted( child_declared )}"
+                        )
+                    child_d = child_declared[ child_op ]
+                    sub_declarations.append( types.NodeDecl(
+                        op_idn      = exposed,
+                        source      = child_d.source,
+                        target      = child_d.target,
+                        node_op_idn = child_op if alias else None,
+                    ) )
+                nodes[ node_id ] = _AliasedNode( child_web, sub_declarations )
+            else:
+                nodes[ node_id ] = child_web
         else:
             paths_dict: dict[ str, str ] | None = None
             if 'paths' in node_desc:
@@ -582,18 +632,36 @@ def web_from_toml(
                 paths_dict = paths_dict,
             )
 
-            declarations: list[ types.NodeDecl ] | None = None
+            declarations: list[ types.NodeDecl ] = []
             if 'ops' in node_desc:
-                declarations = [
-                    types.NodeDecl(
-                        op_idn = op[ 'op_idn' ],
-                        source = tuple( op[ 'source' ] ),
-                        target = tuple( op[ 'target' ] ),
-                    )
-                    for op in node_desc[ 'ops' ]
-                ]
+                cell_op_idns = { d.op_idn for d in _decls_from_cell( cell ) }
+                for op in node_desc[ 'ops' ]:
+                    cell_op = op[ 'op_idn' ]
+                    alias   = op.get( 'alias_idn' )
+                    exposed = alias if alias else cell_op
+                    if cell_op not in cell_op_idns:
+                        raise ValueError(
+                            f"op_idn {cell_op!r} not found among ops declared by cell {node_id!r}"
+                        )
+                    declarations.append( types.NodeDecl(
+                        op_idn      = exposed,
+                        source      = tuple( op[ 'source' ] ),
+                        target      = tuple( op[ 'target' ] ),
+                        node_op_idn = cell_op if alias else None,
+                    ) )
 
             nodes[ node_id ] = WebNode( _cell=cell, _declarations=declarations )
+
+    seen_exposed: dict[ str, str ] = {}
+    for nid, node in nodes.items():
+        for decl in node.declare():
+            if decl.op_idn in seen_exposed:
+                raise ValueError(
+                    f"Duplicate exposed op name {decl.op_idn!r}: "
+                    f"node {seen_exposed[ decl.op_idn ]!r} and {nid!r} both expose this name "
+                    f"(use alias_idn to disambiguate)"
+                )
+            seen_exposed[ decl.op_idn ] = nid
 
     web_processes = _parse_web_processes( data.get( 'processes', [] ) )
 

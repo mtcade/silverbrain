@@ -301,12 +301,10 @@ class Cell:
     def __init__(
         self:      Self,
         main_id:   str,
-        input_ids: list[ str ]                = [],
         ops:       types.TableProcessDict | None = None,
         verbose:   int                        = 0,
         ) -> None:
         self.main_id:   str                   = main_id
-        self.input_ids: list[ str ]           = list( input_ids )
         self.verbose:   int                   = verbose
         self.tableOps:  types.TableProcessDict = dict( _BUILTIN_OPS )
 
@@ -713,8 +711,7 @@ class Cell:
         Domain tables (non-system keys): a's, then b's (b overwrites a).
         """
         merged = cls(
-            main_id   = main_id or f"{ a.main_id }_{ b.main_id }",
-            input_ids = list( dict.fromkeys( a.input_ids + b.input_ids ) ),
+            main_id = main_id or f"{ a.main_id }_{ b.main_id }",
         )
 
         _builtin_keys = set( _BUILTIN_OPS )
@@ -872,8 +869,6 @@ def cell_from_toml(
     --------------------
     [cell]
         class     = "..."       # informational only
-        input_ids = [...]       # optional; defaults to all process op_idns
-
     [tables]
         keys = ["X", "X_latent", ...]
 
@@ -973,12 +968,8 @@ def cell_from_toml(
         else {}
     )
 
-    # -- Resolve input_ids (empty list → all process op_idns)
-    brain_cfg  = data.get( 'cell', data.get( 'brain', {} ) )
-    input_ids  = brain_cfg.get( 'input_ids' ) or [ p.op_idn for p in processes ]
-
     # -- Construct and populate the Web
-    cell = Cell( main_id=main_id, input_ids=input_ids, ops=ops, verbose=verbose )
+    cell = Cell( main_id=main_id, ops=ops, verbose=verbose )
 
     for process in processes:
         cell.register_process( process )
