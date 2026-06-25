@@ -87,6 +87,19 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'thens':        pl.List( pl.Utf8 ),
     # CompositeNodeRef: child node to dispatch to (null for all other types)
     'node_idn':     pl.Utf8,
+} | {
+    # network / distributed routing
+    # mode              — 'terminal' (reply to origin) or 'relay' (forward to next hop)
+    # origin_identity   — raw ZMQ ROUTER routing frame bytes for the request origin
+    # received_at       — epoch milliseconds when the request arrived
+    # request_id        — correlation key linking a relay request to its origin
+    # status            — connection lifecycle: 'connecting' | 'connected' | 'disconnected'
+    '__system_op__':    pl.Utf8,
+    'mode':             pl.Utf8,
+    'origin_identity':  pl.Binary,
+    'received_at':      pl.Int64,
+    'request_id':       pl.Utf8,
+    'status':           pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
@@ -164,5 +177,45 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__routing__': cannonical_schema_for_keys((
         'source_node_idn', 'trigger_op_idn', 'source_table_idn',
         'target_node_idn', 'target_table_idn',
+    )),
+
+    # -- Network system tables (present in every network-capable Cell)
+
+    # Current routing configuration: for each pipeline (op_idn), how to handle
+    # completed results — reply to origin ('terminal') or forward to another node
+    # ('relay').  address is null when mode == 'terminal'.
+    '__node_routing_table__': cannonical_schema_for_keys((
+        'op_idn', 'mode', 'address',
+    )),
+
+    # In-flight relay tracking: while waiting for a downstream node (C) to reply,
+    # B stores the original requester's identity here keyed by request_id.
+    '__node_correlation_table__': cannonical_schema_for_keys((
+        'request_id', 'origin_identity', 'received_at',
+    )),
+
+    # Live ZMQ DEALER connections this node has opened to peers.
+    '__node_connections__': cannonical_schema_for_keys((
+        'address', 'status',
+    )),
+
+    # -- Incoming system message schemas (tables that arrive on the data socket
+    #    but carry routing control commands rather than domain data).
+    #    Every system message table carries a '__system_op__' discriminator column.
+
+    # Update one pipeline's routing entry.
+    # mode in ('terminal', 'relay'); address is null when mode == 'terminal'.
+    '__routing_update__': cannonical_schema_for_keys((
+        '__system_op__', 'op_idn', 'mode', 'address',
+    )),
+
+    # Open a new DEALER connection to address.
+    '__connect__': cannonical_schema_for_keys((
+        '__system_op__', 'address',
+    )),
+
+    # Close an existing DEALER connection.
+    '__disconnect__': cannonical_schema_for_keys((
+        '__system_op__', 'address',
     )),
 }
