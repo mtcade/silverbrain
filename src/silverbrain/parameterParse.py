@@ -58,6 +58,7 @@ _COL_FLOAT  = col_for_dtype( pl.Float64 )            # 'par_val_float64'
 _COL_STRL   = col_for_dtype( pl.List( pl.Utf8 ) )    # 'par_val_list_string'
 _COL_INTL   = col_for_dtype( pl.List( pl.Int64 ) )   # 'par_val_list_int64'
 _COL_FLOATL = col_for_dtype( pl.List( pl.Float64 ) ) # 'par_val_list_float64'
+_COL_BOOL   = col_for_dtype( pl.Boolean )            # 'par_val_boolean'
 
 
 # -- ValueDict TypedDicts
@@ -188,7 +189,7 @@ class ParameterParser:
     def col_for_value( self, value: Any ) -> tuple[ str, Any ]:
         """Map a Python value to (column_name, coerced_value) based on its runtime type."""
         if isinstance( value, bool ):
-            return ( _COL_STR, str( value ) )
+            return ( _COL_BOOL, value )
         if isinstance( value, int ):
             return ( _COL_INT, value )
         if isinstance( value, float ):
