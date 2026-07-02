@@ -501,17 +501,18 @@ class Cell:
                         raise KeyError( f"condition process {cond!r} not registered" )
 
         if isinstance( process, tableProcesses.Alias ):
-            aliased_rows = self.tables[ '__table_processes__' ].filter(
-                pl.col( 'op_idn' ) == process.aliases
-            )
-            if aliased_rows.is_empty():
-                raise KeyError( f"aliased process {process.aliases!r} not registered" )
-            aliased_target = set( aliased_rows.row( 0, named = True )[ 'target' ] or [] )
-            if not set( process.target ).issubset( aliased_target ):
-                raise ValueError(
-                    f"Alias.target {list( process.target )} is not a subset of "
-                    f"{process.aliases}.target {sorted( aliased_target )}"
+            for alias_idn in process.alias_idns:
+                aliased_rows = self.tables[ '__table_processes__' ].filter(
+                    pl.col( 'op_idn' ) == alias_idn
                 )
+                if aliased_rows.is_empty():
+                    raise KeyError( f"aliased process {alias_idn!r} not registered" )
+                aliased_target = set( aliased_rows.row( 0, named = True )[ 'target' ] or [] )
+                if not set( process.target ).issubset( aliased_target ):
+                    raise ValueError(
+                        f"Alias.target {list( process.target )} is not a subset of "
+                        f"{alias_idn}.target {sorted( aliased_target )}"
+                    )
 
         self.tables[ '__table_processes__' ] = pl.concat(
             [ self.tables[ '__table_processes__' ], _df ], how = 'vertical',
@@ -766,6 +767,126 @@ class Cell:
         return merged
     #/def merge
 
+    @classmethod
+    def from_dataframes(
+        cls,
+        main_id:    str,
+        processes:  pl.DataFrame,
+        table_keys: pl.DataFrame,
+        table_init: pl.DataFrame,
+        ops_module,
+        rng                     = None,
+        verbose:    int         = 0,
+    ) -> Self:
+        """
+        Construct a Cell from the DataFrames produced by cell_toml_to_dataframes.
+
+        Parameters
+        ----------
+        main_id    : cell identifier
+        processes  : rows matching _CELL_PROCESSES_SCHEMA
+        table_keys : rows matching _TABLE_KEYS_SCHEMA
+        table_init : rows matching table_schemas['__table_init__']
+        ops_module : module exposing get_ops(keys, rng) -> dict
+        """
+        op_keys: set[ str ] = set()
+        for row in processes.to_dicts():
+            if row[ 'type' ] in ( 'TableProcessRef', 'TableCheckRef' ):
+                op_keys.update( row.get( 'terms' ) or [] )
+
+        ops: types.TableProcessDict = (
+            ops_module.get_ops( list( op_keys ), rng )
+            if hasattr( ops_module, 'get_ops' )
+            else {}
+        )
+
+        cell = cls( main_id=main_id, ops=ops, verbose=verbose )
+
+        for row in processes.to_dicts():
+            t      = row[ 'type' ]
+            source = tuple( row.get( 'source' ) or [] )
+            target = tuple( row.get( 'target' ) or [] )
+            terms  = list(  row.get( 'terms'  ) or [] )
+            if t == 'TableProcessRef':
+                cell.register_process( tableProcesses.TableProcessRef(
+                    op_idn = row[ 'op_idn' ],
+                    source = source,
+                    target = target,
+                    terms  = terms,
+                ) )
+            elif t == 'TableCheckRef':
+                cell.register_process( tableProcesses.TableCheckRef(
+                    op_idn = row[ 'op_idn' ],
+                    source = source,
+                    terms  = terms,
+                ) )
+            elif t == 'TableProcessSequence':
+                cell.register_process( tableProcesses.TableProcessSequence(
+                    op_idn = row[ 'op_idn' ],
+                    source = source,
+                    target = target,
+                    terms  = terms,
+                ) )
+            elif t == 'TableProcessBranch':
+                cell.register_process( tableProcesses.TableProcessBranch(
+                    op_idn    = row[ 'op_idn' ],
+                    source    = source,
+                    target    = target,
+                    ifs       = list( row.get( 'ifs'   ) or [] ),
+                    thens     = list( row.get( 'thens' ) or [] ),
+                    otherwise = row.get( 'otherwise' ),
+                ) )
+            elif t == 'TableProcessWhile':
+                cell.register_process( tableProcesses.TableProcessWhile(
+                    op_idn    = row[ 'op_idn' ],
+                    source    = source,
+                    target    = target,
+                    condition = row[ 'condition' ],
+                    terms     = terms,
+                    maxIter   = row.get( 'max_iter' ) or 2**31 - 1,
+                ) )
+            elif t == 'TableProcessCount':
+                cell.register_process( tableProcesses.TableProcessCount(
+                    op_idn = row[ 'op_idn' ],
+                    source = source,
+                    target = target,
+                    count  = row[ 'count' ],
+                    terms  = terms,
+                ) )
+            elif t == 'Alias':
+                cell.register_process( tableProcesses.Alias(
+                    op_idn     = row[ 'op_idn' ],
+                    alias_idns = list( row[ 'alias_idns' ] or [] ),
+                    source     = source,
+                    target     = target,
+                ) )
+            else:
+                raise ValueError( f"Unknown process type: {t!r}" )
+        #/for row in processes.to_dicts()
+
+        for row in table_keys.to_dicts():
+            key = row[ 'key' ]
+            if key not in cell.tables:
+                cell.tables[ key ] = None
+
+        if not table_init.is_empty():
+            refs = [
+                TableInitRef(
+                    table_idn  = row[ 'table_idn' ],
+                    source     = tuple( row.get( 'source'     ) or [] ),
+                    op_idn     = row[ 'op_idn' ],
+                    written_by = tuple( row.get( 'written_by' ) or [] ),
+                    always_run = bool( row.get( 'always_run', False ) ),
+                )
+                for row in table_init.to_dicts()
+            ]
+            cell.tables[ '__table_init__' ] = pl.concat(
+                [ r.as_polars() for r in refs ], how='vertical',
+            )
+
+        return cell
+    #/def from_dataframes
+
     def print_tableProcesses(
         self:               Self,
         processes_table_id: str = '__table_processes__',
@@ -890,7 +1011,7 @@ def cell_from_toml(
         # TableProcessCount extras:
         count   = N
         # Alias extras:
-        aliases = "..."         # op_idn of the process being aliased
+        alias_idns = [...]      # op_idns of the processes being aliased
     """
     with open( path, 'rb' ) as f:
         data = tomllib.load( f )
@@ -947,10 +1068,10 @@ def cell_from_toml(
             ) )
         elif t == 'Alias':
             processes.append( tableProcesses.Alias(
-                op_idn  = entry[ 'op_idn' ],
-                aliases = entry[ 'aliases' ],
-                source  = entry[ 'source' ],
-                target  = entry[ 'target' ],
+                op_idn     = entry[ 'op_idn' ],
+                alias_idns = list( entry[ 'alias_idns' ] ),
+                source     = entry[ 'source' ],
+                target     = entry[ 'target' ],
             ) )
         else:
             raise ValueError( f"Unknown process type in TOML: {t!r}" )
@@ -1010,3 +1131,69 @@ def cell_from_toml(
 
     return cell
 #/def cell_from_toml
+
+
+def cell_toml_to_dataframes( path: str | Path ) -> dict[ str, pl.DataFrame ]:
+    """
+    Parse a cell TOML file into DataFrames for use with Cell.from_dataframes.
+
+    Returns
+    -------
+    processes  : one row per [[processes]] entry
+    table_keys : one row per key in [tables].keys
+    table_init : one row per [[table_init]] entry
+    """
+    with open( path, 'rb' ) as f:
+        data = tomllib.load( f )
+
+    process_rows = [
+        {
+            'op_idn':    e[ 'op_idn' ],
+            'type':      e[ 'type' ],
+            'source':    list( e.get( 'source',    [] ) ),
+            'target':    list( e.get( 'target',    [] ) ),
+            'terms':     list( e.get( 'terms',     [] ) ),
+            'ifs':       list( e.get( 'ifs',       [] ) ),
+            'thens':     list( e.get( 'thens',     [] ) ),
+            'otherwise': e.get( 'otherwise' ),
+            'condition': e.get( 'condition' ),
+            'max_iter':  e.get( 'maxIter' ),
+            'count':     e.get( 'count' ),
+            'alias_idns': list( e.get( 'alias_idns' ) or [] ),
+        }
+        for e in data.get( 'processes', [] )
+    ]
+    processes_df = (
+        pl.DataFrame( process_rows, schema=table_schemas[ 'cell_processes' ] )
+        if process_rows
+        else pl.DataFrame( schema=table_schemas[ 'cell_processes' ] )
+    )
+
+    keys = data.get( 'tables', {} ).get( 'keys', [] )
+    table_keys_df = pl.DataFrame( { 'key': keys }, schema=table_schemas[ 'table_keys' ] )
+
+    init_rows = [
+        {
+            'table_idn':  e[ 'table_idn' ],
+            'source':     list( e.get( 'source',     [] ) ),
+            'op_idn':     e[ 'op_idn' ],
+            'written_by': list( e.get( 'written_by', [] ) ),
+            'always_run': e.get( 'always_run', False ),
+        }
+        for e in data.get( 'table_init', [] )
+    ]
+    table_init_df = (
+        pl.concat(
+            [ pl.DataFrame( [ r ], schema=table_schemas[ '__table_init__' ] ) for r in init_rows ],
+            how = 'vertical',
+        )
+        if init_rows
+        else pl.DataFrame( schema=table_schemas[ '__table_init__' ] )
+    )
+
+    return {
+        'processes':  processes_df,
+        'table_keys': table_keys_df,
+        'table_init': table_init_df,
+    }
+#/def cell_toml_to_dataframes

@@ -6,7 +6,7 @@
 #
 
 """
-TOML-based tests for web_from_toml: alias_idn, exposed-name validation,
+TOML-based tests for web_from_toml: alias_idns, exposed-name validation,
 and subweb op_idn validation.
 """
 
@@ -46,22 +46,22 @@ terms  = ["noop"]
 # -- Valid cases
 
 
-def test_alias_idn_exposed_as_alias( tmp_path: Path ) -> None:
-    """alias_idn replaces op_idn as the name the parent web sees."""
+def test_alias_idns_exposed_as_alias( tmp_path: Path ) -> None:
+    """alias_idns replaces op_idn as the name the parent web sees."""
     _write( tmp_path / 'cell_a.toml', _cell_toml( 'proc_a', [ 'inp' ], [ 'out' ] ) )
     _write( tmp_path / 'web.toml', """\
 [composite]
 main_id = "w"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
-op_idn    = "proc_a"
-alias_idn = "public_a"
-source    = ["inp"]
-target    = ["out"]
+op_idn     = "proc_a"
+alias_idns = ["public_a"]
+source     = ["inp"]
+target     = ["out"]
 """ )
 
     web   = web_from_toml( tmp_path / 'web.toml', _OPS )
@@ -71,15 +71,15 @@ target    = ["out"]
 
 
 def test_no_alias_exposes_op_idn( tmp_path: Path ) -> None:
-    """Without alias_idn the exposed name equals op_idn."""
+    """Without alias_idns the exposed name equals op_idn."""
     _write( tmp_path / 'cell_a.toml', _cell_toml( 'proc_a', [ 'inp' ], [ 'out' ] ) )
     _write( tmp_path / 'web.toml', """\
 [composite]
 main_id = "w"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -94,7 +94,7 @@ target = ["out"]
 
 
 def test_two_nodes_same_cell_op_idn_disambiguated_by_alias( tmp_path: Path ) -> None:
-    """Two cells both expose 'transform'; alias_idn avoids the collision."""
+    """Two cells both expose 'transform'; alias_idns avoids the collision."""
     cell_toml = _cell_toml( 'transform', [ 'inp' ], [ 'out' ] )
     _write( tmp_path / 'cell_x.toml', cell_toml )
     _write( tmp_path / 'cell_y.toml', cell_toml )
@@ -103,24 +103,24 @@ def test_two_nodes_same_cell_op_idn_disambiguated_by_alias( tmp_path: Path ) -> 
 main_id = "w"
 
 [[nodes]]
-node_id = "nx"
-toml    = "cell_x.toml"
+node_idn = "nx"
+toml     = "cell_x.toml"
 
 [[nodes.ops]]
-op_idn    = "transform"
-alias_idn = "transform_x"
-source    = ["inp"]
-target    = ["out"]
+op_idn     = "transform"
+alias_idns = ["transform_x"]
+source     = ["inp"]
+target     = ["out"]
 
 [[nodes]]
-node_id = "ny"
-toml    = "cell_y.toml"
+node_idn = "ny"
+toml     = "cell_y.toml"
 
 [[nodes.ops]]
-op_idn    = "transform"
-alias_idn = "transform_y"
-source    = ["inp"]
-target    = ["out"]
+op_idn     = "transform"
+alias_idns = ["transform_y"]
+source     = ["inp"]
+target     = ["out"]
 """ )
 
     web   = web_from_toml( tmp_path / 'web.toml', _OPS )
@@ -136,8 +136,8 @@ def test_subweb_valid_op_idn( tmp_path: Path ) -> None:
 main_id = "child"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -156,8 +156,8 @@ terms  = ["proc_a"]
 main_id = "parent"
 
 [[nodes]]
-node_id = "child"
-toml    = "child_web.toml"
+node_idn = "child"
+toml     = "child_web.toml"
 
 [[nodes.ops]]
 op_idn = "child_proc"
@@ -170,7 +170,7 @@ target = ["out"]
     assert decls == { 'child_proc' }
 
 
-def test_subweb_alias_idn( tmp_path: Path ) -> None:
+def test_subweb_alias_idns( tmp_path: Path ) -> None:
     """Subweb op_idn aliased in the parent — parent exposes the alias."""
     _write( tmp_path / 'cell_a.toml', _cell_toml( 'proc_a', [ 'inp' ], [ 'out' ] ) )
     _write( tmp_path / 'child_web.toml', """\
@@ -178,8 +178,8 @@ def test_subweb_alias_idn( tmp_path: Path ) -> None:
 main_id = "child"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -198,14 +198,14 @@ terms  = ["proc_a"]
 main_id = "parent"
 
 [[nodes]]
-node_id = "child"
-toml    = "child_web.toml"
+node_idn = "child"
+toml     = "child_web.toml"
 
 [[nodes.ops]]
-op_idn    = "child_proc"
-alias_idn = "parent_alias"
-source    = ["inp"]
-target    = ["out"]
+op_idn     = "child_proc"
+alias_idns = ["parent_alias"]
+source     = ["inp"]
+target     = ["out"]
 """ )
 
     web   = web_from_toml( tmp_path / 'parent_web.toml', _OPS )
@@ -227,8 +227,8 @@ def test_duplicate_op_idn_no_alias( tmp_path: Path ) -> None:
 main_id = "w"
 
 [[nodes]]
-node_id = "nx"
-toml    = "cell_x.toml"
+node_idn = "nx"
+toml     = "cell_x.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -236,8 +236,8 @@ source = ["inp"]
 target = ["out"]
 
 [[nodes]]
-node_id = "ny"
-toml    = "cell_y.toml"
+node_idn = "ny"
+toml     = "cell_y.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -250,7 +250,7 @@ target = ["out"]
 
 
 def test_alias_conflicts_with_other_op_idn( tmp_path: Path ) -> None:
-    """alias_idn of one node equals the exposed op_idn of another → ValueError."""
+    """alias_idns of one node equals the exposed op_idn of another → ValueError."""
     cell_toml_a = _cell_toml( 'proc_a', [ 'inp' ], [ 'out' ] )
     cell_toml_b = _cell_toml( 'proc_b', [ 'inp' ], [ 'out' ] )
     _write( tmp_path / 'cell_a.toml', cell_toml_a )
@@ -260,18 +260,18 @@ def test_alias_conflicts_with_other_op_idn( tmp_path: Path ) -> None:
 main_id = "w"
 
 [[nodes]]
-node_id = "na"
-toml    = "cell_a.toml"
+node_idn = "na"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
-op_idn    = "proc_a"
-alias_idn = "proc_b"
-source    = ["inp"]
-target    = ["out"]
+op_idn     = "proc_a"
+alias_idns = ["proc_b"]
+source     = ["inp"]
+target     = ["out"]
 
 [[nodes]]
-node_id = "nb"
-toml    = "cell_b.toml"
+node_idn = "nb"
+toml     = "cell_b.toml"
 
 [[nodes.ops]]
 op_idn = "proc_b"
@@ -291,8 +291,8 @@ def test_op_idn_not_in_cell( tmp_path: Path ) -> None:
 main_id = "w"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
 op_idn = "nonexistent"
@@ -312,8 +312,8 @@ def test_op_idn_not_in_subweb( tmp_path: Path ) -> None:
 main_id = "child"
 
 [[nodes]]
-node_id = "n"
-toml    = "cell_a.toml"
+node_idn = "n"
+toml     = "cell_a.toml"
 
 [[nodes.ops]]
 op_idn = "proc_a"
@@ -332,8 +332,8 @@ terms  = ["proc_a"]
 main_id = "parent"
 
 [[nodes]]
-node_id = "child"
-toml    = "child_web.toml"
+node_idn = "child"
+toml     = "child_web.toml"
 
 [[nodes.ops]]
 op_idn = "nonexistent_proc"

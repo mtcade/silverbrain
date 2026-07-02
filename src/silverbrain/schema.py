@@ -88,6 +88,20 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # CompositeNodeRef: child node to dispatch to (null for all other types)
     'node_idn':     pl.Utf8,
 } | {
+    # TOML ↔ DataFrame: cell / web loading
+    'terms':           pl.List( pl.Utf8 ),
+    'otherwise':       pl.Utf8,
+    'max_iter':        pl.Int64,
+    'alias_idns':      pl.List( pl.Utf8 ),
+    'node_idn':        pl.Utf8,
+    'toml':            pl.Utf8,
+    'paths':           pl.Utf8,
+    'name':            pl.Utf8,
+    'condition_node':  pl.Utf8,
+    'condition_table': pl.Utf8,
+    'condition_check': pl.Utf8,
+    'sleep':           pl.Float64,
+} | {
     # network / distributed routing
     # mode              — 'terminal' (reply to origin) or 'relay' (forward to next hop)
     # origin_identity   — raw ZMQ ROUTER routing frame bytes for the request origin
@@ -177,6 +191,36 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__routing__': cannonical_schema_for_keys((
         'source_node_idn', 'trigger_op_idn', 'source_table_idn',
         'target_node_idn', 'target_table_idn',
+    )),
+
+    # -- TOML ↔ DataFrame schemas
+
+    'cell_processes': cannonical_schema_for_keys((
+        'op_idn', 'type', 'source', 'target',
+        'terms', 'ifs', 'thens',
+        'otherwise', 'condition', 'max_iter', 'count', 'alias_idns',
+    )),
+
+    'table_keys': cannonical_schema_for_keys((
+        'key',
+    )),
+
+    'nodes': cannonical_schema_for_keys((
+        'node_idn', 'toml', 'paths',
+    )),
+
+    'node_ops': cannonical_schema_for_keys((
+        'node_idn', 'op_idn', 'alias_idns', 'source', 'target',
+    )),
+
+    'web_processes': cannonical_schema_for_keys((
+        'op_idn', 'type', 'source', 'target',
+        'terms', 'ifs', 'thens', 'otherwise', 'count',
+    )),
+
+    'commands': cannonical_schema_for_keys((
+        'name', 'type', 'terms',
+        'condition_node', 'condition_table', 'condition_check', 'sleep',
     )),
 
     # -- Network system tables (present in every network-capable Cell)

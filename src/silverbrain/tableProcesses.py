@@ -215,10 +215,10 @@ def run_from_df(
 
 @dataclass
 class Alias():
-    op_idn:  str
-    aliases: str            # op_idn of the process being aliased
-    source:  Sequence[ str ]
-    target:  Sequence[ str ]
+    op_idn:     str
+    alias_idns: list[ str ]  # op_idns of the processes being aliased
+    source:     Sequence[ str ]
+    target:     Sequence[ str ]
 
     def as_polars( self: Self ) -> pl.DataFrame:
         return _make_process_row(
@@ -226,7 +226,7 @@ class Alias():
             type      = 'TableProcessSequence',
             source    = list( self.source ),
             target    = list( self.target ),
-            term_idns =[ self.aliases ],
+            term_idns = self.alias_idns,
         )
     #/def as_polars
 #/class Alias
@@ -257,10 +257,10 @@ class TableProcessRef():
 
     def alias( self, new_op_idn: str ) -> Alias:
         return Alias(
-            op_idn=new_op_idn,
-            aliases=self.op_idn,
-            source=self.source,
-            target=self.target,
+            op_idn     = new_op_idn,
+            alias_idns = [ self.op_idn ],
+            source     = self.source,
+            target     = self.target,
         )
     #/def alias
 #/class TableProcessRef
@@ -322,7 +322,7 @@ class TableProcessSequence():
     #/def as_polars
 
     def alias( self, new_op_idn: str ) -> Alias:
-        return Alias( op_idn=new_op_idn, aliases=self.op_idn, source=self.source, target=self.target )
+        return Alias( op_idn=new_op_idn, alias_idns=[ self.op_idn ], source=self.source, target=self.target )
     #/def alias
 #/class TableProcessSequence
 

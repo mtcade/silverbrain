@@ -101,19 +101,19 @@ def _check_composite(
     issues: list[ VerifyIssue ],
 ) -> None:
     base_dir     = path.parent
-    exposed: dict[ str, str ] = {}  # exposed_name → node_id
+    exposed: dict[ str, str ] = {}  # exposed_name → node_idn
 
     for node_desc in data.get( 'nodes', [] ):
-        node_id  = node_desc.get( 'node_id', '?' )
+        node_idn = node_desc.get( 'node_idn', '?' )
         raw_toml = node_desc.get( 'toml' )
         if not raw_toml:
-            issues.append( VerifyIssue( path, f"Node {node_id!r} missing 'toml' field" ) )
+            issues.append( VerifyIssue( path, f"Node {node_idn!r} missing 'toml' field" ) )
             continue
 
         child_path = ( base_dir / _apply_template_vars( raw_toml, tvars ) ).resolve()
         if not child_path.exists():
             issues.append( VerifyIssue(
-                path, f"Node {node_id!r} toml path not found: {child_path}"
+                path, f"Node {node_idn!r} toml path not found: {child_path}"
             ) )
             continue
 
@@ -128,13 +128,12 @@ def _check_composite(
         )
 
         for op in node_desc.get( 'ops', [] ):
-            op_idn  = op.get( 'op_idn' )
-            alias   = op.get( 'alias_idn' )
-            exposed_name = alias if alias else op_idn
+            op_idn     = op.get( 'op_idn' )
+            alias_idns = list( op.get( 'alias_idns' ) or [] )
 
             if not op_idn:
                 issues.append( VerifyIssue(
-                    path, f"Node {node_id!r} [[nodes.ops]] entry missing op_idn"
+                    path, f"Node {node_idn!r} [[nodes.ops]] entry missing op_idn"
                 ) )
                 continue
 
@@ -142,18 +141,20 @@ def _check_composite(
                 kind = 'subweb' if is_composite else 'cell'
                 issues.append( VerifyIssue(
                     path,
-                    f"Node {node_id!r} op_idn {op_idn!r} not found in {kind} "
+                    f"Node {node_idn!r} op_idn {op_idn!r} not found in {kind} "
                     f"{child_path.name!r}; available: {sorted( child_ops )}"
                 ) )
 
-            if exposed_name in exposed:
-                issues.append( VerifyIssue(
-                    path,
-                    f"Duplicate exposed op name {exposed_name!r}: "
-                    f"nodes {exposed[ exposed_name ]!r} and {node_id!r}"
-                ) )
-            else:
-                exposed[ exposed_name ] = node_id
+            exposed_names = alias_idns if alias_idns else [ op_idn ]
+            for exposed_name in exposed_names:
+                if exposed_name in exposed:
+                    issues.append( VerifyIssue(
+                        path,
+                        f"Duplicate exposed op name {exposed_name!r}: "
+                        f"nodes {exposed[ exposed_name ]!r} and {node_idn!r}"
+                    ) )
+                else:
+                    exposed[ exposed_name ] = node_idn
 
     proc_op_idns = { p[ 'op_idn' ] for p in data.get( 'processes', [] ) }
     valid_terms  = set( exposed ) | proc_op_idns
