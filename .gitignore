@@ -17,3 +17,7 @@ wheels/
 
 # Scratch files
 tasks.txt
+
+# Workspace-member lockfile is vestigial; resolution happens at the
+# BigBrainStuff workspace root, not here.
+uv.lock
