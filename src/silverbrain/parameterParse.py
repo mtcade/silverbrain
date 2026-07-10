@@ -10,6 +10,18 @@ and call to_polars() to convert JSON spec dicts to a flat DataFrame.
 
 Each row in the resulting DataFrame has exactly one non-null value column;
 which one depends on the registered dtype for that par_name.
+
+Every row also carries node_idx (a permanent id for the _groups alternative
+that produced it) and parent_idx (the node_idx of the enclosing _groups
+alternative, or null at the root) — this reconstructs the nesting structure
+of the original spec's _groups lists independently of par_idx, which stays a
+flat, reassignable id for the fully-expanded combination a row belongs to.
+
+_groups may not be nested directly inside another _groups with no par_group
+dict in between (e.g. {'_groups': [{'_groups': [...]}]}) — to_polars() raises
+ValueError for this. Nest the inner _groups inside a specific par_group's own
+dict instead (e.g. {'X': {'_groups': [...]}}), which is fully supported at
+any depth.
 """
 
 import itertools
@@ -25,7 +37,9 @@ from .polarsDataTypeStrings import dtype_to_str
 
 # -- Column naming
 
-_PAR_IDX_DTYPE: pl.DataType = _cannonical_schema['par_idx']
+_PAR_IDX_DTYPE:    pl.DataType = _cannonical_schema['par_idx']
+_NODE_IDX_DTYPE:   pl.DataType = _cannonical_schema['node_idx']
+_PARENT_IDX_DTYPE: pl.DataType = _cannonical_schema['parent_idx']
 
 _IDENTIFIER_COLS: dict[ str, pl.DataType ] = {
     'par_group':   pl.Utf8,
@@ -33,6 +47,8 @@ _IDENTIFIER_COLS: dict[ str, pl.DataType ] = {
     'par_idx':     _PAR_IDX_DTYPE,
     'par_name':    pl.Utf8,
     'par_feature': pl.Utf8,
+    'node_idx':    _NODE_IDX_DTYPE,
+    'parent_idx':  _PARENT_IDX_DTYPE,
 }
 
 
@@ -159,7 +175,7 @@ class ParameterParser:
         parser = ParameterParser()
         parser.register('n', pl.Int64)
         parser.register('rho', pl.Float64)
-        df, _ = parser.to_polars(json_dict)
+        df, _, _ = parser.to_polars(json_dict)
     """
 
     def __init__( self ) -> None:
@@ -208,13 +224,18 @@ class ParameterParser:
 
     def _valueDict_to_polars(
         self,
-        valueDict: ValueDict,
-        par_group: str,
-        par_idx:   int,
-        par_name:  str,
+        valueDict:  ValueDict,
+        par_group:  str,
+        par_idx:    int,
+        par_name:   str,
+        node_idx:   int,
+        parent_idx: int | None,
     ) -> pl.DataFrame:
         tb   = TableBuilder( schema = self.schema )
-        base = { 'par_group': par_group, 'par_idx': par_idx, 'par_name': par_name }
+        base = {
+            'par_group': par_group, 'par_idx': par_idx, 'par_name': par_name,
+            'node_idx': node_idx, 'parent_idx': parent_idx,
+        }
 
         def _app( par_type: str, par_feature: str, val: dict ) -> None:
             tb.append(
@@ -303,11 +324,13 @@ class ParameterParser:
 
     def _paramGroup_to_polars(
         self,
-        paramGroup_dict: ParamGroupDict,
-        par_group:       str,
-        sibling_df:      pl.DataFrame | None = None,
-        par_idx_start:   int = 0,
-    ) -> tuple[ pl.DataFrame, int ]:
+        paramGroup_dict:  ParamGroupDict,
+        par_group:        str,
+        sibling_df:       pl.DataFrame | None = None,
+        par_idx_start:    int = 0,
+        node_idx_start:   int = 0,
+        parent_node_idx:  int | None = None,
+    ) -> tuple[ pl.DataFrame, int, int ]:
         schema       = self.schema
         df_own_list: list[ pl.DataFrame ] = []
 
@@ -318,15 +341,24 @@ class ParameterParser:
                 df_own_list.append( self._valueDict_to_polars(
                     valueDict = v, par_group = par_group,
                     par_idx   = par_idx_start, par_name = k,
+                    node_idx  = node_idx_start, parent_idx = parent_node_idx,
                 ) )
             else:
                 col = self.col_for_name( k )
                 df_own_list.append( pl.DataFrame(
                     ( { 'par_group': par_group, 'par_type': 'fixed',
                         'par_idx':   par_idx_start, 'par_name': k,
-                        'par_feature': 'value', col: v }, ),
+                        'par_feature': 'value', col: v,
+                        'node_idx': node_idx_start, 'parent_idx': parent_node_idx }, ),
                     schema = schema,
                 ) )
+
+        if df_own_list:
+            this_node_idx = node_idx_start
+            node_idx      = node_idx_start + 1
+        else:
+            this_node_idx = parent_node_idx
+            node_idx      = node_idx_start
 
         if sibling_df is not None:
             reindexed = sibling_df.with_columns( pl.lit( par_idx_start, dtype=_PAR_IDX_DTYPE ).alias( 'par_idx' ) )
@@ -340,40 +372,48 @@ class ParameterParser:
             df_combined = pl.DataFrame( schema = schema )
 
         if '_groups' not in paramGroup_dict:
-            return df_combined, par_idx_start + 1
+            return df_combined, par_idx_start + 1, node_idx
 
         par_idx = par_idx_start
         df_out_list: list[ pl.DataFrame ] = []
         for child in paramGroup_dict['_groups']:
-            df_next, par_idx = self._paramGroup_to_polars(
+            df_next, par_idx, node_idx = self._paramGroup_to_polars(
                 paramGroup_dict = child, par_group = par_group,
                 sibling_df = df_combined, par_idx_start = par_idx,
+                node_idx_start = node_idx, parent_node_idx = this_node_idx,
             )
             df_out_list.append( df_next )
-        return pl.concat( df_out_list, how = 'vertical' ), par_idx
+        return pl.concat( df_out_list, how = 'vertical' ), par_idx, node_idx
 
     def to_polars(
         self,
-        param_dict:    ParamDict,
-        sibling_df:    pl.DataFrame | None = None,
-        par_idx_start: int = 0,
-    ) -> tuple[ pl.DataFrame, int ]:
+        param_dict:       ParamDict,
+        sibling_df:       pl.DataFrame | None = None,
+        par_idx_start:    int = 0,
+        node_idx_start:   int = 0,
+        parent_node_idx:  int | None = None,
+    ) -> tuple[ pl.DataFrame, int, int ]:
         """
         Convert a top-level parameter spec dict to a flat DataFrame.
 
-        :param param_dict:    Top-level dict keyed by par_group (e.g. 'X', 'Xk').
-        :param sibling_df:    Rows from an outer _groups scope; par_idx is overwritten.
-        :param par_idx_start: First par_idx value to assign.
-        :returns:             (DataFrame with self.schema, next available par_idx)
+        :param param_dict:      Top-level dict keyed by par_group (e.g. 'X', 'Xk').
+        :param sibling_df:      Rows from an outer _groups scope; par_idx is overwritten.
+        :param par_idx_start:   First par_idx value to assign.
+        :param node_idx_start:  First node_idx value to assign.
+        :param parent_node_idx: node_idx this call's own par_group content (and any
+            _groups children) is nested under; None at the root.
+        :returns: (DataFrame with self.schema, next available par_idx, next available node_idx)
         """
         schema         = self.schema
         par_group_dfs: dict[ str, pl.DataFrame ] = {}
 
+        node_idx = node_idx_start
         for k, v in param_dict.items():
             if k == '_groups':
                 continue
-            df_k, _ = self._paramGroup_to_polars(
+            df_k, _, node_idx = self._paramGroup_to_polars(
                 paramGroup_dict = v, par_group = k, par_idx_start = 0,
+                node_idx_start = node_idx, parent_node_idx = parent_node_idx,
             )
             par_group_dfs[ k ] = df_k
 
@@ -425,7 +465,17 @@ class ParameterParser:
         par_idx_after_own = par_idx_start + n_records
 
         if '_groups' not in param_dict:
-            return df_combined, par_idx_after_own
+            return df_combined, par_idx_after_own, node_idx
+
+        for child in param_dict['_groups']:
+            if '_groups' in child:
+                raise ValueError(
+                    "_groups cannot be nested directly inside another _groups "
+                    "(no par_group dict in between). Nest the inner _groups inside "
+                    "a specific par_group's own dict instead, e.g. "
+                    "{'X': {'_groups': [...]}} rather than "
+                    "{'_groups': [{'_groups': [...]}]}."
+                )
 
         par_idx      = par_idx_after_own
         df_out_list: list[ pl.DataFrame ] = []
@@ -434,18 +484,21 @@ class ParameterParser:
             distinct_par_idxs = sorted( df_combined['par_idx'].unique().to_list() )
             for child in param_dict['_groups']:
                 for p in distinct_par_idxs:
-                    df_next, par_idx = self.to_polars(
-                        param_dict    = child,
-                        sibling_df    = df_combined.filter( pl.col( 'par_idx' ) == p ),
-                        par_idx_start = par_idx,
+                    df_next, par_idx, node_idx = self.to_polars(
+                        param_dict      = child,
+                        sibling_df      = df_combined.filter( pl.col( 'par_idx' ) == p ),
+                        par_idx_start   = par_idx,
+                        node_idx_start  = node_idx,
+                        parent_node_idx = parent_node_idx,
                     )
                     df_out_list.append( df_next )
         else:
             for child in param_dict['_groups']:
-                df_next, par_idx = self.to_polars(
-                    param_dict = child, sibling_df = None, par_idx_start = par_idx,
+                df_next, par_idx, node_idx = self.to_polars(
+                    param_dict      = child, sibling_df = None, par_idx_start = par_idx,
+                    node_idx_start  = node_idx, parent_node_idx = parent_node_idx,
                 )
                 df_out_list.append( df_next )
 
-        return pl.concat( df_out_list, how = 'vertical' ), par_idx
+        return pl.concat( df_out_list, how = 'vertical' ), par_idx, node_idx
 #/class ParameterParser
