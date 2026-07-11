@@ -54,8 +54,6 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'schema_name':       pl.Utf8,
     # parameter spec rows
     'par_idx':          pl.UInt32,
-    'node_idx':         pl.UInt32,
-    'parent_idx':       pl.UInt32,
     # table_init / process_init serialization
     'written_by':       pl.List( pl.Utf8 ),
     'factory_idn':      pl.Utf8,
