@@ -107,6 +107,22 @@ class BundleDirs:
 
 # -- Loading a web from a bundle
 
+def _default_map_id( dirs: 'BundleDirs', bundle_id: str ) -> str:
+    """Read the required `default_map_id` from a bundle's bundle.toml."""
+    bundle_toml = dirs.root / 'bundle.toml'
+    if not bundle_toml.exists():
+        raise FileNotFoundError(
+            f"bundle.toml not found for bundle {bundle_id!r} at {bundle_toml}"
+        )
+    with open( bundle_toml, 'rb' ) as f:
+        meta = tomllib.load( f ).get( 'bundle', {} )
+    if 'default_map_id' not in meta:
+        raise ValueError(
+            f"bundle.toml for {bundle_id!r} is missing required 'default_map_id'"
+        )
+    return meta[ 'default_map_id' ]
+
+
 def web_from_bundle(
     bundle_id: str,
     app_name:  str = 'silverknockoff',
@@ -116,7 +132,7 @@ def web_from_bundle(
     from .web import web_from_toml
 
     dirs  = BundleDirs( bundle_id, app_name )
-    toml  = dirs.web_path( bundle_id )
+    toml  = dirs.web_path( _default_map_id( dirs, bundle_id ) )
     template_vars = {
         'cells_root':   str( dirs._cells_root() ),
         'webs_root':    str( dirs._webs_root() ),
@@ -184,7 +200,7 @@ def pull_from_hub(
     )
 
     _fetch_missing_commons( dirs, app_name, token )
-    register_bundle( bundle_id, dirs.web_path( bundle_id ), app_name )
+    register_bundle( bundle_id, dirs.web_path( _default_map_id( dirs, bundle_id ) ), app_name )
     return dirs
 
 
