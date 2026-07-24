@@ -158,7 +158,7 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
         'table_idn', 'column_names', 'column_types',
     )),
     'paths': cannonical_schema_for_keys((
-        'key', 'fp', 'isfile', 'isdir',
+        'key', 'fp', 'isfile', 'isdir', 'format', 'if_exists',
     )),
     '__backend_index__': cannonical_schema_for_keys((
         'backend_id', 'backend_table',

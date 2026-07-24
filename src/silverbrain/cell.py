@@ -972,7 +972,7 @@ def cell_from_toml(
     main_id: str,
     rng: np.random.Generator | None = None,
     verbose: int = 0,
-    paths_dict: dict[ str, str ] | None = None,
+    paths_dict: dict[ str, dict ] | None = None,
 ) -> Cell:
     """
     Construct a Web from a TOML brain config.
@@ -1120,12 +1120,18 @@ def cell_from_toml(
     if paths_dict is not None and 'paths' in cell.tables:
         from .utilities import isfile_series, isdir_series
         from .schema import table_schemas as _table_schemas
+        _fps = [ entry[ 'fp' ] for entry in paths_dict.values() ]
         _paths_df = pl.DataFrame(
-            { 'key': list( paths_dict.keys() ), 'fp': list( paths_dict.values() ) },
-            schema = { 'key': pl.Utf8, 'fp': pl.Utf8 },
+            {
+                'key':       list( paths_dict.keys() ),
+                'fp':        _fps,
+                'format':    [ entry.get( 'format', 'parquet' )    for entry in paths_dict.values() ],
+                'if_exists': [ entry.get( 'if_exists', 'overwrite' ) for entry in paths_dict.values() ],
+            },
+            schema = { 'key': pl.Utf8, 'fp': pl.Utf8, 'format': pl.Utf8, 'if_exists': pl.Utf8 },
         ).with_columns(
-            isfile_series( pl.Series( list( paths_dict.values() ) ), name='isfile' ),
-            isdir_series(  pl.Series( list( paths_dict.values() ) ), name='isdir'  ),
+            isfile_series( pl.Series( _fps ), name='isfile' ),
+            isdir_series(  pl.Series( _fps ), name='isdir'  ),
         ).select( list( _table_schemas['paths'].keys() ) )
         cell.tables[ 'paths' ] = _paths_df
 

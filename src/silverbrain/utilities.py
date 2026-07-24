@@ -292,23 +292,30 @@ def paths_df_from_dict(
     paths_dict: dict[ str, str ],
     ) -> pl.DataFrame:
     """
-        :param paths_dict: key -> fp
-        
+        :param paths_dict: key -> fp (legacy shorthand; always parquet/overwrite --
+            use `cell.cell_from_toml(paths_dict=...)`'s dict-valued form for other
+            backends/write modes)
+
         :returns:
             - key: str
             - fp: str
             - isfile: bool
+            - isdir: bool
+            - format: str
+            - if_exists: str
     """
     paths_df: pl.DataFrame = pl.DataFrame(
         {
-            'key': tuple( paths_dict.keys() ),
-            'fp': tuple( paths_dict.values() ),
+            'key':       tuple( paths_dict.keys() ),
+            'fp':        tuple( paths_dict.values() ),
+            'format':    tuple( 'parquet'   for _ in paths_dict ),
+            'if_exists': tuple( 'overwrite' for _ in paths_dict ),
         },
         schema = schema.cannonical_schema_for_keys((
-            'key','fp',
+            'key', 'fp', 'format', 'if_exists',
         )),
     )
-    
+
     return paths_df.with_columns(
         isfile_series(
             paths_df['fp'],
@@ -318,7 +325,7 @@ def paths_df_from_dict(
             paths_df['fp'],
             name = 'isdir',
         ),
-    )
+    ).select( list( schema.table_schemas['paths'].keys() ) )
 #/def paths_df_from_dict
 
 def resolve_paths(

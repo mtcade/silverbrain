@@ -20,7 +20,7 @@ from collections import UserDict
 from dataclasses import dataclass, field
 from itertools import chain
 from os import path
-from typing import Literal, Self, Sequence, Type
+from typing import Any, Literal, Self, Sequence, Type
 import json
 import sqlite3
 
@@ -1045,10 +1045,20 @@ def _pl_dtype_to_sqlite_type( dtype: pl.DataType ) -> str:
     return 'TEXT'
 #/def _pl_dtype_to_sqlite_type
 
+def _json_dumps_element( v: Any ) -> str | None:
+    """map_elements passes List/Array element values as pl.Series, not plain
+    Python lists/dicts -- normalize before handing to json.dumps."""
+    if v is None:
+        return None
+    if isinstance( v, pl.Series ):
+        v = v.to_list()
+    return json.dumps( v )
+#/def _json_dumps_element
+
 def _prepare_df_for_sqlite( df: pl.DataFrame ) -> pl.DataFrame:
     """Serialize List/Struct/Array columns to JSON strings for SQLite storage."""
     exprs = [
-        pl.col( col ).map_elements( json.dumps, return_dtype = pl.String ).alias( col )
+        pl.col( col ).map_elements( _json_dumps_element, return_dtype = pl.String ).alias( col )
         for col, dtype in df.schema.items()
         if isinstance( dtype, ( pl.List, pl.Array, pl.Struct ) )
     ]
@@ -1080,9 +1090,15 @@ def _write_sqlite(
                 for col, dtype in df.schema.items()
             )
             cursor.execute( f'CREATE TABLE "{table_name}" ({col_defs})' )
+        # Name columns explicitly rather than relying on positional order matching
+        # the table's physical column order -- callers appending rows built from a
+        # dict (e.g. one wide row per trial) commonly vary column order run to run
+        # even when the column set itself is stable, and a bare positional INSERT
+        # would silently write values into the wrong columns.
+        col_list     = ', '.join( f'"{col}"' for col in df.columns )
         placeholders = ', '.join( '?' for _ in df.columns )
         cursor.executemany(
-            f'INSERT INTO "{table_name}" VALUES ({placeholders})',
+            f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
             df.rows(),
         )
         conn.commit()
@@ -1099,7 +1115,10 @@ def _read_sqlite( db_path: str, table_name: str ) -> pl.DataFrame:
         col_names = [ desc[0] for desc in cursor.description ]
         if not rows:
             return pl.DataFrame( { name: [] for name in col_names } )
-        return pl.DataFrame( rows, schema = col_names, orient = 'row' )
+        # infer_schema_length=None: scan every row, not just a sample -- SQLite's
+        # per-value dynamic typing means an early NULL/int in a column can otherwise
+        # cause a later real value of a different type to fail construction.
+        return pl.DataFrame( rows, schema = col_names, orient = 'row', infer_schema_length = None )
     finally:
         conn.close()
 #/def _read_sqlite

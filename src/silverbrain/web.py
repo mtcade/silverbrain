@@ -69,6 +69,23 @@ def _apply_template_vars( s: str, vars: dict[ str, str ] ) -> str:
     return s
 
 
+def _parse_path_entry( raw_value: str | dict, main_root: Path ) -> dict:
+    """
+    Normalize one `paths.json` value to {fp, format, if_exists}. A plain string
+    is legacy shorthand for a parquet path meant to be overwritten each write;
+    a dict lets a key opt into another backend (e.g. sqlite) and write mode,
+    resolved transparently by any write op that reads the `paths` table.
+    """
+    if isinstance( raw_value, str ):
+        entry = { 'fp': raw_value }
+    else:
+        entry = dict( raw_value )
+    entry.setdefault( 'format', 'parquet' )
+    entry.setdefault( 'if_exists', 'overwrite' )
+    entry[ 'fp' ] = str( ( main_root / entry[ 'fp' ] ).resolve() )
+    return entry
+
+
 # -- Web-level process descriptor
 
 _DISALLOWED_WEB_PROC_TYPES = frozenset({ 'TableProcessWhile', 'TableProcessSleep' })
@@ -586,15 +603,15 @@ class Web:
                 else:
                     web_nodes[ node_idn ] = child_web
             else:
-                paths_dict: dict[ str, str ] | None = None
+                paths_dict: dict[ str, dict ] | None = None
                 if node_row.get( 'paths' ):
                     paths_json = ( base_dir / node_row[ 'paths' ] ).resolve()
                     with open( paths_json ) as f:
                         raw = json.load( f )
                     paths_dict = {
-                        '__main_root__': str( mr ),
+                        '__main_root__': { 'fp': str( mr ), 'format': 'parquet', 'if_exists': 'overwrite' },
                         **{
-                            k: str( ( mr / v ).resolve() )
+                            k: _parse_path_entry( v, mr )
                             for k, v in raw.items()
                         },
                     }
@@ -763,15 +780,15 @@ def web_from_toml(
             else:
                 nodes[ node_idn ] = child_web
         else:
-            paths_dict: dict[ str, str ] | None = None
+            paths_dict: dict[ str, dict ] | None = None
             if 'paths' in node_desc:
                 paths_json = ( base_dir / _apply_template_vars( node_desc[ 'paths' ], tvars ) ).resolve()
                 with open( paths_json ) as f:
                     raw = json.load( f )
                 paths_dict = {
-                    '__main_root__': str( main_root ),
+                    '__main_root__': { 'fp': str( main_root ), 'format': 'parquet', 'if_exists': 'overwrite' },
                     **{
-                        k: str( ( main_root / v ).resolve() )
+                        k: _parse_path_entry( v, main_root )
                         for k, v in raw.items()
                     },
                 }
