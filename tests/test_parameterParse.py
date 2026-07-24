@@ -344,6 +344,92 @@ def test_repeat_on_step_search_raises() -> None:
 #/def test_repeat_on_step_search_raises
 
 
+# -- values_random / values_search (literal candidate lists)
+
+def test_values_random_scalar_dtype_round_trips() -> None:
+    p = _make_parser()
+    d = { 'X': { 'method': { 'values_random': [ 'a', 'b', 'c' ] } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'method' ) & ( pl.col( 'par_feature' ) == 'value' ) )
+    assert row.shape[ 0 ] == 1
+    assert row[ 'par_type' ][ 0 ] == 'random'
+    assert list( row[ 'par_val_list_string' ][ 0 ] ) == [ 'a', 'b', 'c' ]
+#/def test_values_random_scalar_dtype_round_trips
+
+
+def test_values_search_scalar_dtype_round_trips() -> None:
+    p = _make_parser()
+    d = { 'X': { 'method': { 'values_search': [ 'a', 'b', 'c' ] } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'method' ) & ( pl.col( 'par_feature' ) == 'value' ) )
+    assert row.shape[ 0 ] == 1
+    assert row[ 'par_type' ][ 0 ] == 'search'
+    assert list( row[ 'par_val_list_string' ][ 0 ] ) == [ 'a', 'b', 'c' ]
+#/def test_values_search_scalar_dtype_round_trips
+
+
+def test_values_random_list_dtype_round_trips() -> None:
+    p = _make_parser()
+    p.register( 'modes_magnitude', pl.List( pl.Float64 ) )
+    d = { 'X': { 'modes_magnitude': { 'values_random': [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'modes_magnitude' ) & ( pl.col( 'par_feature' ) == 'value' ) )
+    assert row.shape[ 0 ] == 1
+    assert row[ 'par_val_list_list_float64' ].to_list()[ 0 ] == [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ]
+#/def test_values_random_list_dtype_round_trips
+
+
+def test_register_list_dtype_twice_adds_one_wrapped_column() -> None:
+    p = ParameterParser()
+    p.register( 'categories',         pl.List( pl.Int64 ) )
+    p.register( 'categories_per_var', pl.List( pl.Int64 ) )
+    assert list( p._list_wrapped_cols.keys() ).count( 'par_val_list_list_int64' ) == 1
+    assert p.schema_flat[ 'par_val_list_list_int64' ] == pl.List( pl.List( pl.Int64 ) )
+#/def test_register_list_dtype_twice_adds_one_wrapped_column
+
+
+def test_values_random_casts_int_to_float() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'values_random': [ 1, 2, 3 ] } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'value' ) )
+    assert list( row[ 'par_val_list_float64' ][ 0 ] ) == [ 1.0, 2.0, 3.0 ]
+#/def test_values_random_casts_int_to_float
+
+
+def test_values_random_rejects_wrong_type() -> None:
+    p = _make_parser()
+    d = { 'X': { 'a': { 'values_random': [ 'x', 'y' ] } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_values_random_rejects_wrong_type
+
+
+def test_values_random_rejects_lossy_float() -> None:
+    p = _make_parser()
+    d = { 'X': { 'a': { 'values_random': [ 1.5 ] } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_values_random_rejects_lossy_float
+
+
+def test_values_random_rejects_empty_list() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'values_random': [] } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_values_random_rejects_empty_list
+
+
+def test_values_random_unsupported_dtype_raises() -> None:
+    p = _make_parser()
+    p.register( 'standardize_y', pl.Boolean )
+    d = { 'X': { 'standardize_y': { 'values_random': [ True, False ] } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_values_random_unsupported_dtype_raises
+
+
 # -- deprecated oracle: frozen pre-refactor behavior (regression safety net)
 #
 # Mirrors the tests above but targets to_polars_deprecated/schema_deprecated,

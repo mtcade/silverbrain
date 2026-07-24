@@ -139,6 +139,36 @@ _COL_INTL   = col_for_dtype( pl.List( pl.Int64 ) )   # 'par_val_list_int64'
 _COL_FLOATL = col_for_dtype( pl.List( pl.Float64 ) ) # 'par_val_list_float64'
 _COL_BOOL   = col_for_dtype( pl.Boolean )            # 'par_val_boolean'
 
+# Fixed candidate-list columns for values_random/values_search on
+# scalar-registered params (the only dtypes PrimitiveValue covers).
+# Unconditionally present in schema/schema_flat -- see ParameterParser.
+_CANDIDATE_LIST_COLS: dict[ str, pl.DataType ] = {
+    _COL_STRL:   pl.List( pl.Utf8 ),
+    _COL_INTL:   pl.List( pl.Int64 ),
+    _COL_FLOATL: pl.List( pl.Float64 ),
+}
+
+
+def _coerce_values_for_dtype(
+    values: list, dtype: pl.DataType, *, par_name: str, spec_key: str,
+) -> list:
+    """Validate + cast a literal candidate list against a registered dtype,
+    raising ValueError if any item isn't reasonably castable."""
+    if not isinstance( values, list ) or len( values ) == 0:
+        raise ValueError(
+            f"{spec_key!r} for par_name={par_name!r} must be a non-empty "
+            f"list, got {values!r}"
+        )
+    try:
+        coerced = pl.Series( values, dtype=dtype, strict=True )
+    except Exception as e:
+        raise ValueError(
+            f"{spec_key!r} values for par_name={par_name!r} are not "
+            f"castable to registered dtype {dtype!r}: {values!r} ({e})"
+        ) from e
+    return coerced.to_list()
+#/def _coerce_values_for_dtype
+
 
 # -- ValueDict TypedDicts
 # Describe the valid shapes of per-parameter spec dicts in JSON settings files.
@@ -148,7 +178,7 @@ RegularValue:   Type = PrimitiveValue | list[ PrimitiveValue ]
 
 
 class ValueDict_Search_Values( TypedDict, closed = True ):
-    values_search: list[ PrimitiveValue ]
+    values_search: list[ PrimitiveValue | list[ PrimitiveValue ] ]
 
 class ValueDict_Search_Int( TypedDict, closed = True ):
     start:            int
@@ -179,7 +209,7 @@ class ValueDict_Search_Logit( TypedDict, closed = True ):
     logit_step: float
 
 class ValueDict_Random_Values( TypedDict, closed = True ):
-    values_random: list[ PrimitiveValue ]
+    values_random: list[ PrimitiveValue | list[ PrimitiveValue ] ]
 
 class ValueDict_Random_UniformInt( TypedDict, closed = True ):
     distribution: Literal[ "uniform_int" ]
@@ -256,20 +286,33 @@ class ParameterParser:
     """
 
     def __init__( self ) -> None:
-        self._dtype_map: dict[ str, pl.DataType ] = {}
+        self._dtype_map:         dict[ str, pl.DataType ] = {}
+        # Doubled-nesting candidate-list columns for pl.List(...)-registered
+        # dtypes (e.g. pl.List(pl.Float64) -> pl.List(pl.List(pl.Float64))),
+        # added lazily in register(), one per distinct inner dtype.
+        self._list_wrapped_cols: dict[ str, pl.DataType ] = {}
 
     def register( self, name: str, dtype: pl.DataType ) -> None:
         self._dtype_map[ name ] = dtype
+        if isinstance( dtype, pl.List ):
+            wrapped_dtype = pl.List( dtype )
+            wrapped_col   = col_for_dtype( wrapped_dtype )
+            if wrapped_col not in _CANDIDATE_LIST_COLS and wrapped_col not in self._list_wrapped_cols:
+                self._list_wrapped_cols[ wrapped_col ] = wrapped_dtype
+        #/if isinstance( dtype, pl.List )
     #/def register
-    
+
     @property
     def schema_flat( self ) -> dict[ str, pl.DataType ]:
         """Flat row schema: identifier columns (incl. par_idx, no node_idx/parent_idx)
-        + one value column per unique registered dtype."""
+        + one value column per unique registered dtype, + the fixed
+        values_random/values_search candidate-list columns."""
         val_cols: dict[ str, pl.DataType ] = {
             col_for_dtype( dtype ): dtype
             for dtype in dict.fromkeys( self._dtype_map.values() )
         }
+        val_cols |= _CANDIDATE_LIST_COLS
+        val_cols |= self._list_wrapped_cols
         return dict( _IDENTIFIER_COLS ) | val_cols
     #/def schema_flat
 
@@ -301,6 +344,22 @@ class ParameterParser:
             return ( _COL_STRL, [ str( v ) for v in value ] )
         return ( _COL_STR, str( value ) )
 
+    def _values_col_and_coerced(
+        self, par_name: str, values: list, *, spec_key: str,
+    ) -> tuple[ str, list ]:
+        """Resolve the candidate-list column + coerced values for a
+        values_random/values_search spec on a registered par_name."""
+        dtype = self._dtype_map[ par_name ]
+        if dtype not in ( pl.Utf8, pl.Int64, pl.Float64 ) and not isinstance( dtype, pl.List ):
+            raise ValueError(
+                f"{spec_key!r} is only supported for par_names registered as "
+                f"Utf8/Int64/Float64 or pl.List(...), got par_name={par_name!r} dtype={dtype!r}"
+            )
+        coerced = _coerce_values_for_dtype( values, dtype, par_name=par_name, spec_key=spec_key )
+        col     = col_for_dtype( pl.List( dtype ) )
+        return col, coerced
+    #/def _values_col_and_coerced
+
     # -- Parsing
 
     # -- Tree (node_idx/parent_idx, no par_idx)
@@ -315,12 +374,15 @@ class ParameterParser:
     @property
     def schema( self ) -> dict[ str, pl.DataType ]:
         """Tree row schema: identifier columns (incl. node_idx/parent_idx, no par_idx)
-        + one value column per unique registered dtype. Junction rows (par_type in
-        {'_or', '_and'}) carry no par_name/value, just identity."""
+        + one value column per unique registered dtype, + the fixed
+        values_random/values_search candidate-list columns. Junction rows
+        (par_type in {'_or', '_and'}) carry no par_name/value, just identity."""
         val_cols: dict[ str, pl.DataType ] = {
             col_for_dtype( dtype ): dtype
             for dtype in dict.fromkeys( self._dtype_map.values() )
         }
+        val_cols |= _CANDIDATE_LIST_COLS
+        val_cols |= self._list_wrapped_cols
         return dict( _TREE_IDENTIFIER_COLS ) | val_cols
     #/def schema
 
@@ -366,12 +428,12 @@ class ParameterParser:
             )
 
         if 'values_search' in d:
-            col = self.col_for_name( par_name )
-            _app( 'search', 'value', { col: d['values_search'] } )
+            col, values = self._values_col_and_coerced( par_name, d['values_search'], spec_key='values_search' )
+            _app( 'search', 'value', { col: values } )
 
         elif 'values_random' in d:
-            col = self.col_for_name( par_name )
-            _app( 'random', 'value', { col: d['values_random'] } )
+            col, values = self._values_col_and_coerced( par_name, d['values_random'], spec_key='values_random' )
+            _app( 'random', 'value', { col: values } )
 
         elif 'logit_step' in d:
             if not ( 0 < d['start'] < 1 ):
