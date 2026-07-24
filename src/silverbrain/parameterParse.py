@@ -63,6 +63,7 @@ oracle — do not use in new code.
 import itertools
 import polars as pl
 
+from dataclasses import dataclass, field
 from typing import Any, Literal, Type
 from typing_extensions import TypedDict, NotRequired, Self
 
@@ -184,26 +185,31 @@ class ValueDict_Random_UniformInt( TypedDict, closed = True ):
     distribution: Literal[ "uniform_int" ]
     min: int
     max: int
+    repeat: NotRequired[ Literal[ "constant", "independent" ] ]
 
 class ValueDict_Random_LogUniformInt( TypedDict, closed = True ):
     distribution: Literal[ "log_uniform_int" ]
     min: int
     max: int
+    repeat: NotRequired[ Literal[ "constant", "independent" ] ]
 
 class ValueDict_Random_Uniform( TypedDict, closed = True ):
     distribution: Literal[ "uniform" ]
     min: float
     max: float
+    repeat: NotRequired[ Literal[ "constant", "independent" ] ]
 
 class ValueDict_Random_LogUniform( TypedDict, closed = True ):
     distribution: Literal[ "log_uniform" ]
     min: float
     max: float
+    repeat: NotRequired[ Literal[ "constant", "independent" ] ]
 
 class ValueDict_Random_LogitUniform( TypedDict, closed = True ):
     distribution: Literal[ "logit_uniform" ]
     min: float
     max: float
+    repeat: NotRequired[ Literal[ "constant", "independent" ] ]
 
 ValueDict: Type = (
     ValueDict_Search_Values
@@ -223,6 +229,15 @@ class ParamGroupDict( TypedDict, closed = False ):
 class ParamDict( TypedDict, closed = False ):
     _or: NotRequired[ list[ Self ] ]
     __extra_items__: ParamGroupDict
+
+
+# -- Leaf path (tree-walk result)
+
+@dataclass
+class LeafPath:
+    """One leaf of a tree-shaped parameter DataFrame (see ParameterParser.leaf_paths())."""
+    content_node_idxs: list[ int ]
+    choices:           list[ tuple[ int, int ] ]  # (junction_node_idx, chosen_child_node_idx), root -> leaf
 
 
 # -- ParameterParser
@@ -344,6 +359,12 @@ class ParameterParser:
 
         d = valueDict
 
+        if 'repeat' in d and 'distribution' not in d:
+            raise ValueError(
+                "'repeat' is only supported on distribution-based random specs "
+                "(with 'distribution'), got valueDict={!r}".format( valueDict )
+            )
+
         if 'values_search' in d:
             col = self.col_for_name( par_name )
             _app( 'search', 'value', { col: d['values_search'] } )
@@ -395,6 +416,10 @@ class ParameterParser:
         elif 'distribution' in d:
             dist = d['distribution']
             _app( 'random', 'distribution', { _COL_STR: dist } )
+            repeat_val = d.get( 'repeat', 'constant' )
+            if repeat_val not in ( 'constant', 'independent' ):
+                raise ValueError( f"repeat must be 'constant' or 'independent', got {repeat_val!r}" )
+            _app( 'random', 'repeat', { _COL_STR: repeat_val } )
             is_log   = dist.startswith( 'log' )
             is_logit = 'logit' in dist
             if dist in ( 'uniform_int', 'log_uniform_int' ):
@@ -582,6 +607,79 @@ class ParameterParser:
             combos = [ [ node_idx ] + c for c in combos ]
         return combos
     #/def _expand_node
+
+    def _expand_node_with_choices(
+        self,
+        node_idx: int | None,
+        children: dict[ int | None, list[ int ] ],
+        node_kind: dict[ int, str | None ],
+    ) -> list[ tuple[ list[ int ], list[ tuple[ int, int ] ] ] ]:
+        """Same recursion as _expand_node, but each combo also carries the
+        ordered (junction_node_idx, chosen_child_node_idx) trail of every
+        '_or' decision made to reach it. Children are visited in ascending
+        node_idx order so the resulting leaf order is deterministic and
+        matches declaration order in the source spec."""
+        kids = sorted( children.get( node_idx, [] ) )
+        kind = node_kind.get( node_idx ) if node_idx is not None else None
+
+        if kind == '_or':
+            combos: list[ tuple[ list[ int ], list[ tuple[ int, int ] ] ] ] = []
+            for kid in kids:
+                for content, choices in self._expand_node_with_choices( kid, children, node_kind ):
+                    combos.append( ( content, [ ( node_idx, kid ) ] + choices ) )
+            return combos
+
+        combos = [ ( [], [] ) ]
+        for kid in kids:
+            kid_combos = self._expand_node_with_choices( kid, children, node_kind )
+            combos = [
+                ( a_content + b_content, a_choices + b_choices )
+                for a_content, a_choices in combos
+                for b_content, b_choices in kid_combos
+            ]
+
+        if node_idx is not None and kind is None:
+            combos = [ ( [ node_idx ] + c, ch ) for c, ch in combos ]
+        return combos
+    #/def _expand_node_with_choices
+
+    def leaf_paths(
+        self, tree_df: pl.DataFrame, root_par_group: str | None = None,
+    ) -> list[ 'LeafPath' ]:
+        """
+        Enumerate leaf paths through a tree-shaped DataFrame (from to_polars()).
+
+        Each leaf corresponds to one full combination -- same as one
+        _expand_node() combo -- but also records the ordered trail of '_or'
+        decisions (junction_node_idx, chosen_child_node_idx) made from the
+        subtree root down to that leaf, so callers can walk/report/resume a
+        tree search without flattening away which choice was made where.
+
+        :param root_par_group: If given, restricts the walk to the subtree(s)
+            rooted at node(s) with par_group == root_par_group and parent_idx
+            null (that group's own top-level attachment point(s)) -- e.g.
+            "importances" to walk only that group's own nesting, independent
+            of unrelated top-level groups/`_or`s elsewhere in the spec. If
+            None, walks the whole tree from the true root.
+        """
+        children, node_kind = self._tree_children_maps( tree_df )
+
+        if root_par_group is None:
+            roots: list[ int | None ] = [ None ]
+        else:
+            root_rows = tree_df.filter(
+                ( pl.col( 'par_group' ) == root_par_group ) & pl.col( 'parent_idx' ).is_null()
+            )
+            roots = sorted( root_rows[ 'node_idx' ].unique().to_list() )
+            if not roots:
+                return []
+
+        leaves: list[ LeafPath ] = []
+        for root in roots:
+            for content, choices in self._expand_node_with_choices( root, children, node_kind ):
+                leaves.append( LeafPath( content_node_idxs=content, choices=choices ) )
+        return leaves
+    #/def leaf_paths
 
     def _expand_tree_to_flat(
         self, tree_df: pl.DataFrame, par_idx_start: int = 0,

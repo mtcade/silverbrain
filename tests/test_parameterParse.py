@@ -11,9 +11,10 @@ from silverbrain.parameterParse import ParameterParser
 
 def _make_parser() -> ParameterParser:
     p = ParameterParser()
-    p.register( 'a',   pl.Int64 )
-    p.register( 'b',   pl.Int64 )
-    p.register( 'rho', pl.Float64 )
+    p.register( 'a',      pl.Int64 )
+    p.register( 'b',      pl.Int64 )
+    p.register( 'rho',    pl.Float64 )
+    p.register( 'method', pl.Utf8 )  # exercises _COL_STR-typed rows (distribution/repeat/search-values)
     return p
 #/def _make_parser
 
@@ -295,6 +296,52 @@ def test_tree_matches_real_data_shape() -> None:
     assert df.filter( pl.col( 'par_type' ) == '_or' ).shape[ 0 ] == 2  # Xk's + top-level
     assert df.filter( pl.col( 'par_name' ) == 'rho' ).shape[ 0 ] == 2
 #/def test_tree_matches_real_data_shape
+
+
+# -- repeat (constant/independent) on distribution-based random specs
+
+def test_repeat_row_defaults_to_constant() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0 } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'repeat' ) )
+    assert row.shape[ 0 ] == 1
+    assert row[ 'par_val_string' ][ 0 ] == 'constant'
+#/def test_repeat_row_defaults_to_constant
+
+
+def test_repeat_row_reflects_explicit_independent() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'independent' } } }
+    df, _ = p.to_polars( d )
+    row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'repeat' ) )
+    assert row.shape[ 0 ] == 1
+    assert row[ 'par_val_string' ][ 0 ] == 'independent'
+#/def test_repeat_row_reflects_explicit_independent
+
+
+def test_repeat_invalid_value_raises() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'bogus' } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_repeat_invalid_value_raises
+
+
+def test_repeat_on_values_random_raises() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'values_random': [ 0.1, 0.2 ], 'repeat': 'independent' } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_repeat_on_values_random_raises
+
+
+def test_repeat_on_step_search_raises() -> None:
+    p = _make_parser()
+    d = { 'X': { 'rho': { 'start': 0.1, 'step': 0.1, 'repeat': 'independent' } } }
+    with pytest.raises( ValueError ):
+        p.to_polars( d )
+#/def test_repeat_on_step_search_raises
 
 
 # -- deprecated oracle: frozen pre-refactor behavior (regression safety net)
