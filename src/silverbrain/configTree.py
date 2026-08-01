@@ -16,24 +16,25 @@ The output is a (nodes, parameters, next_node_idx) triple:
   chains, since a config's file-reference tree can be arbitrarily deep
   before any live Cell exists.
 - parameters (ParameterParser's tree schema, parameterParse.py): a forest
-  of TableOp construction-parameter trees, one par_group per parameterized
-  op (== that op's own node_idn), identified by a root-level leaf with
-  par_name == 'op_idn' -- see parameterParse.py's "TableOp construction
-  kwargs" section. Populated from each file's own [[parameters]] entries
-  (below), either inline or via an external .toml/.json reference; every
-  entry gets its own fresh ParameterParser (dtypes inferred from the
-  literal values present -- see parameter_group_to_tree()), so entries'
-  value-column sets can differ and are reconciled with a diagonal concat.
-  node_idx values, however, ARE kept globally unique across the whole
-  forest one config_tree()/toml_config_tree() call produces: a running
-  counter (node_idx_start in, next_node_idx out -- the same dual-return
-  pattern ParameterParser.to_polars()/to_polars_flat() already use) is
-  threaded through every [[parameters]] entry at this level and,
-  recursively, every [[children]] call's own entries. This is belt-and-
-  suspenders with op_ctor_kwargs_forest()'s par_group-based scoping (still
-  in place, so a forest assembled some other way -- e.g. two independently-
-  built forests concatenated post hoc without sharing a counter -- still
-  extracts correctly even if their node_idx ranges do collide).
+  of TableOp construction-parameter trees. Every parameterized op's rows
+  share one fixed par_group, parameterParse.TABLE_OPS_PARAMETERS_GROUP
+  ('table_ops_parameters') -- individual ops are told apart within it by
+  node_idx, via a root-level leaf with par_name == 'op_idn' -- see
+  parameterParse.py's "TableOp construction kwargs" section. Populated
+  from each file's own [[parameters]] entries (below), either inline or
+  via an external .toml/.json reference; every entry gets its own fresh
+  ParameterParser (dtypes inferred from the literal values present -- see
+  parameter_group_to_tree()), so entries' value-column sets can differ and
+  are reconciled with a diagonal concat. node_idx values are kept globally
+  unique across the whole forest one config_tree()/toml_config_tree() call
+  produces (this is what makes the shared-par_group scheme safe): a
+  running counter (node_idx_start in, next_node_idx out -- the same
+  dual-return pattern ParameterParser.to_polars()/to_polars_flat() already
+  use) is threaded through every [[parameters]] entry at this level and,
+  recursively, every [[children]] call's own entries. A forest assembled
+  some other way without sharing that counter (e.g. Cell.merge()
+  concatenating two independently-built forests) can reintroduce colliding
+  node_idx across different ops -- see the caveat in parameterParse.py.
 - next_node_idx: the counter's value after this whole call (this file plus
   every transitively-loaded child) -- pass back in as a parent's own
   node_idx_start when composing calls manually; cell_from_file's single
@@ -55,8 +56,10 @@ An external .toml/.json file's top-level content IS the ParamGroupDict --
 the same par_name -> scalar-or-valueDict (+ optional _or/_and) shape a
 hand-written pre-ParameterParser JSON spec already uses (see
 parameterParse.py's module docstring), just without the outer
-{par_group: ...} wrapping (node_idn supplies that). Inline keys in the
-TOML block itself (beyond node_idn/toml/json) are read the same way.
+{par_group: ...} wrapping (parameter_group_to_tree() supplies
+TABLE_OPS_PARAMETERS_GROUP for that; node_idn supplies the 'op_idn'
+identity leaf). Inline keys in the TOML block itself (beyond
+node_idn/toml/json) are read the same way.
 
 config_tree() is the format dispatcher, inferring which parser to use from
 the file suffix at every node in the walk (not just the root) -- so a

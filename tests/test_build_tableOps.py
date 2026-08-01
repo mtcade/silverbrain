@@ -15,7 +15,7 @@ import polars as pl
 import pytest
 
 from silverbrain.cell import build_tableOps
-from silverbrain.parameterParse import ParameterParser
+from silverbrain.parameterParse import TABLE_OPS_PARAMETERS_GROUP, ParameterParser
 
 
 def _params_parser() -> ParameterParser:
@@ -52,7 +52,7 @@ def test_build_tableOps_uses_class_defaults_with_empty_parameters() -> None:
 
 def test_build_tableOps_passes_kwargs_from_parameters_forest() -> None:
     p          = _params_parser()
-    tree, _    = p.to_polars( { 'a': { 'op_idn': 'a', 'threshold': 0.25 } } )
+    tree, _    = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'a', 'threshold': 0.25 } } )
     rng        = np.random.default_rng( 0 )
     ops        = build_tableOps( { 'a': _DefaultsOp }, [ 'a' ], rng, tree )
     assert ops[ 'a' ].threshold == 0.25
@@ -69,7 +69,7 @@ def test_build_tableOps_missing_required_kwarg_raises_typeerror() -> None:
 
 def test_build_tableOps_required_kwarg_satisfied_by_parameters_forest() -> None:
     p       = _params_parser()
-    tree, _ = p.to_polars( { 'a': { 'op_idn': 'a', 'threshold': 0.75 } } )
+    tree, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'a', 'threshold': 0.75 } } )
     ops     = build_tableOps( { 'a': _RequiredKwargOp }, [ 'a' ], None, tree )
     assert ops[ 'a' ].threshold == 0.75
 #/def test_build_tableOps_required_kwarg_satisfied_by_parameters_forest

@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from silverbrain.parameterParse import (
+    TABLE_OPS_PARAMETERS_GROUP,
     ParameterParser,
     op_ctor_kwargs_forest,
     parameter_group_to_tree,
@@ -533,27 +534,47 @@ def test_op_ctor_kwargs_forest_empty_forest_returns_empty_dict() -> None:
 
 def test_op_ctor_kwargs_forest_extracts_one_op() -> None:
     p = _op_params_parser()
-    tree, _ = p.to_polars( { 'reader': { 'op_idn': 'reader', 'threshold': 0.5, 'label': 'x' } } )
+    tree, _ = p.to_polars(
+        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5, 'label': 'x' } },
+    )
     assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
 #/def test_op_ctor_kwargs_forest_extracts_one_op
 
 
-def test_op_ctor_kwargs_forest_extracts_multiple_ops_with_colliding_node_idx() -> None:
-    # Grouping is scoped by par_group, not raw node_idx -- configTree.py
-    # builds each [[parameters]] entry's tree independently (its own
-    # 0-based node_idx numbering, no global counter across files/entries),
-    # so two entries both landing on node_idx 0 must still extract cleanly
-    # once concatenated. Deliberately NOT offsetting node_idx here, to
-    # prove that.
+def test_op_ctor_kwargs_forest_extracts_multiple_ops_via_threaded_node_idx() -> None:
+    # All parameterized ops share one par_group (TABLE_OPS_PARAMETERS_GROUP)
+    # -- they're told apart by node_idx instead, so node_idx must actually be
+    # threaded (node_idx_start in, next returned out) across sibling calls
+    # sharing that par_group, same as configTree.py does across
+    # [[parameters]] entries.
     p = _op_params_parser()
-    tree_a, _ = p.to_polars( { 'reader': { 'op_idn': 'reader', 'threshold': 0.5 } } )
-    tree_b, _ = p.to_polars( { 'writer': { 'op_idn': 'writer', 'label': 'out' } } )
+    tree_a, next_idx = p.to_polars(
+        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } },
+    )
+    tree_b, _ = p.to_polars(
+        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'writer', 'label': 'out' } },
+        node_idx_start = next_idx,
+    )
     forest = pl.concat( [ tree_a, tree_b ], how = 'vertical' )
     assert op_ctor_kwargs_forest( forest ) == {
         'reader': { 'threshold': 0.5 },
         'writer': { 'label': 'out' },
     }
-#/def test_op_ctor_kwargs_forest_extracts_multiple_ops_with_colliding_node_idx
+#/def test_op_ctor_kwargs_forest_extracts_multiple_ops_via_threaded_node_idx
+
+
+def test_op_ctor_kwargs_forest_rejects_colliding_node_idx_across_ops() -> None:
+    # Without threading node_idx, two ops sharing TABLE_OPS_PARAMETERS_GROUP
+    # both landing on node_idx 0 is now ambiguous (was previously
+    # disambiguated by per-op par_group -- no longer true) -- raise rather
+    # than silently merging/misattributing kwargs between them.
+    p = _op_params_parser()
+    tree_a, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } } )
+    tree_b, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'writer', 'label': 'out' } } )
+    forest = pl.concat( [ tree_a, tree_b ], how = 'vertical' )
+    with pytest.raises( ValueError, match = 'multiple .*op_idn' ):
+        op_ctor_kwargs_forest( forest )
+#/def test_op_ctor_kwargs_forest_rejects_colliding_node_idx_across_ops
 
 
 def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling() -> None:
@@ -562,18 +583,32 @@ def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling() -> None:
     # search), not something build_tableOps() can turn into a kwarg.
     p = _op_params_parser()
     tree, _ = p.to_polars( {
-        'reader': { 'op_idn': 'reader', 'threshold': { 'values_search': [ 0.1, 0.5 ] } },
+        TABLE_OPS_PARAMETERS_GROUP: {
+            'op_idn': 'reader', 'threshold': { 'values_search': [ 0.1, 0.5 ] },
+        },
     } )
     with pytest.raises( ValueError, match = 'only fixed values are supported' ):
         op_ctor_kwargs_forest( tree )
 #/def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling
 
 
-def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf() -> None:
-    # A par_group with no 'op_idn' key isn't a TableOp parameter node at all
-    # -- e.g. some unrelated parameter tree sharing the same dataframe.
+def test_op_ctor_kwargs_forest_ignores_rows_outside_table_ops_parameters_group() -> None:
+    # A par_group other than TABLE_OPS_PARAMETERS_GROUP isn't a TableOp
+    # parameter node at all -- e.g. some unrelated parameter tree sharing
+    # the same dataframe -- and is filtered out before op_idn is even
+    # considered.
     p = _op_params_parser()
-    tree, _ = p.to_polars( { 'unrelated': { 'threshold': 0.9 } } )
+    tree, _ = p.to_polars( { 'unrelated': { 'op_idn': 'reader', 'threshold': 0.9 } } )
+    assert op_ctor_kwargs_forest( tree ) == {}
+#/def test_op_ctor_kwargs_forest_ignores_rows_outside_table_ops_parameters_group
+
+
+def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf() -> None:
+    # Within TABLE_OPS_PARAMETERS_GROUP, a node with no 'op_idn' leaf isn't
+    # a TableOp parameter node -- forward-looking, not exercised by any
+    # producer today.
+    p = _op_params_parser()
+    tree, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'threshold': 0.9 } } )
     assert op_ctor_kwargs_forest( tree ) == {}
 #/def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf
 
@@ -583,7 +618,7 @@ def test_op_ctor_kwargs_forest_rejects_nested_or_and() -> None:
     # alternatives -- reject rather than guess.
     p = _op_params_parser()
     tree, _ = p.to_polars( {
-        'reader': {
+        TABLE_OPS_PARAMETERS_GROUP: {
             'op_idn': 'reader',
             '_or': [ { 'threshold': 0.1 }, { 'threshold': 0.5 } ],
         },
@@ -595,23 +630,31 @@ def test_op_ctor_kwargs_forest_rejects_nested_or_and() -> None:
 
 # -- parameter_group_to_tree (raw dict -> forest tree, no pre-registration)
 
+def test_parameter_group_to_tree_uses_fixed_par_group() -> None:
+    tree, _ = parameter_group_to_tree( 'reader', { 'threshold': 0.5 } )
+    assert tree[ 'par_group' ].unique().to_list() == [ TABLE_OPS_PARAMETERS_GROUP ]
+#/def test_parameter_group_to_tree_uses_fixed_par_group
+
+
 def test_parameter_group_to_tree_infers_dtypes_from_literal_values() -> None:
     tree, _ = parameter_group_to_tree( 'reader', { 'threshold': 0.5, 'label': 'x', 'n': 3 } )
     assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.5, 'label': 'x', 'n': 3 } }
 #/def test_parameter_group_to_tree_infers_dtypes_from_literal_values
 
 
-def test_parameter_group_to_tree_multiple_groups_concatenate_via_diagonal() -> None:
+def test_parameter_group_to_tree_multiple_ops_thread_node_idx() -> None:
     # Each call registers dtypes independently -- concatenating fragments
     # whose value-column sets differ requires a relaxed/diagonal concat.
-    tree_a, _ = parameter_group_to_tree( 'reader', { 'threshold': 0.5 } )
-    tree_b, _ = parameter_group_to_tree( 'writer', { 'label': 'out' } )
+    # node_idx must be threaded across calls (same as configTree.py does
+    # across [[parameters]] entries) since they now share one par_group.
+    tree_a, next_idx = parameter_group_to_tree( 'reader', { 'threshold': 0.5 } )
+    tree_b, _        = parameter_group_to_tree( 'writer', { 'label': 'out' }, node_idx_start = next_idx )
     forest = pl.concat( [ tree_a, tree_b ], how = 'diagonal_relaxed' )
     assert op_ctor_kwargs_forest( forest ) == {
         'reader': { 'threshold': 0.5 },
         'writer': { 'label': 'out' },
     }
-#/def test_parameter_group_to_tree_multiple_groups_concatenate_via_diagonal
+#/def test_parameter_group_to_tree_multiple_ops_thread_node_idx
 
 
 def test_parameter_group_to_tree_supports_values_search_dtype_inference() -> None:

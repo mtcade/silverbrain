@@ -17,12 +17,26 @@ import polars as pl
 import pytest
 
 from silverbrain.configTree import config_tree, toml_config_tree
-from silverbrain.parameterParse import ParameterParser, op_ctor_kwargs_forest
+from silverbrain.parameterParse import TABLE_OPS_PARAMETERS_GROUP, ParameterParser, op_ctor_kwargs_forest
 
 
 def _write( path: Path, content: str ) -> Path:
     path.write_text( content )
     return path
+
+
+def _node_idx_for_op( params: pl.DataFrame, op_idn: str ) -> int:
+    """The node_idx of the 'op_idn' leaf row identifying op_idn -- since all
+    parameterized ops share one par_group (TABLE_OPS_PARAMETERS_GROUP),
+    node_idx is what actually distinguishes them."""
+    val_cols = [ c for c in params.columns if c.startswith( 'par_val_' ) ]
+    for row in params.filter(
+        ( pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP ) & ( pl.col( 'par_name' ) == 'op_idn' )
+    ).to_dicts():
+        value = next( ( row[ c ] for c in val_cols if row[ c ] is not None ), None )
+        if value == op_idn:
+            return row[ 'node_idx' ]
+    raise AssertionError( f"no op_idn leaf found for {op_idn!r}" )
 
 
 def test_single_file_root_row( tmp_path: Path ) -> None:
@@ -253,8 +267,11 @@ threshold = 0.5
     )
     assert next_node_idx == 101  # one flat group -> one node_idx consumed
     # both rows in the group (the 'op_idn' leaf and 'threshold') share that
-    # one node_idx -- see _paramGroup_to_tree.
-    assert params.filter( pl.col( 'par_group' ) == 'reader' )[ 'node_idx' ].unique().to_list() == [ 100 ]
+    # one node_idx -- see _paramGroup_to_tree. All ops share one par_group
+    # (TABLE_OPS_PARAMETERS_GROUP) now, so node_idx is what distinguishes them.
+    assert params.filter(
+        pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP
+    )[ 'node_idx' ].unique().to_list() == [ 100 ]
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
 
 
@@ -278,10 +295,10 @@ node_idn = "kid"
 toml     = "child.toml"
 """ )
     _, params, next_node_idx = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
-    reader_idx = params.filter( pl.col( 'par_group' ) == 'reader' )[ 'node_idx' ].unique().to_list()
-    writer_idx = params.filter( pl.col( 'par_group' ) == 'writer' )[ 'node_idx' ].unique().to_list()
-    assert reader_idx == [ 0 ]
-    assert writer_idx == [ 1 ]  # threaded from the parent's own counter, not reset to 0
+    reader_idx = _node_idx_for_op( params, 'reader' )
+    writer_idx = _node_idx_for_op( params, 'writer' )
+    assert reader_idx == 0
+    assert writer_idx == 1  # threaded from the parent's own counter, not reset to 0
     assert next_node_idx == 2
 
 

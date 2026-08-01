@@ -1078,25 +1078,32 @@ class ParameterParser:
 
 # -- TableOp construction kwargs (__table_ops_parameters__ forest, cell.py)
 #
-# A parameterized op's row group is built via parameter_group_to_tree(),
-# i.e. parser.to_polars({ op_idn: { 'op_idn': op_idn, **group } }) -- using
-# op_idn as the par_group name too, so a group's rows are scoped by
-# par_group == op_idn, the same scoping leaf_paths()'s root_par_group
-# already uses. Extraction is scoped by par_group rather than raw node_idx
-# on purpose, as defense in depth: configTree.py threads a running
-# node_idx_start/next_node_idx counter (the same dual-return pattern
-# to_polars()/to_polars_flat() use) through every [[parameters]] entry it
-# parses, so node_idx values usually ARE globally unique across one
-# config_tree() call's whole forest -- but nothing here depends on that
-# holding. A forest assembled some other way (e.g. two independently-built
-# forests concatenated post hoc without sharing a counter) still extracts
-# correctly even if their node_idx ranges collide, since par_group (the
-# target op's own node_idn) is the value that stays meaningfully unique
-# regardless. The 'op_idn' leaf row is kept anyway (rather than relying on
-# par_group alone) as an explicit, self-describing identity marker
-# consistent with the original design sketch (nested-gathering-russell.md)
-# and as a sanity check -- extraction ignores a group whose par_group
-# doesn't actually carry one.
+# Every parameterized op's row group shares one par_group,
+# TABLE_OPS_PARAMETERS_GROUP -- a fixed, categorical label (matching this
+# codebase's par_group convention elsewhere: a role/domain name like
+# 'importances'/'model_name'/'epochs_per_stage' in silverknockoff's specs,
+# lowercase snake_case, never a per-instance identifier), not the op's own
+# node_idn. Individual ops are told apart within that shared par_group by
+# node_idx: configTree.py threads a running node_idx_start/next_node_idx
+# counter (the same dual-return pattern to_polars()/to_polars_flat() use)
+# through every [[parameters]] entry it parses, so each op's root-level
+# rows (parent_idx is null) land at their own node_idx, globally unique
+# across one config_tree() call's whole forest. Each such root group
+# carries one par_name == 'op_idn' row identifying which op its sibling
+# rows are ctor kwargs for -- kept as an explicit, self-describing identity
+# marker (consistent with the original design sketch,
+# nested-gathering-russell.md) rather than inferring identity from
+# node_idx position alone.
+#
+# Caveat: this relies on node_idx actually being unique forest-wide, which
+# only configTree.py's own threading guarantees. A forest assembled some
+# other way without sharing a counter -- e.g. Cell.merge() concatenating
+# two independently cell_from_file()-built Cells' parameter forests -- can
+# reintroduce colliding node_idx across different ops, silently merging
+# two ops' kwargs into one entry. Not handled here; revisit if that merge
+# path is ever exercised with real [[parameters]] data.
+
+TABLE_OPS_PARAMETERS_GROUP: str = 'table_ops_parameters'
 
 def _leaf_value( row: dict, val_cols: list[ str ] ) -> Any:
     """The single non-null par_val_* value on a tree row, or None if it
@@ -1114,39 +1121,61 @@ def op_ctor_kwargs_forest( parameters: pl.DataFrame ) -> dict[ str, dict[ str, A
     Extract TableOp constructor kwargs for every op declared in the
     __table_ops_parameters__ forest (cell.py), keyed by op_idn.
 
-    Each parameterized op contributes one par_group (== its own op_idn,
-    by convention -- see parameter_group_to_tree()) whose root-level rows
-    (parent_idx is null) include one par_name == 'op_idn' row identifying
-    the op, plus its sibling ctor-kwarg rows. Only par_type == 'fixed' rows
-    are supported at the root: a random/search sibling raises, since
-    construction-time kwargs need concrete values, not search specs (that
-    machinery is for a different downstream consumer, e.g. hyperparameter
-    search, not this one). Any non-root row in the group (parent_idx not
-    null -- i.e. a `_or`/`_and` nested underneath) also raises, since there
-    is no single unambiguous value to pick for a ctor kwarg in that case.
+    Rows outside par_group == TABLE_OPS_PARAMETERS_GROUP are ignored (the
+    forest could in principle carry other, unrelated parameter groups
+    someday). Within that group, each op's root-level rows (parent_idx is
+    null, grouped by node_idx) include one par_name == 'op_idn' row
+    identifying the op, plus its sibling ctor-kwarg rows. Only
+    par_type == 'fixed' rows are supported at the root: a random/search
+    sibling raises, since construction-time kwargs need concrete values,
+    not search specs (that machinery is for a different downstream
+    consumer, e.g. hyperparameter search, not this one). Any non-root row
+    in the node (parent_idx not null -- i.e. a `_or`/`_and` nested
+    underneath) also raises, since there is no single unambiguous value to
+    pick for a ctor kwarg in that case. A node_idx carrying more than one
+    'op_idn' leaf also raises -- since every parameterized op now shares
+    one par_group, this can only mean node_idx collided between two ops
+    (e.g. built without threading node_idx_start), which would otherwise
+    silently merge their kwargs into one entry.
 
-    Returns {} for an empty forest. A par_group with no 'op_idn' row is
-    ignored (not every parameter group in the forest need be a TableOp's --
-    this is forward-looking, not exercised by any producer yet). An op_idn
-    with no declared parameter group simply has no entry, same as if the
-    whole forest were empty; callers rely on the op's own constructor
-    defaults (or a TypeError for a missing required kwarg) in that case.
+    Returns {} for an empty forest. An op_idn with no declared parameter
+    node simply has no entry, same as if the whole forest were empty;
+    callers rely on the op's own constructor defaults (or a TypeError for a
+    missing required kwarg) in that case.
     """
     if parameters.is_empty():
         return {}
 
     val_cols = [ c for c in parameters.columns if c.startswith( 'par_val_' ) ]
+    table_ops_rows = parameters.filter( pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP )
+    # Every op's own root sits at parent_idx is null (top of its own
+    # subtree) -- grouping by node_idx there, rather than scanning
+    # table_ops_rows' whole node_idx range, is what makes this correct now
+    # that ops no longer get their own par_group to scope by: a nested
+    # _or/_and's junction/leaf rows live under DIFFERENT node_idx values
+    # (children of the root's), so they'd otherwise never be seen.
+    roots_by_group = table_ops_rows.filter( pl.col( 'parent_idx' ).is_null() )
+    nodes_with_children = set(
+        table_ops_rows.filter( pl.col( 'parent_idx' ).is_not_null() )[ 'parent_idx' ].to_list()
+    )
     result: dict[ str, dict[ str, Any ] ] = {}
-    for par_group in parameters[ 'par_group' ].drop_nulls().unique().to_list():
-        group = parameters.filter( pl.col( 'par_group' ) == par_group )
-        roots = group.filter( pl.col( 'parent_idx' ).is_null() ).to_dicts()
+    for node_idx in roots_by_group[ 'node_idx' ].drop_nulls().unique().to_list():
+        roots = roots_by_group.filter( pl.col( 'node_idx' ) == node_idx ).to_dicts()
         id_rows = [ r for r in roots if r[ 'par_name' ] == 'op_idn' ]
         if not id_rows:
             continue
-        op_idn = _leaf_value( id_rows[ 0 ], val_cols )
-        if len( group ) != len( roots ):
+        if len( id_rows ) > 1:
+            op_idns = [ _leaf_value( r, val_cols ) for r in id_rows ]
             raise ValueError(
-                f"parameter group for op_idn={ op_idn!r } has nested "
+                f"node_idx={ node_idx!r } carries multiple op_idn leaves "
+                f"{ op_idns!r } -- node_idx must be unique per op within "
+                f"{ TABLE_OPS_PARAMETERS_GROUP!r } (thread node_idx_start/"
+                f"next_node_idx across calls that share it)"
+            )
+        op_idn = _leaf_value( id_rows[ 0 ], val_cols )
+        if node_idx in nodes_with_children:
+            raise ValueError(
+                f"parameter node for op_idn={ op_idn!r } has nested "
                 f"_or/_and structure -- not supported for TableOp "
                 f"construction kwargs, which need one concrete value per "
                 f"parameter"
@@ -1225,8 +1254,11 @@ def parameter_group_to_tree(
     optional _or/_and) shape a hand-written pre-ParameterParser JSON/TOML
     spec already uses (parameterParse.py's module docstring). The 'op_idn'
     identity leaf op_ctor_kwargs_forest() reads back out is added here
-    automatically, under op_idn as its own par_group -- callers (e.g.
-    configTree.py) supply just the op's own kwargs, keyed by name.
+    automatically. Every call lands under the same fixed
+    TABLE_OPS_PARAMETERS_GROUP par_group (not op_idn) -- ops are told apart
+    within it by node_idx (see the "TableOp construction kwargs" comment
+    above op_ctor_kwargs_forest) -- callers (e.g. configTree.py) supply
+    just the op's own kwargs, keyed by name.
 
     Dtypes are inferred from the literal values present (see
     _register_param_group_dtypes) rather than requiring a separate
@@ -1239,6 +1271,7 @@ def parameter_group_to_tree(
     parser.register( 'op_idn', pl.Utf8 )
     _register_param_group_dtypes( parser, group )
     return parser.to_polars(
-        { op_idn: { 'op_idn': op_idn, **group } }, node_idx_start = node_idx_start,
+        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': op_idn, **group } },
+        node_idx_start = node_idx_start,
     )
 #/def parameter_group_to_tree
