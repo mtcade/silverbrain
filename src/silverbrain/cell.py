@@ -1,330 +1,317 @@
 #
-#//  webNu.py
+#//  cell.py
 #//  silverbrain
 #//
-#//  Created by Evan Mason on 3/11/26.
 
-from . import tableOps, tableProcesses, types
-from .tableOps import TableOpSchema
-from .tableProcesses import TableProcessRef, TableCheckRef, TableProcessSequence, TableProcessBranch
+from . import configTree, tableOps, tableProcesses, types
+from .actor import Actor
+from .tableOps import TableOp, TableOpSchema
+from .parameterParse import ParameterParser, op_ctor_kwargs_forest
 from .schema import table_schemas, table_schemas_to_df
-from .polarsDataTypeStrings import dtype_to_str
-from .tableInit import (
-    TableInitRef, ProcessInitRef,
-    process_init_df_from_dict,
-    topological_init_order_from_df,
-)
 
-import tomllib
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Self, Sequence
+
+import inspect
+import threading
+
 import polars as pl
 import numpy as np
 
-import os
-import shutil
-from pathlib import Path
-from typing import Self
+from uuid_extensions import uuid7
 
 # -- System table schemas
 _SYSTEM_SCHEMAS: dict[ str, dict ] = {
-    '__tables_schema__':    table_schemas[ '__tables_schema__'   ],
-    '__table_processes__':  table_schemas[ '__table_processes__' ],
-    '__table_op_schema__':  table_schemas[ '__table_op_schema__'  ],
-    '__table_op_effects__': table_schemas[ '__table_op_effects__' ],
-    '__table_init__':       table_schemas[ '__table_init__'  ],
-    '__process_init__':     table_schemas[ '__process_init__'],
-    '__routing__':          table_schemas[ '__routing__'     ],
+    '__tables_schema__':          table_schemas[ '__tables_schema__'   ],
+    '__nodes__':                  table_schemas[ '__nodes__'           ],
+    '__table_op_schema__':        table_schemas[ '__table_op_schema__'  ],
+    '__table_op_effects__':       table_schemas[ '__table_op_effects__' ],
+    # TableOp construction-parameter forest -- see configTree.py's module
+    # docstring and squishy-sleeping-snowflake.md. No parameter sources
+    # exist yet, so this is always empty for now; the schema is
+    # ParameterParser's own (with zero dtypes registered, just its
+    # identifier columns), reused directly rather than duplicated.
+    '__table_ops_parameters__':   ParameterParser().schema,
 }
 
-class _ComputeOpBindingsOp( tableOps.TableOp ):
-    """
-        Compute the op_bindings for each tableProcess, from __table_processes__ to __op_bindings__. Gets run in `web.init_data`, once all table processes have been registered
-    """
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        """
-            :param dfs:
-                - [0]: __table_processes__
-            :returns:
-                - [0]: __op_bindings__
-        """
-        frames: list[ pl.DataFrame ] = []
-        for row in dfs[ 0 ].to_dicts():
-            if not row.get( 'source' ):
-                continue
-            frames.append( pl.DataFrame(
-                [{
-                    'root_op_idn': row[ 'op_idn' ],
-                    'op_idn':      row[ 'op_idn' ],
-                    'source':      row[ 'source' ] or [],
-                    'target':      row[ 'target' ] or [],
-                }],
-                schema = table_schemas[ 'op_bindings' ],
-            ) )
-        #
+# -- Async dispatch: a shared thread pool every Cell's wiring engine and
+# bind() submit calls to, so a synchronous TableOp gets adapted into a
+# non-blocking Future uniformly with a nested Cell (which already returns
+# one natively) or a Ray remote handle. See squishy-sleeping-snowflake.md.
+_EXECUTOR = ThreadPoolExecutor( thread_name_prefix = 'silverbrain-actor' )
 
-        op_bindings_df: pl.DataFrame = (
-            pl.concat( frames, how = 'vertical' )
-            if frames
-            else pl.DataFrame( schema = table_schemas[ 'op_bindings' ] )
+
+def _accepts_corr_id( actor ) -> bool:
+    """Whether `actor`'s __call__ structurally accepts a corr_id kwarg.
+    TableOp.__call__ doesn't (left unchanged, out of scope for this
+    rearchitecture); Cell and any corr_id-aware Actor does."""
+    try:
+        return 'corr_id' in inspect.signature( actor ).parameters
+    except ( TypeError, ValueError ):
+        return False
+#/def _accepts_corr_id
+
+
+def _call_actor(
+    actor,
+    dfs:            tuple[ pl.DataFrame, ... ],
+    corr_id:        tuple[ str, ... ],
+    verbose:        int,
+    verbose_prefix: str,
+    ) -> tuple[ pl.DataFrame, ... ]:
+    """
+    Invoke a bound Actor. Always runs on a thread-pool worker (see
+    _EXECUTOR), never the original caller's thread -- this is what makes
+    __call__/bind() non-blocking from the caller's perspective. Passes
+    corr_id only if the target structurally accepts it. If the target
+    itself returns a Future (a nested Cell, or a Ray remote call already
+    wrapped), blocks this worker thread on it rather than the caller -- a
+    known simplification; see squishy-sleeping-snowflake.md.
+    """
+    if hasattr( actor, 'remote' ):
+        import ray
+        result = ray.get( actor.__call__.remote( dfs, corr_id, verbose, verbose_prefix ) )
+    elif _accepts_corr_id( actor ):
+        result = actor( dfs, corr_id = corr_id, verbose = verbose, verbose_prefix = verbose_prefix )
+    else:
+        result = actor( dfs, verbose = verbose, verbose_prefix = verbose_prefix )
+    if isinstance( result, Future ):
+        result = result.result()
+    return result
+#/def _call_actor
+
+
+class _WiringEngine:
+    """
+    Runs one Cell.__call__ invocation's wiring graph: fires any registered
+    node whose declared source names have all received a value since it
+    last fired, feeding results forward by target name, until every name in
+    the Cell's own declared target is available -- then resolves `future`
+    with those values, in order.
+
+    Not restricted to a DAG. The same node may fire more than once (a
+    loop); each firing gets its own corr_id segment
+    (root_id + "node_idn:n"), derived from a simple per-node fire counter,
+    not from graph analysis. A null/None value written to a target does
+    NOT count as a "new" round for downstream consumers -- their
+    generation-tracking per source name only advances on non-null writes.
+    This is how loop termination propagates: a controller node emitting
+    null to one target and real data to another lets the null branch's
+    consumers stop advancing while the real branch's consumers fire; the
+    controller itself needs no internal state; "which iteration am I on"
+    is carried entirely by the corr_id its own trigger arrived under and
+    the fire-count-derived id of whatever it emits next.
+
+    Deadlock is detected, not silently hung forever: if a scan finds
+    nothing newly fireable and nothing still in flight, but the Cell's own
+    target isn't fully resolved, `future` gets a RuntimeError naming the
+    unresolved names.
+    """
+
+    def __init__(
+        self:           Self,
+        cell:           'Cell',
+        root_id:        tuple[ str, ... ],
+        verbose:        int,
+        verbose_prefix: str,
+        ) -> None:
+        self.cell           = cell
+        self.root_id        = root_id
+        self.verbose        = verbose
+        self.verbose_prefix = verbose_prefix
+        self.future: Future = Future()
+        self.lock           = threading.Lock()
+        self.values: dict[ str, pl.DataFrame | None ] = {}
+        self.gen:    dict[ str, int ]                  = {}
+        self.seen:   dict[ str, dict[ str, int ] ]     = {}
+        self.fire_count: dict[ str, int ]              = {}
+        self.in_flight:  set[ str ]                    = set()
+        self._nodes = cell.tables[ '__nodes__' ].to_dicts()
+    #/def __init__
+
+    def seed( self: Self, values: dict[ str, pl.DataFrame ] ) -> None:
+        with self.lock:
+            for k, v in values.items():
+                self.values[ k ] = v
+                self.gen[ k ] = self.gen.get( k, 0 ) + 1
+        self._scan()
+    #/def seed
+
+    def _scan( self: Self ) -> None:
+        to_fire: list[ tuple[ str, dict, tuple, tuple ] ] = []
+        with self.lock:
+            if self.future.done():
+                return
+            if all( t in self.values for t in self.cell.target ):
+                self.future.set_result( tuple( self.values[ t ] for t in self.cell.target ) )
+                return
+            for row in self._nodes:
+                node_idn = row[ 'node_idn' ]
+                if node_idn in self.in_flight:
+                    continue
+                src = row[ 'source' ] or []
+                if not src or not all( s in self.values for s in src ):
+                    continue
+                seen = self.seen.setdefault( node_idn, {} )
+                if all( seen.get( s, 0 ) >= self.gen.get( s, 0 ) for s in src ):
+                    continue
+                for s in src:
+                    seen[ s ] = self.gen.get( s, 0 )
+                self.in_flight.add( node_idn )
+                fire_no = self.fire_count.get( node_idn, 0 )
+                self.fire_count[ node_idn ] = fire_no + 1
+                node_corr_id = self.root_id + ( f'{ node_idn }:{ fire_no }', )
+                to_fire.append( (
+                    node_idn, row,
+                    tuple( self.values[ s ] for s in src ),
+                    node_corr_id,
+                ) )
+            #/for row in self._nodes
+
+            if not to_fire and not self.in_flight:
+                missing = [ t for t in self.cell.target if t not in self.values ]
+                self.future.set_exception( RuntimeError(
+                    f"Cell { self.cell.main_id!r } cannot resolve target(s) { missing!r } "
+                    f"-- no registered node is ready to produce them"
+                ) )
+                return
+        #/with self.lock
+
+        for node_idn, row, inputs, node_corr_id in to_fire:
+            self._dispatch( node_idn, row, inputs, node_corr_id )
+    #/def _scan
+
+    def _dispatch(
+        self:         Self,
+        node_idn:     str,
+        row:          dict,
+        inputs:       tuple[ pl.DataFrame, ... ],
+        node_corr_id: tuple[ str, ... ],
+        ) -> None:
+        actor = self.cell.tableOps[ node_idn ]
+        fut = _EXECUTOR.submit(
+            _call_actor, actor, inputs, node_corr_id, self.verbose, self.verbose_prefix,
         )
+        fut.add_done_callback(
+            lambda f, node_idn = node_idn, row = row: self._on_done( f, node_idn, row )
+        )
+    #/def _dispatch
 
-        return ( op_bindings_df, )
-    #/def __call__
-#/class _ComputeOpBindingsOp
-
-_BUILTIN_OPS: types.TableProcessDict = {
-    '_compute_op_bindings_op':  _ComputeOpBindingsOp(),
-    '_always_true':  lambda dfs, verbose=0, verbose_prefix='': True,
-    '_always_false': lambda dfs, verbose=0, verbose_prefix='': False,
-    # backend dispatch
-    'join_table_backend_op':   tableOps.JoinTableBackendOp(),
-    'is_parquet_op':           tableOps.IsParquetBackendOp(),
-    'join_parquet_backend_op': tableOps.JoinParquetBackendOp(),
-    'write_parquet_op':        tableOps.WriteParquetFragmentOp(),
-    'is_sqlite_op':            tableOps.IsSQLiteBackendOp(),
-    'join_sqlite_backend_op':  tableOps.JoinSQLiteBackendOp(),
-    'write_sqlite_op':         tableOps.WriteSQLiteFragmentOp(),
-    'is_postgres_op':          tableOps.IsPostgresBackendOp(),
-    'join_postgres_backend_op': tableOps.JoinPostgresBackendOp(),
-    'write_postgres_op':       tableOps.WritePostgresFragmentOp(),
-}
-
-# -- Built-in process definitions
-
-_COMPUTE_OP_BINDINGS_PROCESS = tableProcesses.TableProcessRef(
-    op_idn = 'compute_op_bindings',
-    source = ( '__table_processes__', ),
-    target = ( 'op_bindings', ),
-    terms  = [ '_compute_op_bindings_op' ],
-)
-
-_BUILTIN_ROOT_OP_IDS: frozenset[ str ] = frozenset({
-    'compute_op_bindings',
-})
-
-# -- Table saving and reading; Uses the internal table "_table", which you'll have to bind by wrapping referencing with another TableProcessRef which passes through and renames it to "_table"
-
-# Backend write
-_JOIN_TABLE_BACKEND_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'join_table_backend',
-    source = ( 'table_ref', '__backend_index__', ),
-    target = ( '_table_backend_ref',),
-    terms = [ 'join_table_backend_op', ],
-)
-
-# Backend write -- parquet
-_CHECK_PARQUET_PROCESS: tableProcesses.TableCheckRef = TableCheckRef(
-    op_idn = 'is_parquet',
-    source = ( '_table_backend_ref',),
-    terms = [ 'is_parquet_op', ],
-)
-
-_JOIN_PARQUET_BACKEND_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'join_parquet_backend',
-    source = ( '_table_backend_ref', '__parquet_backend__',),
-    target = ( '_table_backend_ref_written',),
-    terms = [ 'join_parquet_backend_op', ],
-)
-
-_WRITE_PARQUET_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'write_parquet',
-    source = ( '_table', '_table_backend_ref_parquet',),
-    target = ( '_table_backend_ref_parquet',),
-    terms = [ 'write_parquet_op' ],
-)
-
-_WRITE_PARQUET_SEQUENCE: tableProcesses.TableProcessSequence = TableProcessSequence(
-    op_idn = 'write_parquet_sequence',
-    source = ( '_table', '_table_backend_ref','__parquet_backend__',),
-    target = ( '_table_backend_ref_written',),
-    terms = [
-        'join_parquet_backend',
-        'write_parquet',
-    ]
-)
-
-# Backend write -- sqlite
-_CHECK_SQLITE_PROCESS: tableProcesses.TableCheckRef = TableCheckRef(
-    op_idn = 'is_sqlite',
-    source = ( '_table_backend_ref',),
-    terms = [ 'is_sqlite_op', ],
-)
-
-_JOIN_SQLITE_BACKEND_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'join_sqlite_backend',
-    source = ( '_table_backend_ref','__sqlite_backend__',),
-    target = ( '_table_backend_ref_sqlite',),
-    terms = [ 'join_sqlite_backend_op', ],
-)
-
-_WRITE_SQLITE_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'write_sqlite',
-    source = ( '_table', '_table_backend_ref_sqlite',),
-    target = ( '_table_backend_ref_written',),
-    terms = [ 'write_sqlite_op', ],
-)
-
-_WRITE_SQLITE_SEQUENCE: tableProcesses.TableProcessSequence = TableProcessSequence(
-    op_idn = 'write_sqlite_sequence',
-    source = ( '_table', '_table_backend_ref','__sqlite_backend__',),
-    target = ( '_table_backend_ref_written',),
-    terms = [
-        'join_sqlite_backend',
-        'write_sqlite',
-    ]
-)
-
-# Backend write -- postgres
-_CHECK_POSTGRES_PROCESS: tableProcesses.TableCheckRef = TableCheckRef(
-    op_idn = 'is_postgres',
-    source = ( '_table_backend_ref',),
-    terms = [ 'is_postgres_op', ],
-)
-
-_JOIN_POSTGRES_BACKEND_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'join_postgres_backend',
-    source = ( '_table_backend_ref','__postgres_backend__',),
-    target = ( '_table_backend_ref_postgres',),
-    terms = [ 'join_postgres_backend_op', ],
-)
-
-_WRITE_POSTGRES_PROCESS: tableProcesses.TableProcessRef = TableProcessRef(
-    op_idn = 'write_postgres',
-    source = ( '_table', '_table_backend_ref_postgres',),
-    target = ( '_table_backend_ref_written',),
-    terms = [ 'write_postgres_op' ],
-)
-
-_WRITE_POSTGRES_SEQUENCE: tableProcesses.TableProcessSequence = TableProcessSequence(
-    op_idn = 'write_postgres_sequence',
-    source = ( '_table', '_table_backend_ref','__postgres_backend__',),
-    target = ( '_table_backend_ref_written',),
-    terms = [
-        'join_postgres_backend',
-        'write_postgres',
-    ]
-)
-
-# Determine the backend_type, and write accordingly
-_WRITE_TABLE_BRANCH_PROCESS: tableProcesses.TableProcessBranch = TableProcessBranch(
-    op_idn = 'write_table_branch',
-    source = ( '_table', '_table_backend_ref',),
-    target = ( '_table_backend_ref_written', ),
-    ifs = [
-        'is_parquet','is_sqlite','is_postgres',
-    ],
-    thens = [
-        'write_parquet_sequence',
-        'write_sqlite_sequence',
-        'write_postgres_sequence',
-    ],
-)
-
-_TABLE_WRITER_FRAGMENT_PROCESS: tableProcesses.TableProcessSequence = TableProcessSequence(
-    op_idn = '__table_writer_branch__',
-    source = (
-        '_table', 'table_ref', '__backend_index__',
-        '__parquet_backend__','__sqlite_backend__','__postgres_backend__',
-    ),
-    target = (),
-    terms = [
-        'join_table_backend',
-        'write_table_branch',
-    ]
-)
-
-
-def _domain_process_df( df: pl.DataFrame ) -> pl.DataFrame:
-    """Return __table_processes__ rows eligible for reactive firing in run_domain."""
-    return df.filter(
-        ~pl.col( 'op_idn' ).is_in( list( _BUILTIN_ROOT_OP_IDS ) )
-        & ( pl.col( 'type' ) != 'TableCheckRef' )
-    )
-#/def _domain_process_df
-
-
-def _collect_op_ids( rows: dict, op_id: str ) -> set[ str ]:
-    """Return op_id plus all transitively referenced process op_ids."""
-    return tableProcesses.collect_process_deps( rows, op_id )
-#/def _collect_op_ids
-
-
-def _extract_op_subtree( df: pl.DataFrame, op_idn: str ) -> pl.DataFrame:
-    """Return all rows needed to execute op_idn (op_idn + all transitive process deps)."""
-    rows = { r[ 'op_idn' ]: r for r in df.to_dicts() }
-    if op_idn not in rows:
-        return df.slice( 0, 0 )
-    all_op_idns = tableProcesses.collect_process_deps( rows, op_idn )
-    return df.filter( pl.col( 'op_idn' ).is_in( list( all_op_idns ) ) )
-#/def _extract_op_subtree
+    def _on_done( self: Self, fut: Future, node_idn: str, row: dict ) -> None:
+        with self.lock:
+            self.in_flight.discard( node_idn )
+        try:
+            result = fut.result()
+        except Exception as exc:
+            with self.lock:
+                if not self.future.done():
+                    self.future.set_exception( exc )
+            return
+        targets = row[ 'target' ] or []
+        with self.lock:
+            for name, value in zip( targets, result ):
+                self.values[ name ] = value
+                if value is not None:
+                    self.gen[ name ] = self.gen.get( name, 0 ) + 1
+                #/if value is not None
+            #/for name, value
+        self._scan()
+    #/def _on_done
+#/class _WiringEngine
 
 
 class Cell:
     """
-    Fresh implementation of Web with a fixed set of system tables that every
-    instance carries.
+    A stateful compute unit with a fixed set of system tables that every
+    instance carries. Conforms to the Actor protocol (actor.py) -- a Cell may
+    nest other Cells (and raw TableOps) as entries in its own tableOps, so
+    composition doesn't need a separate Web class (nested-gathering-
+    russell.md §1.6).
+
+    __call__ is a declarative wiring engine, not hand-written per Cell (see
+    _WiringEngine): source/target names, assigned when each node is
+    registered, determine routing -- including fan-out (one target feeding
+    several nodes' source) and fan-in (a node whose source lists several
+    names, each independently produced) -- and the graph need not be a DAG;
+    loops are expressible (see _WiringEngine's docstring). A Cell's own
+    external contract is self.source/self.target: names its incoming dfs
+    are seeded under, and which resolved names (in order) it returns. These
+    are private to this Cell -- a parent registering this Cell as one of
+    its own nodes assigns independent node-level source/target names for
+    it; only arity need match across that boundary, never the names
+    themselves. Cell no longer manages any domain data of its own -- every
+    table originates from some Actor's __call__, produced by execution, not
+    pulled from a persistent store Cell maintains (squishy-sleeping-
+    snowflake.md).
 
     System tables (always present, named with dunder convention):
-        __tables_schema__    — schema registry; one row per table
-                               (table_id, column_names, column_types)
-        __table_processes__  — serialized process DAG; dispatched by apply()
-        __table_op_schema__  — per-column schema declarations for registered tableOps
-        __table_op_effects__ — side-effect declarations for registered tableOps
-        __table_init__       — serialized TableInitRef rows
-        __process_init__     — serialized ProcessInitRef rows
+        __tables_schema__         — schema registry; one row per table
+                                    (table_id, column_names, column_types)
+        __nodes__                 — declarative wiring: which named
+                                    children exist, whether each is a leaf
+                                    op or a nested Cell, and their
+                                    parent-assigned source/target names
+        __table_op_schema__       — per-column schema declarations for registered tableOps
+        __table_op_effects__      — side-effect declarations for registered tableOps
+        __table_ops_parameters__  — TableOp construction-parameter forest (always
+                                    empty for now; see configTree.py)
 
     All system-table schemas are themselves rows in __tables_schema__, so the
     table is self-describing from construction.
 
-    Running:
-        apply(op_id)  — the single dispatch entry point; looks up op_id in
-                        __table_processes__, pulls inputs from self.tables,
-                        runs the process, and writes outputs back to self.tables.
-
     Extension:
-        register_tableOps(ops)    — merge ops into self.tableOps and update
-                                    __table_op_schema__ / __table_op_effects__.
-        register_process(process) — serialize and append a TaggedTableProcess to
-                                    __table_processes__.
-        register_tables(tables)   — merge tables into self.tables and append
-                                    schema rows to __tables_schema__ for each new
-                                    DataFrame.
-
-    The built-in 'register_process' and 'register_tableOps' processes are
-    themselves registered during __init__, so they are available via apply().
+        register_tableOps(ops)  — merge ops into self.tableOps and update
+                                   __table_op_schema__ / __table_op_effects__.
+        register_node(node_idn, source, target) — declare a __nodes__ row for
+                                   an already-registered tableOps entry.
     """
 
     def __init__(
-        self:      Self,
-        main_id:   str,
-        ops:       types.TableProcessDict | None = None,
-        verbose:   int                        = 0,
+        self:       Self,
+        main_id:    str,
+        ops:        types.TableProcessDict | None = None,
+        verbose:    int                        = 0,
+        source:     Sequence[ str ]             = (),
+        target:     Sequence[ str ]             = (),
+        input:      list[ tableOps.InputSchema ]  | None = None,
+        output:     list[ tableOps.OutputSchema ] | None = None,
+        parameters: pl.DataFrame | None            = None,
         ) -> None:
         self.main_id:   str                   = main_id
         self.verbose:   int                   = verbose
-        self.tableOps:  types.TableProcessDict = dict( _BUILTIN_OPS )
+        self.tableOps:  types.TableProcessDict = {}
+        # This Cell's own external binding -- private to this Cell, not the
+        # same as the source/target a parent assigns when registering this
+        # Cell as one of ITS nodes. Replaces the old single op_idn (Static
+        # Execution Binding is still upheld: this binding is fixed at
+        # construction, never re-decided per call -- it's just no longer
+        # restricted to "exactly one child, called directly").
+        self.source: tuple[ str, ... ] = tuple( source )
+        self.target: tuple[ str, ... ] = tuple( target )
+        # Declared Actor interface (actor.py) -- what __call__ consumes/
+        # produces, same params/semantics as TableOp.__init__ already has.
+        # This is the "genuine interface, not routing" that replaced Web's
+        # declare()/NodeDecl exposure machinery (nested-gathering-
+        # russell.md §1.6); may be left None, same as an undeclared TableOp.
+        self.input:  list[ tableOps.InputSchema ]  | None = input
+        self.output: list[ tableOps.OutputSchema ] | None = output
 
         # -- Initialise system tables
         self.tables: dict[ str, pl.DataFrame ] = {
-            '__table_processes__':  pl.DataFrame( schema = table_schemas[ '__table_processes__'   ] ),
-            '__table_op_schema__':  pl.DataFrame( schema = table_schemas[ '__table_op_schema__'    ] ),
-            '__table_op_effects__': pl.DataFrame( schema = table_schemas[ '__table_op_effects__'   ] ),
-            '__table_init__':       pl.DataFrame( schema = table_schemas[ '__table_init__'    ] ),
-            '__process_init__':     pl.DataFrame( schema = table_schemas[ '__process_init__'  ] ),
-            '__routing__':          pl.DataFrame( schema = table_schemas[ '__routing__'       ] ),
+            '__nodes__':                 pl.DataFrame( schema = table_schemas[ '__nodes__'           ] ),
+            '__table_op_schema__':       pl.DataFrame( schema = table_schemas[ '__table_op_schema__'  ] ),
+            '__table_op_effects__':      pl.DataFrame( schema = table_schemas[ '__table_op_effects__' ] ),
+            # TableOp construction-parameter forest -- see configTree.py's
+            # module docstring. Always empty for now; no parameter sources
+            # exist yet.
+            '__table_ops_parameters__':  (
+                parameters if parameters is not None
+                else pl.DataFrame( schema = _SYSTEM_SCHEMAS[ '__table_ops_parameters__' ] )
+            ),
             # __tables_schema__ bootstraps itself — its own schema is one of the rows
-            '__tables_schema__':    table_schemas_to_df( _SYSTEM_SCHEMAS ),
+            '__tables_schema__':         table_schemas_to_df( _SYSTEM_SCHEMAS ),
         }
-
-        # -- Seed __table_processes__ with built-in process definition
-        self.tables[ '__table_processes__' ] = pl.concat(
-            [ self.tables[ '__table_processes__' ], _COMPUTE_OP_BINDINGS_PROCESS.as_polars() ],
-            how = 'vertical',
-        )
 
         if ops:
             self.register_tableOps( ops )
@@ -332,79 +319,93 @@ class Cell:
     #/def __init__
 
 
-    # -- Dispatch
+    # -- Actor protocol
 
-    def run(
-        self: Self,
-        op_id: str,
-        extra: dict[ str, pl.DataFrame ] | None = None,
-        dfs: tuple[ pl.DataFrame, ... ] | None = None,
-        processes_table_id: str = '__table_processes__',
-        verbose: int | None = None,
-        verbose_prefix: str = '',
-        ) -> None:
-        """
-        Stateful dispatch: pull all inputs named in source from self.tables merged
-        with extra, run the process, and write outputs back to self.tables by target.
-        Pass extra to inject tables not yet in self.tables (e.g. staged inputs).
-        Pass dfs to supply positional inputs; they are mapped to source names via
-        __table_processes__ and merged into extra.
-        """
-        _verbose = self.verbose if verbose is None else verbose
-        if dfs is not None:
-            tp_df  = self.tables[ processes_table_id ]
-            rows_d = { r[ 'op_idn' ]: r for r in tp_df.to_dicts() }
-            source_ids = rows_d[ op_id ].get( 'source' ) or []
-            mapped = dict( zip( source_ids, dfs ) )
-            extra  = mapped | ( extra or {} )
-        all_tables = dict( self.tables ) | { k: v for k, v in dict( extra or {} ).items() if v is not None }
-        df         = self.tables[ processes_table_id ]
-        rows       = { r[ 'op_idn' ]: r for r in df.to_dicts() }
-        row        = rows[ op_id ]
-        _dfs       = tuple( all_tables[ tid ] for tid in row[ 'source' ] )
-        result     = tableProcesses.run_from_df(
-            df             = df,
-            root_op_idn    = op_id,
-            dfs            = _dfs,
-            tableOps       = self.tableOps,
-            verbose        = _verbose,
-            verbose_prefix = verbose_prefix,
-        )
-        self.tables |= dict( zip( row[ 'target' ], result ) )
-    #/def run
-
-    def run_domain(
+    def __call__(
         self:           Self,
-        inputs:         dict[ str, pl.DataFrame ],
+        dfs:            tuple[ pl.DataFrame, ... ],
+        corr_id:        tuple[ str, ... ] = (),
         verbose:        int = 0,
         verbose_prefix: str = '',
-    ) -> set[ str ]:
+        ) -> 'Future[ tuple[ pl.DataFrame, ... ] ]':
         """
-        Merge inputs into self.tables and reactively fire all ready domain ops
-        until quiescent.  Returns the set of op_idns that fired.
+        Actor interface: run this Cell's declarative wiring graph against
+        dfs, seeded under self.source's names, returning a Future that
+        resolves to the values collected under self.target's names, in
+        order. Never blocks -- see _WiringEngine.
+
+        corr_id, if not given (the top-level/external-call case), gets a
+        fresh root segment minted here. Every Cell invocation -- this one
+        included -- extends whatever corr_id it receives with its own
+        further segment, so this Cell's internal joins can't cross-talk
+        with a concurrent invocation of itself.
         """
-        if inputs:
-            self.tables |= inputs
-        domain_df = _domain_process_df( self.tables[ '__table_processes__' ] )
-        rows      = { r[ 'op_idn' ]: r for r in domain_df.to_dicts() }
-        fired: set[ str ] = set()
-        changed = True
-        while changed:
-            changed = False
-            for op_idn, row in rows.items():
-                if op_idn in fired:
-                    continue
-                sources = row.get( 'source' ) or []
-                if sources and all( self.tables.get( s ) is not None for s in sources ):
-                    self.run(
-                        op_id          = op_idn,
-                        verbose        = verbose,
-                        verbose_prefix = verbose_prefix,
-                    )
-                    fired.add( op_idn )
-                    changed = True
-        return fired
-    #/def run_domain
+        if len( dfs ) != len( self.source ):
+            raise ValueError(
+                f"Cell { self.main_id!r } expects { len( self.source ) } input(s) "
+                f"{ self.source!r }, got { len( dfs ) }"
+            )
+        if not corr_id:
+            corr_id = ( str( uuid7() ), )
+        my_id = corr_id + ( str( uuid7() ), )
+
+        engine = _WiringEngine( self, my_id, verbose, verbose_prefix )
+        engine.seed( dict( zip( self.source, dfs ) ) )
+        return engine.future
+    #/def __call__
+
+    def bind( self: Self, op_idn: str ) -> Actor:
+        """
+        Resolve op_idn to a callable Actor, fixed once per the Static
+        Execution Binding invariant (nested-gathering-russell.md §1.5): a
+        dict lookup on self.tableOps, nothing more. A registered entry
+        (TableOp, nested Cell, or Ray actor handle) is a child this Cell was
+        constructed with. The returned callable always returns a Future,
+        uniformly, whether the underlying target is a synchronous TableOp
+        (adapted via thread-pool submission), a nested Cell (already
+        native), or a Ray actor handle -- callers can't tell the difference
+        and never block waiting for it.
+        """
+        if op_idn not in self.tableOps:
+            raise KeyError( f"{ op_idn!r } is not a registered tableOp on this Cell" )
+
+        target = self.tableOps[ op_idn ]
+
+        def _bound(
+            dfs:            tuple[ pl.DataFrame, ... ],
+            corr_id:        tuple[ str, ... ] = (),
+            verbose:        int = 0,
+            verbose_prefix: str = '',
+            ) -> 'Future[ tuple[ pl.DataFrame, ... ] ]':
+            return _EXECUTOR.submit( _call_actor, target, dfs, corr_id, verbose, verbose_prefix )
+        #/def _bound
+
+        return _bound
+    #/def bind
+
+    def to_dataframes( self: Self ) -> dict[ str, object ]:
+        """
+        Serialize this Cell's node structure and domain table data.
+
+        tableOps are intentionally excluded: the destination reconstructing
+        a Cell is assumed to already have the necessary op library and
+        supplies it directly via Cell(..., ops=...), same as __init__
+        already requires -- no content-addressed reconstruction.
+        """
+        domain_tables = {
+            k: v for k, v in self.tables.items() if k not in _SYSTEM_SCHEMAS
+        }
+        return {
+            'main_id':    self.main_id,
+            'source':     list( self.source ),
+            'target':     list( self.target ),
+            'nodes':      self.tables[ '__nodes__' ],
+            'parameters': self.tables[ '__table_ops_parameters__' ],
+            'tables':     domain_tables,
+            'verbose':    self.verbose,
+        }
+    #/def to_dataframes
+
 
     # -- Registration
 
@@ -415,8 +416,6 @@ class Cell:
         """
         Merge `ops` into self.tableOps and update __table_op_schema__ /
         __table_op_effects__ for ops that expose input / output / effects.
-        Dispatches 'register_tableOps' via apply(), passing new rows directly
-        as dfs and writing the results back to self.tables.
         """
         self.tableOps |= ops
 
@@ -430,7 +429,7 @@ class Cell:
                 _schema_df, _effects_df = TableOpSchema(
                     inputs  = op.input  or [],
                     outputs = op.output or [],
-                    effects = op.effects or [],
+                    effects = getattr( op, 'effects', None ) or [],
                 ).to_polars( op_id )
                 _schema_rows.append( _schema_df )
                 if not _effects_df.is_empty():
@@ -461,295 +460,99 @@ class Cell:
         )
     #/def register_tableOps
 
-    def register_process(
-        self: Self,
-        process: types.TaggedTableProcess,
-        validate_children: bool = False,
+    def register_node(
+        self:       Self,
+        node_idn:   str,
+        source:     Sequence[ str ] = (),
+        target:     Sequence[ str ] = (),
+        parent_idn: str | None      = None,
         ) -> None:
         """
-        Serialize `process` and append it to __table_processes__.
+        Declare a __nodes__ row for node_idn, an entry already registered in
+        self.tableOps (via register_tableOps or the ops= constructor param).
+        kind ('op' vs 'cell') is inferred from the tableOps entry's type, not
+        passed explicitly -- there's nothing to get wrong.
 
-        validate_children: if True, raise KeyError if any referenced child
-            op_id does not exist in __table_processes__ (for composite types)
-            or in self.tableOps (for atomic types).
-
-        NOTE: If you have a process already serialized as a DataFrame, you can call
-        run( 'register_process', extra = { '__new_process__': process_df } ) directly.
+        target names need not be unique across nodes -- the wiring graph
+        isn't required to be a DAG (see _WiringEngine); more than one node
+        may legitimately claim the same target across different rounds.
         """
-        _df = process.as_polars()
-
-        if validate_children:
-            existing_procs = set( self.tables[ '__table_processes__' ][ 'op_idn' ].to_list() )
-            row = _df.row( 0, named = True )
-            t   = row[ 'type' ]
-            if t in ( 'TableProcessRef', 'TableCheckRef' ):
-                for term in ( row.get( 'term_idns' ) or [] ):
-                    if term not in self.tableOps:
-                        raise KeyError( f"tableOp {term!r} not registered" )
-            else:
-                for term in ( row.get( 'term_idns' ) or [] ):
-                    if term not in existing_procs:
-                        raise KeyError( f"process {term!r} not registered" )
-                for term in ( row.get( 'ifs' ) or [] ):
-                    if term not in existing_procs:
-                        raise KeyError( f"check process {term!r} not registered" )
-                for term in ( row.get( 'thens' ) or [] ):
-                    if term not in existing_procs:
-                        raise KeyError( f"then process {term!r} not registered" )
-                if cond := row.get( 'condition' ):
-                    if cond not in existing_procs:
-                        raise KeyError( f"condition process {cond!r} not registered" )
-
-        if isinstance( process, tableProcesses.Alias ):
-            for alias_idn in process.alias_idns:
-                aliased_rows = self.tables[ '__table_processes__' ].filter(
-                    pl.col( 'op_idn' ) == alias_idn
-                )
-                if aliased_rows.is_empty():
-                    raise KeyError( f"aliased process {alias_idn!r} not registered" )
-                aliased_target = set( aliased_rows.row( 0, named = True )[ 'target' ] or [] )
-                if not set( process.target ).issubset( aliased_target ):
-                    raise ValueError(
-                        f"Alias.target {list( process.target )} is not a subset of "
-                        f"{alias_idn}.target {sorted( aliased_target )}"
-                    )
-
-        self.tables[ '__table_processes__' ] = pl.concat(
-            [ self.tables[ '__table_processes__' ], _df ], how = 'vertical',
-        )
-    #/def register_process
-
-    def register_tables(
-        self: Self,
-        tables: dict[ str, pl.DataFrame | None ],
-        ) -> None:
-        """
-        Merge `tables` into self.tables.
-        Appends a __tables_schema__ row for each new entry that is a DataFrame
-        (None-valued placeholders are merged silently with no schema row).
-        """
-
-        self.tables |= tables
-
-        # Collect schema of new tables to add to __tables_schema__
-        new_rows: list[ dict ] = []
-        for tid, df in tables.items():
-            if isinstance( df, pl.DataFrame ) and tid not in self.tables:
-                new_rows.append({
-                    'table_idn':    tid,
-                    'column_names': list( df.columns ),
-                    'column_types': [ dtype_to_str( df.schema[ c ] ) for c in df.columns ],
-                })
-            #/if isinstance( df, pl.DataFrame ) and tid not in self.tables
-        #/for tid, df
-
-        if new_rows:
-            self.tables[ '__tables_schema__' ] = pl.concat(
-                [
-                    self.tables[ '__tables_schema__' ],
-                    pl.DataFrame( new_rows, schema = table_schemas[ '__tables_schema__' ] ),
-                ],
-                how = 'vertical',
+        if node_idn not in self.tableOps:
+            raise KeyError(
+                f"{ node_idn!r } must be registered via register_tableOps "
+                f"(or Cell(..., ops=...)) before register_node"
             )
-        #/if new_rows
-    #/def register_tables
+        kind = 'cell' if isinstance( self.tableOps[ node_idn ], Cell ) else 'op'
+        self.tables[ '__nodes__' ] = pl.concat(
+            [
+                self.tables[ '__nodes__' ],
+                tableProcesses.make_node_row(
+                    node_idn   = node_idn,
+                    kind       = kind,
+                    source     = source,
+                    target     = target,
+                    parent_idn = parent_idn,
+                ),
+            ],
+            how = 'vertical',
+        )
+    #/def register_node
 
-    def validate_tableProcesses( self: Self ) -> None:
-        """
-        Validate the __table_processes__ DAG:
-          1. All referenced op_ids exist (processes reference processes;
-             TableProcessRef/TableCheckRef terms reference tableOps)
-          2. No cycles
-          3. Terminal nodes (no child process references) are TableProcessRef or TableCheckRef
-        """
-        df   = self.tables[ '__table_processes__' ]
-        rows = { r[ 'op_idn' ]: r for r in df.to_dicts() }
-        existing_procs = set( rows.keys() )
-
-        def _process_refs( row: dict ) -> list[ str ]:
-            """Return all op_ids this row references that should be in __table_processes__."""
-            t = row[ 'type' ]
-            if t in ( 'TableProcessRef', 'TableCheckRef' ):
-                return []
-            refs = list( row.get( 'term_idns' ) or [] )
-            refs += list( row.get( 'ifs' ) or [] )
-            refs += list( row.get( 'thens' ) or [] )
-            if cond := row.get( 'condition' ):
-                refs.append( cond )
-            return refs
-
-        # 1. Reference check
-        for op_id, row in rows.items():
-            t = row[ 'type' ]
-            if t in ( 'TableProcessRef', 'TableCheckRef' ):
-                for term in ( row.get( 'term_idns' ) or [] ):
-                    if term not in self.tableOps:
-                        raise KeyError( f"Process {op_id!r} references unknown tableOp {term!r}" )
-            else:
-                for ref in _process_refs( row ):
-                    if ref not in existing_procs:
-                        raise KeyError( f"Process {op_id!r} references unknown process {ref!r}" )
-
-        # 2. Cycle check (DFS)
-        visited: set[ str ] = set()
-        in_stack: set[ str ] = set()
-
-        def _has_cycle( op_id: str ) -> bool:
-            if op_id in in_stack:
-                return True
-            if op_id in visited:
-                return False
-            visited.add( op_id )
-            in_stack.add( op_id )
-            for ref in _process_refs( rows[ op_id ] ):
-                if ref in rows and _has_cycle( ref ):
-                    return True
-            in_stack.remove( op_id )
-            return False
-
-        for op_id in existing_procs:
-            if _has_cycle( op_id ):
-                raise ValueError( f"__table_processes__ contains a cycle involving {op_id!r}" )
-
-        # 3. Terminal nodes must be TableProcessRef or TableCheckRef
-        for op_id, row in rows.items():
-            if not _process_refs( row ) and row[ 'type' ] not in ( 'TableProcessRef', 'TableCheckRef' ):
-                raise ValueError(
-                    f"Terminal process {op_id!r} must be TableProcessRef or TableCheckRef, "
-                    f"got {row['type']!r}"
-                )
-    #/def validate_tableProcesses
-
-    def reset_data(
-        self: Self,
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> None:
-        if 'paths' not in self.tables:
-            return
-        rows = self.tables[ 'paths' ].filter( pl.col( 'key' ) == '__data_root__' )
-        if rows.is_empty():
-            return
-        data_root = rows[ 'fp' ][ 0 ]
-        if not os.path.isdir( data_root ):
-            return
-        for entry in os.listdir( data_root ):
-            entry_path = os.path.join( data_root, entry )
-            if os.path.isfile( entry_path ):
-                os.remove( entry_path )
-            elif os.path.isdir( entry_path ):
-                shutil.rmtree( entry_path )
-    #/def reset_data
-
-    def init_data(
-        self: Self,
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> None:
-        """
-        Run all registered init ops in topological dependency order.
-        For each entry in topological order derived from __table_init__ and
-        __process_init__:
-          - table:   run( ref.op_idn )   if always_run or table not yet populated
-          - process: run( ref.factory_idn ) if process not yet in __table_processes__
-
-        Factory processes are TaggedTableProcesses already registered in
-        __table_processes__; when run they produce and register the target process.
-        """
-        for _type, _init_id in topological_init_order_from_df(
-            self.tables[ '__table_init__'   ],
-            self.tables[ '__process_init__' ],
-        ):
-            if _type == 'table':
-                row = self.tables[ '__table_init__' ].filter(
-                    pl.col( 'table_idn' ) == _init_id
-                ).row( 0, named = True )
-                if row[ 'always_run' ] or self.tables.get( row[ 'table_idn' ] ) is None:
-                    self.run(
-                        row[ 'op_idn' ],
-                        verbose        = verbose,
-                        verbose_prefix = verbose_prefix,
-                    )
-                #
-            else:
-                row = self.tables[ '__process_init__' ].filter(
-                    pl.col( 'op_idn' ) == _init_id
-                ).row( 0, named = True )
-                if self.tables[ '__table_processes__' ].filter(
-                    pl.col( 'op_idn' ) == row[ 'op_idn' ]
-                ).is_empty():
-                    if row[ 'factory_idn' ] is None:
-                        raise RuntimeError(
-                            f"Process '{row[ 'op_idn' ]}' has factory_idn=None "
-                            f"but is absent from __table_processes__"
-                        )
-                    self.run(
-                        row[ 'factory_idn' ],
-                        verbose        = verbose,
-                        verbose_prefix = verbose_prefix,
-                    )
-                #
-            #
-        #/for _type, _init_id
-
-        self.run( 'compute_op_bindings' )
-    #/def init_data
+    def validate_nodes( self: Self ) -> None:
+        """Validate every __nodes__ row's node_idn is a registered tableOps entry."""
+        for row in self.tables[ '__nodes__' ].to_dicts():
+            if row[ 'node_idn' ] not in self.tableOps:
+                raise KeyError( f"__nodes__ row {row[ 'node_idn' ]!r} has no matching tableOps entry" )
+    #/def validate_nodes
 
     @classmethod
     def merge(
         cls,
-        a: Self,
-        b: Self,
-        main_id: str = '',
+        a:       Self,
+        b:       Self,
+        main_id: str                 = '',
+        source:  Sequence[ str ] | None = None,
+        target:  Sequence[ str ] | None = None,
         ) -> Self:
         """
         Produce a new Cell combining a and b.
         main_id is '{a.main_id}_{b.main_id}'.
-        tableOps: non-builtin ops from both (b overwrites a on conflict).
-        __table_processes__: non-builtin rows from both; on op_id conflict b wins.
-        __table_init__ / __process_init__: concatenated and deduplicated on
-            their primary keys (b wins on conflict).
+        source/target: the merged Cell's own binding -- a's and b's aren't
+            inherently compatible to combine automatically, so this
+            defaults to a's if not given explicitly.
+        tableOps: from both (b overwrites a on conflict).
+        __nodes__: rows from both; on node_idn conflict b wins.
+        __table_ops_parameters__: rows from both, concatenated (no dedup --
+            a forest, not keyed by any single column shared across
+            independently-sourced trees; see configTree.py's module
+            docstring).
         Domain tables (non-system keys): a's, then b's (b overwrites a).
         """
         merged = cls(
             main_id = main_id or f"{ a.main_id }_{ b.main_id }",
+            source  = source if source is not None else a.source,
+            target  = target if target is not None else a.target,
         )
 
-        _builtin_keys = set( _BUILTIN_OPS )
-        ops: types.TableProcessDict = {
-            k: v for k, v in a.tableOps.items() if k not in _builtin_keys
-        } | {
-            k: v for k, v in b.tableOps.items() if k not in _builtin_keys
-        }
-
+        ops: types.TableProcessDict = dict( a.tableOps ) | dict( b.tableOps )
         if ops:
             merged.register_tableOps( ops )
         #
 
-        # Merge domain process rows (b wins on op_id conflict)
-        domain_a = _domain_process_df( a.tables[ '__table_processes__' ] )
-        domain_b = _domain_process_df( b.tables[ '__table_processes__' ] )
-        combined = pl.concat( [ domain_a, domain_b ], how = 'vertical' )
+        combined = pl.concat( [ a.tables[ '__nodes__' ], b.tables[ '__nodes__' ] ], how = 'vertical' )
         if not combined.is_empty():
-            deduped = combined.unique( subset = [ 'op_idn' ], keep = 'last' )
-            merged.tables[ '__table_processes__' ] = pl.concat(
-                [ merged.tables[ '__table_processes__' ], deduped ], how = 'vertical',
-            )
+            deduped = combined.unique( subset = [ 'node_idn' ], keep = 'last' )
+            merged.tables[ '__nodes__' ] = deduped
         #
 
-        for key, pk in (
-            ( '__table_init__',    'table_idn' ),
-            ( '__process_init__',  'op_idn'    ),
-        ):
-            combined = pl.concat(
-                [ a.tables[ key ], b.tables[ key ] ],
-                how = 'vertical',
-            )
-            merged.tables[ key ] = combined.unique(
-                subset = [ pk ],
-                keep = 'last',
-            )
-        #/for key, pk in (...)
+        merged.tables[ '__table_ops_parameters__' ] = pl.concat(
+            [ a.tables[ '__table_ops_parameters__' ], b.tables[ '__table_ops_parameters__' ] ],
+            # diagonal_relaxed: a's and b's parameter forests may have been
+            # built with independently-registered dtypes (configTree.py's
+            # [[parameters]] entries each infer their own), so their
+            # value-column sets can differ.
+            how = 'diagonal_relaxed',
+        )
 
         _system_keys = set( _SYSTEM_SCHEMAS )
         for k, v in a.tables.items():
@@ -767,439 +570,186 @@ class Cell:
         return merged
     #/def merge
 
-    @classmethod
-    def from_dataframes(
-        cls,
-        main_id:    str,
-        processes:  pl.DataFrame,
-        table_keys: pl.DataFrame,
-        table_init: pl.DataFrame,
-        ops_module,
-        rng                     = None,
-        verbose:    int         = 0,
-    ) -> Self:
-        """
-        Construct a Cell from the DataFrames produced by cell_toml_to_dataframes.
-
-        Parameters
-        ----------
-        main_id    : cell identifier
-        processes  : rows matching _CELL_PROCESSES_SCHEMA
-        table_keys : rows matching _TABLE_KEYS_SCHEMA
-        table_init : rows matching table_schemas['__table_init__']
-        ops_module : module exposing get_ops(keys, rng) -> dict
-        """
-        op_keys: set[ str ] = set()
-        for row in processes.to_dicts():
-            if row[ 'type' ] in ( 'TableProcessRef', 'TableCheckRef' ):
-                op_keys.update( row.get( 'terms' ) or [] )
-
-        ops: types.TableProcessDict = (
-            ops_module.get_ops( list( op_keys ), rng )
-            if hasattr( ops_module, 'get_ops' )
-            else {}
-        )
-
-        cell = cls( main_id=main_id, ops=ops, verbose=verbose )
-
-        for row in processes.to_dicts():
-            t      = row[ 'type' ]
-            source = tuple( row.get( 'source' ) or [] )
-            target = tuple( row.get( 'target' ) or [] )
-            terms  = list(  row.get( 'terms'  ) or [] )
-            if t == 'TableProcessRef':
-                cell.register_process( tableProcesses.TableProcessRef(
-                    op_idn = row[ 'op_idn' ],
-                    source = source,
-                    target = target,
-                    terms  = terms,
-                ) )
-            elif t == 'TableCheckRef':
-                cell.register_process( tableProcesses.TableCheckRef(
-                    op_idn = row[ 'op_idn' ],
-                    source = source,
-                    terms  = terms,
-                ) )
-            elif t == 'TableProcessSequence':
-                cell.register_process( tableProcesses.TableProcessSequence(
-                    op_idn = row[ 'op_idn' ],
-                    source = source,
-                    target = target,
-                    terms  = terms,
-                ) )
-            elif t == 'TableProcessBranch':
-                cell.register_process( tableProcesses.TableProcessBranch(
-                    op_idn    = row[ 'op_idn' ],
-                    source    = source,
-                    target    = target,
-                    ifs       = list( row.get( 'ifs'   ) or [] ),
-                    thens     = list( row.get( 'thens' ) or [] ),
-                    otherwise = row.get( 'otherwise' ),
-                ) )
-            elif t == 'TableProcessWhile':
-                cell.register_process( tableProcesses.TableProcessWhile(
-                    op_idn    = row[ 'op_idn' ],
-                    source    = source,
-                    target    = target,
-                    condition = row[ 'condition' ],
-                    terms     = terms,
-                    maxIter   = row.get( 'max_iter' ) or 2**31 - 1,
-                ) )
-            elif t == 'TableProcessCount':
-                cell.register_process( tableProcesses.TableProcessCount(
-                    op_idn = row[ 'op_idn' ],
-                    source = source,
-                    target = target,
-                    count  = row[ 'count' ],
-                    terms  = terms,
-                ) )
-            elif t == 'Alias':
-                cell.register_process( tableProcesses.Alias(
-                    op_idn     = row[ 'op_idn' ],
-                    alias_idns = list( row[ 'alias_idns' ] or [] ),
-                    source     = source,
-                    target     = target,
-                ) )
-            else:
-                raise ValueError( f"Unknown process type: {t!r}" )
-        #/for row in processes.to_dicts()
-
-        for row in table_keys.to_dicts():
-            key = row[ 'key' ]
-            if key not in cell.tables:
-                cell.tables[ key ] = None
-
-        if not table_init.is_empty():
-            refs = [
-                TableInitRef(
-                    table_idn  = row[ 'table_idn' ],
-                    source     = tuple( row.get( 'source'     ) or [] ),
-                    op_idn     = row[ 'op_idn' ],
-                    written_by = tuple( row.get( 'written_by' ) or [] ),
-                    always_run = bool( row.get( 'always_run', False ) ),
-                )
-                for row in table_init.to_dicts()
-            ]
-            cell.tables[ '__table_init__' ] = pl.concat(
-                [ r.as_polars() for r in refs ], how='vertical',
-            )
-
-        return cell
-    #/def from_dataframes
-
-    def print_tableProcesses(
-        self:               Self,
-        processes_table_id: str = '__table_processes__',
-        verbose_prefix:     str = '',
-        ) -> None:
-        """
-        Print every domain (non-builtin) process, showing each as a node
-        with its source, terms/ifs/thens/condition, and target.
-        Processes that are only referenced as children of others are indented.
-        """
-        df   = _domain_process_df( self.tables[ processes_table_id ] )
-        rows = { r[ 'op_idn' ]: r for r in df.to_dicts() }
-
-        # Find processes not referenced by any other domain process
-        referenced: set[ str ] = set()
-        for row in rows.values():
-            for t in ( row.get( 'term_idns' ) or [] ):
-                if t in rows:
-                    referenced.add( t )
-            for t in ( row.get( 'ifs' ) or [] ):
-                if t in rows:
-                    referenced.add( t )
-            for t in ( row.get( 'thens' ) or [] ):
-                if t in rows:
-                    referenced.add( t )
-            if cond := row.get( 'condition' ):
-                if cond in rows:
-                    referenced.add( cond )
-
-        roots = sorted( [ op_id for op_id in rows if op_id not in referenced ] )
-
-        def _print_node( op_id: str, indent: str ) -> None:
-            if op_id not in rows:
-                print( f'{ indent }[{ op_id }] (external ref)' )
-                return
-            row          = rows[ op_id ]
-            type_        = row[ 'type' ]
-            source       = row[ 'source' ] or []
-            target       = row[ 'target' ] or []
-            child_indent = indent + '  '
-
-            print( f'{ indent }[{ op_id }] { type_ }' )
-
-            if source:
-                print( f'{ child_indent }source: { tuple( source ) }' )
-
-            if type_ == 'TableProcessRef':
-                terms = row.get( 'term_idns' ) or []
-                print( f'{ child_indent }op: { terms[0] if terms else "?" }' )
-            elif type_ == 'TableCheckRef':
-                terms = row.get( 'term_idns' ) or []
-                print( f'{ child_indent }check: { terms[0] if terms else "?" }' )
-            elif type_ == 'TableProcessBranch':
-                for if_op, then_op in zip( row.get( 'ifs' ) or [], row.get( 'thens' ) or [] ):
-                    _print_node( if_op,   child_indent )
-                    _print_node( then_op, child_indent )
-                if ( terms := row.get( 'term_idns' ) ) and terms:
-                    print( f'{ child_indent }otherwise:' )
-                    _print_node( terms[ 0 ], child_indent + '  ' )
-            elif type_ == 'TableProcessWhile':
-                if cond := row.get( 'condition' ):
-                    _print_node( cond, child_indent )
-                for t in ( row.get( 'term_idns' ) or [] ):
-                    _print_node( t, child_indent )
-            else:
-                for t in ( row.get( 'term_idns' ) or [] ):
-                    _print_node( t, child_indent )
-
-            if target:
-                print( f'{ child_indent }target: { tuple( target ) }' )
-        #/def _print_node
-
-        for op_id in roots:
-            _print_node( op_id, verbose_prefix )
-            print()
-    #/def print_tableProcesses
+    def print_nodes( self: Self, verbose_prefix: str = '' ) -> None:
+        """Print every registered __nodes__ row: its kind, source, and target."""
+        for row in self.tables[ '__nodes__' ].to_dicts():
+            print( f"{ verbose_prefix }[{ row[ 'node_idn' ] }] { row[ 'kind' ] }" )
+            if row[ 'source' ]:
+                print( f"{ verbose_prefix }  source: { tuple( row[ 'source' ] ) }" )
+            if row[ 'target' ]:
+                print( f"{ verbose_prefix }  target: { tuple( row[ 'target' ] ) }" )
+    #/def print_nodes
 #/class Cell
 
 
-def cell_from_toml(
+def build_tableOps(
+    op_classes: dict[ str, type[ TableOp ] ],
+    op_keys:    Sequence[ str ],
+    rng:        np.random.Generator | None,
+    parameters: pl.DataFrame,
+    ) -> types.TableProcessDict:
+    """
+    Construct one TableOp instance per op_keys entry:
+    op_classes[op_idn](rng=rng, **kwargs), where kwargs comes from
+    op_ctor_kwargs_forest(parameters).get(op_idn, {}) -- {} for any op with
+    no declared parameter node, relying entirely on the class's own
+    defaults (or a TypeError for a missing required kwarg, same as any
+    ordinary Python call -- no separate validation here).
+
+    Replaces the old "a series of lambdas" pattern (an application
+    hand-writing a get_ops(keys, rng) function with one branch per op_idn)
+    with a plain class registry + this one generic instantiation rule.
+    op_classes[op_idn] not existing raises KeyError, same failure mode as
+    the old hook silently producing an incomplete ops dict.
+    """
+    kwargs_by_op = op_ctor_kwargs_forest( parameters )
+    return {
+        op_idn: op_classes[ op_idn ]( rng = rng, **kwargs_by_op.get( op_idn, {} ) )
+        for op_idn in op_keys
+    }
+#/def build_tableOps
+
+
+def _cell_from_tree(
+    tree:       pl.DataFrame,
+    node_idn:   str,
+    op_classes: dict[ str, type[ TableOp ] ],
+    rng:        np.random.Generator | None,
+    verbose:    int,
+    parameters: pl.DataFrame,
+    ) -> Cell:
+    """
+    Construct one Cell (and, recursively, its nested Cell children) from a
+    flat config_tree dataframe (configTree.py) -- the topology (who's a
+    child of whom, op vs cell, each node's own parent-assigned source/
+    target, each cell's own external source/target binding) comes entirely
+    from the tree, already fully parsed by configTree. No file access
+    happens here at all -- Cell no longer manages any domain data of its
+    own (squishy-sleeping-snowflake.md), so there's no remaining
+    non-topology metadata to read.
+
+    parameters is the whole TableOp construction-parameter forest parsed by
+    configTree alongside the tree, threaded unchanged to every level -- it's
+    a forest (independent per-op trees, no cross-tree resolution needed), so
+    every Cell can safely hold the same shared frame rather than needing a
+    per-Cell slice. Currently always empty (no TOML syntax populates it
+    yet); build_tableOps()/op_ctor_kwargs_forest() already handle a
+    non-empty one, ahead of that syntax landing.
+    """
+    own_row = tree.filter(
+        ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
+    ).row( 0, named = True )
+    children      = tree.filter( pl.col( 'parent_idn' ) == node_idn )
+    op_children   = children.filter( pl.col( 'kind' ) == 'op'   ).to_dicts()
+    cell_children = children.filter( pl.col( 'kind' ) == 'cell' ).to_dicts()
+
+    op_keys: list[ str ] = [ row[ 'node_idn' ] for row in op_children ]
+    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters )
+
+    for row in cell_children:
+        ops[ row[ 'node_idn' ] ] = _cell_from_tree(
+            tree       = tree,
+            node_idn   = row[ 'node_idn' ],
+            op_classes = op_classes,
+            rng        = rng,
+            verbose    = verbose,
+            parameters = parameters,
+        )
+
+    cell = Cell(
+        main_id    = node_idn,
+        ops        = ops,
+        verbose    = verbose,
+        source     = own_row[ 'cell_source' ] or [],
+        target     = own_row[ 'cell_target' ] or [],
+        parameters = parameters,
+    )
+
+    for row in op_children:
+        cell.register_node( node_idn=row[ 'node_idn' ], source=row[ 'source' ], target=row[ 'target' ] )
+    for row in cell_children:
+        if row[ 'source' ] or row[ 'target' ]:
+            cell.register_node( node_idn=row[ 'node_idn' ], source=row[ 'source' ], target=row[ 'target' ] )
+
+    return cell
+#/def _cell_from_tree
+
+
+def cell_from_file(
     path: str | Path,
-    ops_module,
+    op_classes: dict[ str, type[ TableOp ] ],
     main_id: str,
     rng: np.random.Generator | None = None,
     verbose: int = 0,
-    paths_dict: dict[ str, dict ] | None = None,
+    template_vars: dict[ str, str ] | None = None,
 ) -> Cell:
     """
-    Construct a Web from a TOML brain config.
+    Construct a Cell from a config file, delegating to configTree.config_tree
+    to recursively parse the file and its transitive [[children]] references
+    into a flat initialization table (topology + each cell's own binding),
+    then building nested Cells from that table bottom-up. File format is
+    inferred from suffix at every node in the walk (configTree.config_tree);
+    only '.toml' is implemented today.
 
     Parameters
     ----------
-    path        : path to the .toml file
-    ops_module  : module exposing ``get_ops(keys, rng) -> dict``; used to build
-                  the tableOps the processes need
-    main_id     : passed to ``Web.__init__``
-    rng         : forwarded to ``ops_module.get_ops``
-    verbose     : forwarded to ``Web.__init__``
+    path        : path to the config file
+    op_classes  : dict[str, type[TableOp]] mapping each [[processes]]
+                  node_idn to the TableOp subclass to construct for it. Each
+                  instance is built via build_tableOps() as
+                  cls(rng=rng, **kwargs) -- kwargs from the op's own node in
+                  the __table_ops_parameters__ forest (empty for now; no
+                  TOML syntax populates it yet), so an op with no declared
+                  parameters just gets `cls(rng=rng)`, relying on its own
+                  defaults (or a TypeError for a missing required kwarg).
+    main_id     : passed to ``Cell.__init__`` and used as this file's own
+                  node_idn in the parsed tree
+    rng         : forwarded to every constructed TableOp, at every level
+    verbose     : forwarded to ``Cell.__init__`` at every level
+    template_vars : optional ``{key}`` substitutions applied to [[children]]
+                  ``toml`` strings before resolving (e.g. ``{cells_root}``)
 
     TOML schema expected
     --------------------
     [cell]
-        class     = "..."       # informational only
-    [tables]
-        keys = ["X", "X_latent", ...]
+        class  = "..."       # informational only
+        source = [...]       # this Cell's own external input binding --
+                              # names its incoming dfs are seeded under
+        target = [...]       # this Cell's own external output binding --
+                              # which resolved names (in order) it returns.
+                              # Both optional; a Cell with neither declared
+                              # only reaches its children via bind(), never
+                              # through its own __call__'s wiring engine.
 
-    [[processes]]               # one block per process
-        op_idn  = "..."
-        type    = "TableProcessRef" | "TableCheckRef" | "TableProcessSequence"
-                | "TableProcessBranch" | "TableProcessWhile" | "TableProcessCount"
-                | "Alias"
-        source  = [...]
-        target  = [...]         # omit for TableCheckRef
-        terms   = [...]         # op keys for Ref/Check; process op_idns for others
-        # TableProcessBranch extras:
-        ifs     = [...]
-        thens   = [...]
-        otherwise = "..."       # optional
-        # TableProcessWhile extras:
-        condition = "..."
-        maxIter = 2147483647    # optional
-        # TableProcessCount extras:
-        count   = N
-        # Alias extras:
-        alias_idns = [...]      # op_idns of the processes being aliased
+    [[processes]]                # one block per leaf op reference
+        node_idn = "..."          # must be a key op_classes resolves
+        source   = [...]          # names this op's positional inputs are
+                                   # read from (this Cell's own namespace)
+        target   = [...]          # names this op's positional outputs are
+                                   # written under (ditto) -- need not be
+                                   # unique across [[processes]]/[[children]]
+                                   # entries; see squishy-sleeping-
+                                   # snowflake.md
+
+    [[children]]                 # one block per nested Cell
+        node_idn = "..."          # key this child is registered under in
+                                   # the parent's tableOps
+        toml     = "path/to/child.toml"   # relative to this file
+        source   = [...]                  # optional -- omit to leave this
+        target   = [...]                  # child unregistered as a __nodes__
+                                           # row (still reachable via bind())
     """
-    with open( path, 'rb' ) as f:
-        data = tomllib.load( f )
-
-    # -- Build process dataclasses from [[processes]]
-    processes: list = []
-    for entry in data.get( 'processes', [] ):
-        t = entry[ 'type' ]
-        if t == 'TableProcessRef':
-            processes.append( tableProcesses.TableProcessRef(
-                op_idn = entry[ 'op_idn' ],
-                source = entry[ 'source' ],
-                target = entry[ 'target' ],
-                terms  = entry[ 'terms' ],
-            ) )
-        elif t == 'TableCheckRef':
-            processes.append( tableProcesses.TableCheckRef(
-                op_idn = entry[ 'op_idn' ],
-                source = entry[ 'source' ],
-                terms  = entry[ 'terms' ],
-            ) )
-        elif t == 'TableProcessSequence':
-            processes.append( tableProcesses.TableProcessSequence(
-                op_idn = entry[ 'op_idn' ],
-                source = entry[ 'source' ],
-                target = entry[ 'target' ],
-                terms  = entry[ 'terms' ],
-            ) )
-        elif t == 'TableProcessBranch':
-            processes.append( tableProcesses.TableProcessBranch(
-                op_idn    = entry[ 'op_idn' ],
-                source    = entry[ 'source' ],
-                target    = entry[ 'target' ],
-                ifs       = entry[ 'ifs' ],
-                thens     = entry[ 'thens' ],
-                otherwise = entry.get( 'otherwise' ),
-            ) )
-        elif t == 'TableProcessWhile':
-            processes.append( tableProcesses.TableProcessWhile(
-                op_idn    = entry[ 'op_idn' ],
-                source    = entry[ 'source' ],
-                target    = entry[ 'target' ],
-                condition = entry[ 'condition' ],
-                terms     = entry[ 'terms' ],
-                maxIter   = entry.get( 'maxIter', 2**31 - 1 ),
-            ) )
-        elif t == 'TableProcessCount':
-            processes.append( tableProcesses.TableProcessCount(
-                op_idn = entry[ 'op_idn' ],
-                source = entry[ 'source' ],
-                target = entry[ 'target' ],
-                count  = entry[ 'count' ],
-                terms  = entry[ 'terms' ],
-            ) )
-        elif t == 'Alias':
-            processes.append( tableProcesses.Alias(
-                op_idn     = entry[ 'op_idn' ],
-                alias_idns = list( entry[ 'alias_idns' ] ),
-                source     = entry[ 'source' ],
-                target     = entry[ 'target' ],
-            ) )
-        else:
-            raise ValueError( f"Unknown process type in TOML: {t!r}" )
-
-    # -- Collect op keys: terms of Ref/Check processes only
-    op_keys: set[ str ] = set()
-    for entry in data.get( 'processes', [] ):
-        if entry[ 'type' ] in ( 'TableProcessRef', 'TableCheckRef' ):
-            op_keys.update( entry.get( 'terms', [] ) )
-
-    # -- Build ops from the provided module
-    ops: types.TableProcessDict = (
-        ops_module.get_ops( list( op_keys ), rng )
-        if hasattr( ops_module, 'get_ops' )
-        else {}
+    tree, parameters, _ = configTree.config_tree(
+        path          = path,
+        node_idn      = main_id,
+        template_vars = template_vars,
     )
-
-    # -- Construct and populate the Web
-    cell = Cell( main_id=main_id, ops=ops, verbose=verbose )
-
-    for process in processes:
-        cell.register_process( process )
-
-    for key in data.get( 'tables', {} ).get( 'keys', [] ):
-        if key not in cell.tables:
-            cell.tables[ key ] = None
-
-    # -- Populate __table_init__ from [[table_init]] entries if present
-    table_init_entries = data.get( 'table_init', [] )
-    if table_init_entries:
-        refs = [
-            TableInitRef(
-                table_idn  = e[ 'table_idn' ],
-                source     = tuple( e.get( 'source', [] ) ),
-                op_idn     = e[ 'op_idn' ],
-                written_by = tuple( e.get( 'written_by', [] ) ),
-                always_run = e.get( 'always_run', False ),
-            )
-            for e in table_init_entries
-        ]
-        cell.tables[ '__table_init__' ] = pl.concat(
-            [ r.as_polars() for r in refs ], how='vertical',
-        )
-
-    # -- Inject paths DataFrame when paths_dict is provided
-    if paths_dict is not None and 'paths' in cell.tables:
-        from .utilities import isfile_series, isdir_series
-        from .schema import table_schemas as _table_schemas
-        _fps = [ entry[ 'fp' ] for entry in paths_dict.values() ]
-        _paths_df = pl.DataFrame(
-            {
-                'key':       list( paths_dict.keys() ),
-                'fp':        _fps,
-                'format':    [ entry.get( 'format', 'parquet' )    for entry in paths_dict.values() ],
-                'if_exists': [ entry.get( 'if_exists', 'overwrite' ) for entry in paths_dict.values() ],
-            },
-            schema = { 'key': pl.Utf8, 'fp': pl.Utf8, 'format': pl.Utf8, 'if_exists': pl.Utf8 },
-        ).with_columns(
-            isfile_series( pl.Series( _fps ), name='isfile' ),
-            isdir_series(  pl.Series( _fps ), name='isdir'  ),
-        ).select( list( _table_schemas['paths'].keys() ) )
-        cell.tables[ 'paths' ] = _paths_df
-
-    return cell
-#/def cell_from_toml
-
-
-def cell_toml_to_dataframes( path: str | Path ) -> dict[ str, pl.DataFrame ]:
-    """
-    Parse a cell TOML file into DataFrames for use with Cell.from_dataframes.
-
-    Returns
-    -------
-    processes  : one row per [[processes]] entry
-    table_keys : one row per key in [tables].keys
-    table_init : one row per [[table_init]] entry
-    """
-    with open( path, 'rb' ) as f:
-        data = tomllib.load( f )
-
-    process_rows = [
-        {
-            'op_idn':    e[ 'op_idn' ],
-            'type':      e[ 'type' ],
-            'source':    list( e.get( 'source',    [] ) ),
-            'target':    list( e.get( 'target',    [] ) ),
-            'terms':     list( e.get( 'terms',     [] ) ),
-            'ifs':       list( e.get( 'ifs',       [] ) ),
-            'thens':     list( e.get( 'thens',     [] ) ),
-            'otherwise': e.get( 'otherwise' ),
-            'condition': e.get( 'condition' ),
-            'max_iter':  e.get( 'maxIter' ),
-            'count':     e.get( 'count' ),
-            'alias_idns': list( e.get( 'alias_idns' ) or [] ),
-        }
-        for e in data.get( 'processes', [] )
-    ]
-    processes_df = (
-        pl.DataFrame( process_rows, schema=table_schemas[ 'cell_processes' ] )
-        if process_rows
-        else pl.DataFrame( schema=table_schemas[ 'cell_processes' ] )
+    return _cell_from_tree(
+        tree       = tree,
+        node_idn   = main_id,
+        op_classes = op_classes,
+        rng        = rng,
+        verbose    = verbose,
+        parameters = parameters,
     )
-
-    keys = data.get( 'tables', {} ).get( 'keys', [] )
-    table_keys_df = pl.DataFrame( { 'key': keys }, schema=table_schemas[ 'table_keys' ] )
-
-    init_rows = [
-        {
-            'table_idn':  e[ 'table_idn' ],
-            'source':     list( e.get( 'source',     [] ) ),
-            'op_idn':     e[ 'op_idn' ],
-            'written_by': list( e.get( 'written_by', [] ) ),
-            'always_run': e.get( 'always_run', False ),
-        }
-        for e in data.get( 'table_init', [] )
-    ]
-    table_init_df = (
-        pl.concat(
-            [ pl.DataFrame( [ r ], schema=table_schemas[ '__table_init__' ] ) for r in init_rows ],
-            how = 'vertical',
-        )
-        if init_rows
-        else pl.DataFrame( schema=table_schemas[ '__table_init__' ] )
-    )
-
-    return {
-        'processes':  processes_df,
-        'table_keys': table_keys_df,
-        'table_init': table_init_df,
-    }
-#/def cell_toml_to_dataframes
+#/def cell_from_file

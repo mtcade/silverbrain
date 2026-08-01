@@ -2,21 +2,15 @@
 #//  verify.py
 #//  silverbrain
 #//
-#//  Created by Evan Mason on 6/22/26.
-#
+
 """
-Pure-TOML consistency checker for cell and composite web TOML files.
-Requires no ops_module and no live execution.
+Pure-TOML consistency checker for cell TOML files, including nested
+[[children]]. Requires no op_classes and no live execution.
 """
 
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-
-from .web import _apply_template_vars
-
-_BUILTIN_OP_IDNS = frozenset( { 'compute_op_bindings' } )
-_CHECK_TYPE      = 'TableCheckRef'
 
 
 @dataclass
@@ -28,54 +22,31 @@ class VerifyIssue:
         return f"{self.path}: {self.issue}"
 
 
-def verify_toml(
-    path:          Path,
-    template_vars: dict[ str, str ] | None = None,
-) -> list[ VerifyIssue ]:
+def verify_toml( path: Path ) -> list[ VerifyIssue ]:
     """
-    Load a cell or composite TOML at *path* and return a list of structural issues.
+    Load a cell TOML at *path* and return a list of structural issues,
+    recursing into any [[children]].
 
     Checks performed:
-    - Cell: no duplicate [[processes]] op_idns.
-    - Composite: node toml paths exist; [[nodes.ops]] op_idns exist in child's
-      processes; no duplicate exposed names; [[processes]] terms reference known
-      exposed ops or other [[processes]].
+    - No duplicate node_idn across [[processes]] and [[children]] (node_idn
+      is a tableOps dict key, so must stay unique within one Cell -- unlike
+      source/target names, which may legitimately repeat; see
+      squishy-sleeping-snowflake.md).
+    - Each [[children]] entry has a node_idn and a toml path that exists.
+    - Each child's own TOML is recursively verified.
     """
     path   = Path( path ).resolve()
-    tvars  = template_vars or {}
     issues: list[ VerifyIssue ] = []
 
     with open( path, 'rb' ) as f:
         data = tomllib.load( f )
 
-    if 'cell' in data:
-        _check_cell( path, data, issues )
-    elif 'composite' in data:
-        _check_composite( path, data, tvars, issues )
-    else:
-        issues.append( VerifyIssue( path, 'TOML has neither [cell] nor [composite] section' ) )
+    if 'cell' not in data:
+        issues.append( VerifyIssue( path, "TOML has no [cell] section" ) )
+        return issues
 
+    _check_cell( path, data, issues )
     return issues
-
-
-def _cell_op_idns( data: dict ) -> set[ str ]:
-    """Domain process op_idns for a cell TOML (excludes TableCheckRef and builtins)."""
-    return {
-        p[ 'op_idn' ]
-        for p in data.get( 'processes', [] )
-        if p.get( 'type' ) != _CHECK_TYPE
-        and p[ 'op_idn' ] not in _BUILTIN_OP_IDNS
-    }
-
-
-def _composite_exposed_op_idns( data: dict ) -> set[ str ]:
-    """
-    Op_idns a composite web exposes to its parent.
-    If [[processes]] entries exist, those are the interface.
-    Otherwise the composite exposes nothing (the parent uses [[nodes.ops]] for routing).
-    """
-    procs = data.get( 'processes', [] )
-    return { p[ 'op_idn' ] for p in procs }
 
 
 def _check_cell(
@@ -84,98 +55,44 @@ def _check_cell(
     issues: list[ VerifyIssue ],
 ) -> None:
     seen: set[ str ] = set()
+
     for proc in data.get( 'processes', [] ):
-        op = proc.get( 'op_idn' )
-        if not op:
-            issues.append( VerifyIssue( path, "[[processes]] entry missing op_idn" ) )
+        node_idn = proc.get( 'node_idn' )
+        if not node_idn:
+            issues.append( VerifyIssue( path, "[[processes]] entry missing node_idn" ) )
             continue
-        if op in seen:
-            issues.append( VerifyIssue( path, f"Duplicate [[processes]] op_idn {op!r}" ) )
-        seen.add( op )
+        if node_idn in seen:
+            issues.append( VerifyIssue( path, f"Duplicate node_idn {node_idn!r}" ) )
+        seen.add( node_idn )
 
+    base_dir = path.parent
+    for child_desc in data.get( 'children', [] ):
+        node_idn = child_desc.get( 'node_idn' )
+        raw_toml = child_desc.get( 'toml' )
 
-def _check_composite(
-    path:   Path,
-    data:   dict,
-    tvars:  dict[ str, str ],
-    issues: list[ VerifyIssue ],
-) -> None:
-    base_dir     = path.parent
-    exposed: dict[ str, str ] = {}  # exposed_name → node_idn
+        if not node_idn:
+            issues.append( VerifyIssue( path, "[[children]] entry missing node_idn" ) )
+        elif node_idn in seen:
+            issues.append( VerifyIssue( path, f"Duplicate node_idn {node_idn!r}" ) )
+        else:
+            seen.add( node_idn )
 
-    for node_desc in data.get( 'nodes', [] ):
-        node_idn = node_desc.get( 'node_idn', '?' )
-        raw_toml = node_desc.get( 'toml' )
         if not raw_toml:
-            issues.append( VerifyIssue( path, f"Node {node_idn!r} missing 'toml' field" ) )
+            issues.append( VerifyIssue( path, f"Child {node_idn!r} missing 'toml' field" ) )
             continue
 
-        child_path = ( base_dir / _apply_template_vars( raw_toml, tvars ) ).resolve()
+        child_path = ( base_dir / raw_toml ).resolve()
         if not child_path.exists():
             issues.append( VerifyIssue(
-                path, f"Node {node_idn!r} toml path not found: {child_path}"
+                path, f"Child {node_idn!r} toml path not found: {child_path}"
             ) )
             continue
 
         with open( child_path, 'rb' ) as f:
             child_data = tomllib.load( f )
 
-        is_composite = 'composite' in child_data
-        child_ops    = (
-            _composite_exposed_op_idns( child_data )
-            if is_composite
-            else _cell_op_idns( child_data )
-        )
+        if 'cell' not in child_data:
+            issues.append( VerifyIssue( child_path, "TOML has no [cell] section" ) )
+            continue
 
-        for op in node_desc.get( 'ops', [] ):
-            op_idn     = op.get( 'op_idn' )
-            alias_idns = list( op.get( 'alias_idns' ) or [] )
-
-            if not op_idn:
-                issues.append( VerifyIssue(
-                    path, f"Node {node_idn!r} [[nodes.ops]] entry missing op_idn"
-                ) )
-                continue
-
-            if child_ops and op_idn not in child_ops:
-                kind = 'subweb' if is_composite else 'cell'
-                issues.append( VerifyIssue(
-                    path,
-                    f"Node {node_idn!r} op_idn {op_idn!r} not found in {kind} "
-                    f"{child_path.name!r}; available: {sorted( child_ops )}"
-                ) )
-
-            exposed_names = alias_idns if alias_idns else [ op_idn ]
-            for exposed_name in exposed_names:
-                if exposed_name in exposed:
-                    issues.append( VerifyIssue(
-                        path,
-                        f"Duplicate exposed op name {exposed_name!r}: "
-                        f"nodes {exposed[ exposed_name ]!r} and {node_idn!r}"
-                    ) )
-                else:
-                    exposed[ exposed_name ] = node_idn
-
-    proc_op_idns = { p[ 'op_idn' ] for p in data.get( 'processes', [] ) }
-    valid_terms  = set( exposed ) | proc_op_idns
-
-    for proc in data.get( 'processes', [] ):
-        all_terms = (
-            proc.get( 'terms', [] )
-            + proc.get( 'ifs', [] )
-            + proc.get( 'thens', [] )
-        )
-        for term in all_terms:
-            if term not in valid_terms:
-                issues.append( VerifyIssue(
-                    path,
-                    f"Web process {proc[ 'op_idn' ]!r} term {term!r} "
-                    f"not in exposed node ops or [[processes]]"
-                ) )
-        otherwise = proc.get( 'otherwise' )
-        if otherwise and otherwise not in valid_terms:
-            issues.append( VerifyIssue(
-                path,
-                f"Web process {proc[ 'op_idn' ]!r} otherwise {otherwise!r} "
-                f"not in exposed node ops or [[processes]]"
-            ) )
+        _check_cell( child_path, child_data, issues )

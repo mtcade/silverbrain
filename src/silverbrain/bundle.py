@@ -105,7 +105,7 @@ class BundleDirs:
         self.common_webs.mkdir( parents=True, exist_ok=True )
 
 
-# -- Loading a web from a bundle
+# -- Loading the top-level cell from a bundle
 
 def _default_map_id( dirs: 'BundleDirs', bundle_id: str ) -> str:
     """Read the required `default_map_id` from a bundle's bundle.toml."""
@@ -123,23 +123,63 @@ def _default_map_id( dirs: 'BundleDirs', bundle_id: str ) -> str:
     return meta[ 'default_map_id' ]
 
 
-def web_from_bundle(
+def _resolve_bundle_map(
     bundle_id: str,
-    app_name:  str = 'silverknockoff',
-    **kwargs,
-):
-    """Load a Web from an installed bundle by id, resolving {cells_root}/{webs_root}."""
-    from .web import web_from_toml
-
-    dirs  = BundleDirs( bundle_id, app_name )
-    toml  = dirs.web_path( _default_map_id( dirs, bundle_id ) )
+    app_name:  str,
+) -> tuple[ 'BundleDirs', str, Path, dict[ str, str ] ]:
+    """
+    Resolve a bundle's map TOML path plus the {cells_root}/{webs_root}/etc.
+    template_vars every bundle-aware config load needs -- shared by
+    cell_from_bundle and config_tree_from_bundle.
+    """
+    dirs   = BundleDirs( bundle_id, app_name )
+    map_id = _default_map_id( dirs, bundle_id )
+    toml   = dirs.web_path( map_id )
     template_vars = {
         'cells_root':   str( dirs._cells_root() ),
         'webs_root':    str( dirs._webs_root() ),
         'bundle_root':  str( dirs.root ),
         'app_bundles':  str( dirs._app_root / 'bundles' ),
     }
-    return web_from_toml( path=toml, template_vars=template_vars, **kwargs )
+    return dirs, map_id, toml, template_vars
+#/def _resolve_bundle_map
+
+
+def cell_from_bundle(
+    bundle_id: str,
+    app_name:  str = 'silverknockoff',
+    **kwargs,
+):
+    """
+    Load the top-level Cell for an installed bundle by id, resolving
+    {cells_root}/{webs_root}. The bundle's map TOML (formerly a composite
+    Web, now a plain [cell] with [[children]]) is loaded via cell_from_file,
+    which delegates to configTree.py to recurse into any [[children]] itself.
+    """
+    from .cell import cell_from_file
+
+    dirs, map_id, toml, template_vars = _resolve_bundle_map( bundle_id, app_name )
+    kwargs.setdefault( 'main_id', map_id )
+    return cell_from_file( path=toml, template_vars=template_vars, **kwargs )
+
+
+def config_tree_from_bundle(
+    bundle_id: str,
+    app_name:  str = 'silverknockoff',
+    **kwargs,
+):
+    """
+    Parse (not construct) the (nodes, parameters) dataframe pair for an
+    installed bundle's map TOML, resolving {cells_root}/{webs_root}/etc. the
+    same way cell_from_bundle does. Useful when you want the tree/forest
+    themselves -- e.g. to inspect or feed to a Cell-building step manually
+    -- rather than a live Cell.
+    """
+    from .configTree import config_tree
+
+    dirs, map_id, toml, template_vars = _resolve_bundle_map( bundle_id, app_name )
+    kwargs.setdefault( 'node_idn', map_id )
+    return config_tree( path=toml, template_vars=template_vars, **kwargs )
 
 
 # -- Packing

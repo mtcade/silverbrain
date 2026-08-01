@@ -11,8 +11,8 @@ Abstract types for building blocks
 
 import enum
 from concurrent.futures import Future
-from dataclasses import dataclass, field
-from typing import Callable, Protocol, Self, Sequence, Type
+from dataclasses import dataclass
+from typing import Protocol, Self, Type
 
 import polars as pl
 
@@ -41,63 +41,6 @@ class TableCheck( Protocol ):
 #/class TableCheck
 
 TableProcessDict: Type = dict[ str, TableProcess | TableCheck ]
-
-# -- Helper Classes
-
-@dataclass
-class SignatureCollector():
-    """
-        Helper class to recursively trawl ModTableProcesses to build their signatures, before being compared against a dictionary of tables to determine contextual and intermediate tables.
-    """
-    source: set[ str ] = field( default_factory = set )
-    target: set[ str ] = field( default_factory = set )
-
-    def __or__( self: Self, other: Self ) -> Self:
-        if not isinstance( other, type( self ) ):
-            raise TypeError(
-                "Expected got type(other)={}, expected {}".format(
-                    type( other ), type( self )
-                )
-            )
-        #/if not isinstance( other, type( self ) )
-
-        return type( self )(
-            source = self.source | other.source,
-            target = self.target | other.target,
-        )
-    #/def __or__
-#/class SignatureCollector
-
-@dataclass
-class TaggedTableProcessSignature():
-    source: list[ str ]
-    context: list[ str ]
-    intermediate: list[ str ]
-    target: list[ str ]
-#/class ModTableProcessSignature
-
-# -- Recursive Table Processors
-
-class TaggedTableProcess( Protocol ):
-    source: Sequence[ str ]
-    target: Sequence[ str ]
-    op_idn: str
-
-    def as_polars( self: Self ) -> pl.DataFrame:
-        ...
-    #/def as_polars
-#/class TaggedTableProcess
-
-class TaggedTableCheck( Protocol ):
-    source: Sequence[ str ]
-    op_idn: str
-
-    def as_polars( self: Self ) -> pl.DataFrame:
-        ...
-    #/def as_polars
-#/class TaggedTableCheck
-
-TaggedTableProcessDict: Type = dict[ str, TaggedTableProcess | TaggedTableCheck ]
 
 
 class ExecutionStrategy( Protocol ):

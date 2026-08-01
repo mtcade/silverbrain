@@ -1074,3 +1074,171 @@ class ParameterParser:
         return pl.concat( df_out_list, how = 'vertical' ), par_idx, node_idx
     #/def to_polars_deprecated
 #/class ParameterParser
+
+
+# -- TableOp construction kwargs (__table_ops_parameters__ forest, cell.py)
+#
+# A parameterized op's row group is built via parameter_group_to_tree(),
+# i.e. parser.to_polars({ op_idn: { 'op_idn': op_idn, **group } }) -- using
+# op_idn as the par_group name too, so a group's rows are scoped by
+# par_group == op_idn, the same scoping leaf_paths()'s root_par_group
+# already uses. Extraction is scoped by par_group rather than raw node_idx
+# on purpose, as defense in depth: configTree.py threads a running
+# node_idx_start/next_node_idx counter (the same dual-return pattern
+# to_polars()/to_polars_flat() use) through every [[parameters]] entry it
+# parses, so node_idx values usually ARE globally unique across one
+# config_tree() call's whole forest -- but nothing here depends on that
+# holding. A forest assembled some other way (e.g. two independently-built
+# forests concatenated post hoc without sharing a counter) still extracts
+# correctly even if their node_idx ranges collide, since par_group (the
+# target op's own node_idn) is the value that stays meaningfully unique
+# regardless. The 'op_idn' leaf row is kept anyway (rather than relying on
+# par_group alone) as an explicit, self-describing identity marker
+# consistent with the original design sketch (nested-gathering-russell.md)
+# and as a sanity check -- extraction ignores a group whose par_group
+# doesn't actually carry one.
+
+def _leaf_value( row: dict, val_cols: list[ str ] ) -> Any:
+    """The single non-null par_val_* value on a tree row, or None if it
+    carries none (shouldn't happen for a 'fixed' row, but content-node rows
+    in general may be value-less)."""
+    for col in val_cols:
+        if row[ col ] is not None:
+            return row[ col ]
+    return None
+#/def _leaf_value
+
+
+def op_ctor_kwargs_forest( parameters: pl.DataFrame ) -> dict[ str, dict[ str, Any ] ]:
+    """
+    Extract TableOp constructor kwargs for every op declared in the
+    __table_ops_parameters__ forest (cell.py), keyed by op_idn.
+
+    Each parameterized op contributes one par_group (== its own op_idn,
+    by convention -- see parameter_group_to_tree()) whose root-level rows
+    (parent_idx is null) include one par_name == 'op_idn' row identifying
+    the op, plus its sibling ctor-kwarg rows. Only par_type == 'fixed' rows
+    are supported at the root: a random/search sibling raises, since
+    construction-time kwargs need concrete values, not search specs (that
+    machinery is for a different downstream consumer, e.g. hyperparameter
+    search, not this one). Any non-root row in the group (parent_idx not
+    null -- i.e. a `_or`/`_and` nested underneath) also raises, since there
+    is no single unambiguous value to pick for a ctor kwarg in that case.
+
+    Returns {} for an empty forest. A par_group with no 'op_idn' row is
+    ignored (not every parameter group in the forest need be a TableOp's --
+    this is forward-looking, not exercised by any producer yet). An op_idn
+    with no declared parameter group simply has no entry, same as if the
+    whole forest were empty; callers rely on the op's own constructor
+    defaults (or a TypeError for a missing required kwarg) in that case.
+    """
+    if parameters.is_empty():
+        return {}
+
+    val_cols = [ c for c in parameters.columns if c.startswith( 'par_val_' ) ]
+    result: dict[ str, dict[ str, Any ] ] = {}
+    for par_group in parameters[ 'par_group' ].drop_nulls().unique().to_list():
+        group = parameters.filter( pl.col( 'par_group' ) == par_group )
+        roots = group.filter( pl.col( 'parent_idx' ).is_null() ).to_dicts()
+        id_rows = [ r for r in roots if r[ 'par_name' ] == 'op_idn' ]
+        if not id_rows:
+            continue
+        op_idn = _leaf_value( id_rows[ 0 ], val_cols )
+        if len( group ) != len( roots ):
+            raise ValueError(
+                f"parameter group for op_idn={ op_idn!r } has nested "
+                f"_or/_and structure -- not supported for TableOp "
+                f"construction kwargs, which need one concrete value per "
+                f"parameter"
+            )
+        kwargs: dict[ str, Any ] = {}
+        for row in roots:
+            if row[ 'par_name' ] in ( 'op_idn', None ):
+                continue
+            if row[ 'par_type' ] != 'fixed':
+                raise ValueError(
+                    f"parameter { row[ 'par_name' ]!r } for op_idn={ op_idn!r } has "
+                    f"par_type={ row[ 'par_type' ]!r } -- only fixed values are "
+                    f"supported for TableOp construction kwargs"
+                )
+            kwargs[ row[ 'par_name' ] ] = _leaf_value( row, val_cols )
+        result[ op_idn ] = kwargs
+    return result
+#/def op_ctor_kwargs_forest
+
+
+# -- Building a parameter group's tree from a raw dict (TOML/JSON, no
+# advance dtype registration -- see configTree.py's [[parameters]] support)
+
+def _dtype_for_value( value: Any ) -> pl.DataType:
+    """Infer a registrable dtype from a literal Python value's runtime type
+    -- same dispatch ParameterParser.col_for_value() uses, but returning the
+    dtype (for .register()) rather than the (column, value) pair."""
+    if isinstance( value, bool ):
+        return pl.Boolean
+    if isinstance( value, int ):
+        return pl.Int64
+    if isinstance( value, float ):
+        return pl.Float64
+    if isinstance( value, str ):
+        return pl.Utf8
+    if isinstance( value, list ) and value:
+        return pl.List( _dtype_for_value( value[ 0 ] ) )
+    return pl.Utf8
+#/def _dtype_for_value
+
+
+def _register_param_group_dtypes( parser: ParameterParser, group: dict ) -> None:
+    """
+    Auto-register every par_name this group needs a dtype for, inferred
+    from the literal values present -- parser.to_polars() requires
+    pre-registration for plain fixed values (via col_for_name) and for
+    values_search/values_random spec lists (via the registered dtype's
+    coercion), and configTree.py has no advance knowledge of what dtype any
+    given TOML/JSON-sourced parameter should be. Other valueDict shapes
+    (step/log_step/logit_step/distribution) pick their column from the
+    literal value's own runtime type inline, not a registration, so nothing
+    to do for those. Recurses into _or/_and alternatives (still the same
+    par_group).
+    """
+    for key, value in group.items():
+        if key in ( '_or', '_and' ):
+            for alt in value:
+                _register_param_group_dtypes( parser, alt )
+            continue
+        if isinstance( value, dict ):
+            values = value.get( 'values_search', value.get( 'values_random' ) )
+            if values:
+                parser.register( key, _dtype_for_value( values[ 0 ] ) )
+            continue
+        parser.register( key, _dtype_for_value( value ) )
+    #/for key, value in group.items()
+#/def _register_param_group_dtypes
+
+
+def parameter_group_to_tree(
+    op_idn: str, group: dict, node_idx_start: int = 0,
+    ) -> tuple[ pl.DataFrame, int ]:
+    """
+    Build one op's row-group for the __table_ops_parameters__ forest from a
+    raw ParamGroupDict -- the same par_name -> scalar-or-valueDict (+
+    optional _or/_and) shape a hand-written pre-ParameterParser JSON/TOML
+    spec already uses (parameterParse.py's module docstring). The 'op_idn'
+    identity leaf op_ctor_kwargs_forest() reads back out is added here
+    automatically, under op_idn as its own par_group -- callers (e.g.
+    configTree.py) supply just the op's own kwargs, keyed by name.
+
+    Dtypes are inferred from the literal values present (see
+    _register_param_group_dtypes) rather than requiring a separate
+    .register() pass -- a TOML/JSON parameter file has no natural place to
+    declare its own dtypes, and the eventual TableOp ctor kwarg types
+    aren't known at parse time anyway (op_classes isn't available until
+    Cell construction).
+    """
+    parser = ParameterParser()
+    parser.register( 'op_idn', pl.Utf8 )
+    _register_param_group_dtypes( parser, group )
+    return parser.to_polars(
+        { op_idn: { 'op_idn': op_idn, **group } }, node_idx_start = node_idx_start,
+    )
+#/def parameter_group_to_tree

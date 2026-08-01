@@ -12,7 +12,7 @@ dependencies = [
     "polars>=1.32,<2",
     "numpy>=1.26.0",
     "pyarrow",
-    "pyzmq>=25",
+    "ray>=2.40",
     "uuid7",
     "platformdirs>=4.0",
     "huggingface_hub>=0.20",

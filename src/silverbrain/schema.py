@@ -12,11 +12,14 @@ import polars as pl
 from .polarsDataTypeStrings import dtype_to_str
 
 cannonical_schema: dict[ str, pl.DataType ] = {
-    # op bindings
-    'root_op_idn':      pl.Utf8,            # op_idn of the root process node (parent_id = null) that owns this op
     'op_idn':           pl.Utf8,
     'source':           pl.List( pl.Utf8 ),
     'target':           pl.List( pl.Utf8 ),
+    # a Cell's own external binding (Cell.source/Cell.target) -- distinct
+    # from a __nodes__/config_tree row's source/target, which are assigned
+    # by whoever registers that node (see squishy-sleeping-snowflake.md).
+    'cell_source':      pl.List( pl.Utf8 ),
+    'cell_target':      pl.List( pl.Utf8 ),
     # schemas df
     'direction':        pl.Utf8,
     'index':            pl.UInt32,
@@ -29,10 +32,6 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'fp':               pl.Utf8,
     'isfile':           pl.Boolean,
     'isdir':            pl.Boolean,
-    # routes / inter-web transport
-    'web_idn':          pl.Utf8,
-    'address':          pl.Utf8,
-    'topic':            pl.Utf8,
     # tables schema
     'table_idn':        pl.Utf8,
     # effects df
@@ -54,66 +53,35 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'schema_name':       pl.Utf8,
     # parameter spec rows
     'par_idx':          pl.UInt32,
-    # table_init / process_init serialization
-    'written_by':       pl.List( pl.Utf8 ),
-    'factory_idn':      pl.Utf8,
-    'always_run':       pl.Boolean,
-    # routing — cross-node data edges
-    'source_node_idn':  pl.Utf8,
-    'trigger_op_idn':   pl.Utf8,
-    'source_table_idn': pl.Utf8,
-    'target_node_idn':  pl.Utf8,
-    'target_table_idn': pl.Utf8,
 } | {
-    # table_processes serialization
-    # op_idn     — primary key; unique across all registered processes
-    # type       — dispatch tag: TableProcessRef | TableCheckRef | TableProcessSequence |
-    #                TableProcessWhile | TableProcessCount | TableProcessBranch
-    # source     — ordered input table keys read from local tables dict before this node runs
-    # target     — ordered output table keys written to local tables dict after this node runs
-    # term_idns  — for Ref/Check: [op_idn of the tableOp to call]; for Sequence: op_idns of child
-    #              processes in order; for While/Count: [op_idn of the inner process];
-    #              for Branch: [op_idn of the fallback process], or [] if no fallback
-    # condition  — (While) op_idn of the condition TableCheckRef
-    # count      — (While) max iteration cap; (Count) exact iteration count
-    # ifs        — (Branch) op_idns of condition check processes, parallel with thens
-    # thens      — (Branch) op_idns of branch-arm processes
-    #'source':       pl.List( pl.Utf8 ), from op bindings
-    #'target':       pl.List( pl.Utf8 ), from op bindings
-    'term_idns':    pl.List( pl.Utf8 ),
-    'condition':    pl.Utf8,
-    'count':        pl.Int64,
-    'ifs':          pl.List( pl.Utf8 ),
-    'thens':        pl.List( pl.Utf8 ),
-    # CompositeNodeRef: child node to dispatch to (null for all other types)
+    # __nodes__ serialization -- see squishy-sleeping-snowflake.md. A Cell's
+    # own local table only ever has parent_idn = null (every row is a
+    # direct child of this Cell); the same shape is reused by configTree.py
+    # for a real multi-level file-reference tree, parsed before any live
+    # Cell exists.
+    # node_idn   — the name this child is registered under in self.tableOps;
+    #              doubles as the lookup key (self.tableOps[node_idn])
+    # parent_idn — parent node_idn in the same table; null = direct child
+    #              of the owning Cell (always null in a live Cell's own
+    #              table; may chain multiple levels in a configTree parse)
+    # kind       — 'op' (leaf TableOp) or 'cell' (nested Cell) -- both
+    #              resolved the same way, via self.tableOps[node_idn]
+    # source     — names this node's positional dfs inputs are read from,
+    #              assigned by whoever registers it (its parent Cell); need
+    #              not be unique -- a name may feed more than one node
+    #              (fan-out) and, since the wiring graph isn't required to
+    #              be a DAG, more than one node may target the same name
+    #              across different rounds (loops)
+    # target     — names this node's positional outputs are written under,
+    #              likewise parent-assigned; a null/None value for a target
+    #              is a legitimate "no data this round" signal (loop
+    #              termination), not an error
     'node_idn':     pl.Utf8,
-} | {
-    # TOML ↔ DataFrame: cell / web loading
-    'terms':           pl.List( pl.Utf8 ),
-    'otherwise':       pl.Utf8,
-    'max_iter':        pl.Int64,
-    'alias_idns':      pl.List( pl.Utf8 ),
-    'node_idn':        pl.Utf8,
-    'toml':            pl.Utf8,
-    'paths':           pl.Utf8,
-    'name':            pl.Utf8,
-    'condition_node':  pl.Utf8,
-    'condition_table': pl.Utf8,
-    'condition_check': pl.Utf8,
-    'sleep':           pl.Float64,
-} | {
-    # network / distributed routing
-    # mode              — 'terminal' (reply to origin) or 'relay' (forward to next hop)
-    # origin_identity   — raw ZMQ ROUTER routing frame bytes for the request origin
-    # received_at       — epoch milliseconds when the request arrived
-    # request_id        — correlation key linking a relay request to its origin
-    # status            — connection lifecycle: 'connecting' | 'connected' | 'disconnected'
-    '__system_op__':    pl.Utf8,
-    'mode':             pl.Utf8,
-    'origin_identity':  pl.Binary,
-    'received_at':      pl.Int64,
-    'request_id':       pl.Utf8,
-    'status':           pl.Utf8,
+    'parent_idn':   pl.Utf8,
+    'kind':         pl.Utf8,
+    # configTree.py: file-reference metadata for kind='cell' rows only, not
+    # part of a live Cell's own __nodes__ table.
+    'path':         pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
@@ -140,10 +108,6 @@ def table_schemas_to_df(
 #/table_schemas_to_df
 
 table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
-    'op_bindings': cannonical_schema_for_keys((
-        'root_op_idn', 'op_idn', 'source',
-        'target',
-    )),
     '__table_op_schema__':  cannonical_schema_for_keys((
         'op_idn', 'direction', 'index',
         'column_names', 'column_types',
@@ -157,9 +121,6 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__tables_schema__': cannonical_schema_for_keys((
         'table_idn', 'column_names', 'column_types',
     )),
-    'paths': cannonical_schema_for_keys((
-        'key', 'fp', 'isfile', 'isdir', 'format', 'if_exists',
-    )),
     '__backend_index__': cannonical_schema_for_keys((
         'backend_id', 'backend_table',
     )),
@@ -172,94 +133,22 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__postgres_backend__': cannonical_schema_for_keys((
         'backend_id', 'connection_string', 'table_name', 'schema_name', 'if_exists',
     )),
-    'routes': cannonical_schema_for_keys((
-        'web_idn', 'op_idn', 'address', 'topic',
-    )),
-    '__table_init__': cannonical_schema_for_keys((
-        'table_idn', 'source', 'op_idn', 'written_by', 'always_run',
-    )),
-    '__process_init__': cannonical_schema_for_keys((
-        'op_idn', 'source', 'factory_idn', 'always_run',
-    )),
-    '__table_processes__': cannonical_schema_for_keys((
-        'op_idn', 'type',
-        'source', 'target',
-        'term_idns', 'condition', 'count',
-        'ifs', 'thens',
-        'node_idn',
-    )),
-    '__routing__': cannonical_schema_for_keys((
-        'source_node_idn', 'trigger_op_idn', 'source_table_idn',
-        'target_node_idn', 'target_table_idn',
+    '__nodes__': cannonical_schema_for_keys((
+        'node_idn', 'parent_idn', 'kind', 'source', 'target',
     )),
 
     # -- TOML ↔ DataFrame schemas
 
-    'cell_processes': cannonical_schema_for_keys((
-        'op_idn', 'type', 'source', 'target',
-        'terms', 'ifs', 'thens',
-        'otherwise', 'condition', 'max_iter', 'count', 'alias_idns',
-    )),
-
-    'table_keys': cannonical_schema_for_keys((
-        'key',
-    )),
-
-    'nodes': cannonical_schema_for_keys((
-        'node_idn', 'toml', 'paths',
-    )),
-
-    'node_ops': cannonical_schema_for_keys((
-        'node_idn', 'op_idn', 'alias_idns', 'source', 'target',
-    )),
-
-    'web_processes': cannonical_schema_for_keys((
-        'op_idn', 'type', 'source', 'target',
-        'terms', 'ifs', 'thens', 'otherwise', 'count',
-    )),
-
-    'commands': cannonical_schema_for_keys((
-        'name', 'type', 'terms',
-        'condition_node', 'condition_table', 'condition_check', 'sleep',
-    )),
-
-    # -- Network system tables (present in every network-capable Cell)
-
-    # Current routing configuration: for each pipeline (op_idn), how to handle
-    # completed results — reply to origin ('terminal') or forward to another node
-    # ('relay').  address is null when mode == 'terminal'.
-    '__node_routing_table__': cannonical_schema_for_keys((
-        'op_idn', 'mode', 'address',
-    )),
-
-    # In-flight relay tracking: while waiting for a downstream node (C) to reply,
-    # B stores the original requester's identity here keyed by request_id.
-    '__node_correlation_table__': cannonical_schema_for_keys((
-        'request_id', 'origin_identity', 'received_at',
-    )),
-
-    # Live ZMQ DEALER connections this node has opened to peers.
-    '__node_connections__': cannonical_schema_for_keys((
-        'address', 'status',
-    )),
-
-    # -- Incoming system message schemas (tables that arrive on the data socket
-    #    but carry routing control commands rather than domain data).
-    #    Every system message table carries a '__system_op__' discriminator column.
-
-    # Update one pipeline's routing entry.
-    # mode in ('terminal', 'relay'); address is null when mode == 'terminal'.
-    '__routing_update__': cannonical_schema_for_keys((
-        '__system_op__', 'op_idn', 'mode', 'address',
-    )),
-
-    # Open a new DEALER connection to address.
-    '__connect__': cannonical_schema_for_keys((
-        '__system_op__', 'address',
-    )),
-
-    # Close an existing DEALER connection.
-    '__disconnect__': cannonical_schema_for_keys((
-        '__system_op__', 'address',
+    # configTree.py: a parsed, not-yet-constructed file-reference tree.
+    # Same shape as __nodes__ plus 'path'/'cell_source'/'cell_target' --
+    # only meaningful on kind='cell' rows: 'path' is which file this node
+    # came from (informational -- construction no longer needs to reopen
+    # it); 'cell_source'/'cell_target' are that cell's own external binding
+    # ([cell].source/[cell].target in a TOML source), carried in the tree
+    # alongside the row's own (parent-assigned) source/target so
+    # construction never needs to open a file to learn either.
+    'config_tree': cannonical_schema_for_keys((
+        'node_idn', 'parent_idn', 'kind', 'source', 'target',
+        'path', 'cell_source', 'cell_target',
     )),
 }
