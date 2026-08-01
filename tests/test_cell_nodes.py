@@ -148,6 +148,58 @@ def test_validate_nodes_catches_dangling_reference() -> None:
         c.validate_nodes()
 
 
+# -- "_" discard target: computed (side effects included) but never
+# stored/wired, so nothing can depend on it.
+
+
+def test_discard_target_is_not_stored_or_wired() -> None:
+    calls: list = []
+
+    def _write_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        calls.append( dfs[ 0 ][ 'v' ].to_list() )
+        return ( dfs[ 0 ], )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'write': _write_op, 'consumer': _double_op },
+        source=[ 'inp' ], target=[ 'out' ],
+    )
+    c.register_node( 'write',    source=[ 'inp' ], target=[ '_' ] )
+    c.register_node( 'consumer', source=[ '_' ],   target=[ 'out' ] )
+
+    df_in = pl.DataFrame( { 'v': [ 1, 2, 3 ] } )
+    fut = c( ( df_in, ) )
+    with pytest.raises( RuntimeError ):
+        fut.result( timeout=5 )
+    assert calls == [ [ 1, 2, 3 ] ]  # 'write' still ran; 'consumer' never fired
+
+
+def test_discard_target_mixed_with_real_target() -> None:
+    def _split_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        return ( dfs[ 0 ], dfs[ 0 ].with_columns( ( pl.col( 'v' ) * 10 ).alias( 'v' ) ) )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'split': _split_op },
+        source=[ 'inp' ], target=[ 'kept' ],
+    )
+    c.register_node( 'split', source=[ 'inp' ], target=[ '_', 'kept' ] )
+
+    df_in  = pl.DataFrame( { 'v': [ 1, 2, 3 ] } )
+    result = c( ( df_in, ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() == [ 10, 20, 30 ]
+
+
+def test_multiple_nodes_may_all_discard_to_underscore() -> None:
+    """"_" is exempt from any implicit uniqueness expectation -- multiple
+    nodes may declare target=["_"] with no conflict, same as any other
+    repeated target name (test_register_node_allows_duplicate_target_names)."""
+    c = Cell( main_id='c', ops={ 'double': _double_op, 'incr': _incr_op } )
+    c.register_node( 'double', source=[ 'a' ], target=[ '_' ] )
+    c.register_node( 'incr',   source=[ 'b' ], target=[ '_' ] )
+    assert c.tables[ '__nodes__' ].shape[ 0 ] == 2
+
+
 # -- Fan-out / fan-in via the wiring engine
 
 
@@ -252,8 +304,8 @@ def test_backend_write_then_read_via_nodes( tmp_path ) -> None:
     c = Cell(
         main_id = 'c',
         ops = {
-            'read_it':  BackendReadOp(),
-            'write_it': BackendWriteOp(),
+            'read_it':  BackendReadOp( columns={ 'a': pl.Int64 } ),
+            'write_it': BackendWriteOp( columns={ 'a': pl.Int64 } ),
         },
         source = [ 'to_write', 'backend_ref', '__backend_index__', '__parquet_backend__', '__sqlite_backend__', '__postgres_backend__' ],
         target = [ 'loaded' ],

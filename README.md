@@ -52,6 +52,14 @@ own defaults (or a `TypeError` for a missing required kwarg). `source`/
 `target` are names in *this Cell's own* namespace -- assigned here, by this
 Cell, not by the op itself.
 
+A `target` name of `"_"` is reserved: it discards that result slot rather
+than wiring it anywhere -- the op still runs (side effects included), the
+value just never enters this Cell's resolved values and nothing can depend
+on it. Useful for an op that always returns something you don't need
+downstream (e.g. a write op that echoes the table it wrote, per its own
+convention -- see the op's own docs). Any number of nodes may declare
+`target = ["_"]`; unlike real names, it's never ambiguous who "owns" it.
+
 ### `[[parameters]]` -- TableOp construction kwargs
 
 ```toml

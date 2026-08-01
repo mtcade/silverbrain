@@ -23,6 +23,7 @@ from os import path
 from typing import Any, Literal, Self, Sequence, Type
 import json
 import sqlite3
+import threading
 
 # -- TableOp functions
 
@@ -581,11 +582,15 @@ class TableOp( ABC ):
 # -- Atomic Table Ops
 
 class WriteParquetOp( TableOp ):
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input = [
-                InputSchema( extra = 'open' ),
+                InputSchema( columns = columns, extra = 'open' ),
                 InputSchema( columns = { 'fp': pl.Utf8 }, extra = 'transparent' ),
             ],
             output = [
@@ -1130,11 +1135,15 @@ class ReadParquetOp( TableOp ):
     Read data from a parquet file.
     dfs[0]: row(s) with 'fp' column (e.g. from __parquet_backend__)
     """
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input   = [ InputSchema( columns = { 'fp': pl.Utf8 }, extra = 'forbidden' ) ],
-            output  = [ OutputSchema() ],
+            output  = [ OutputSchema( columns = columns ) ],
             effects = [ DiskRead( path_input = 0, path_column = 'fp', output = 0, format = 'parquet' ) ],
         )
     #/def __init__
@@ -1159,11 +1168,15 @@ class WriteSQLiteOp( TableOp ):
     dfs[1]: config row with 'db_path', 'table_name', 'if_exists'
     Returns dfs[1] unchanged.
     """
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input = [
-                InputSchema( extra = 'open' ),
+                InputSchema( columns = columns, extra = 'open' ),
                 InputSchema(
                     columns = { 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 },
                     extra = 'forbidden',
@@ -1195,11 +1208,15 @@ class ReadSQLiteOp( TableOp ):
     dfs[0]: config row with 'db_path', 'table_name'
     Returns the loaded DataFrame.
     """
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input   = [ InputSchema( columns = { 'db_path': pl.Utf8, 'table_name': pl.Utf8 }, extra = 'forbidden' ) ],
-            output  = [ OutputSchema() ],
+            output  = [ OutputSchema( columns = columns ) ],
             effects = [ DBRead( backend_input = 0, backend_id_column = 'db_path', output = 0 ) ],
         )
     #/def __init__
@@ -1219,11 +1236,15 @@ class ReadSQLiteOp( TableOp ):
 
 class WritePostgresOp( TableOp ):
     """UC: postgres backend not yet implemented."""
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input = [
-                InputSchema( extra = 'open' ),
+                InputSchema( columns = columns, extra = 'open' ),
                 InputSchema(
                     columns = {
                         'connection_string': pl.Utf8, 'table_name': pl.Utf8,
@@ -1244,14 +1265,18 @@ class WritePostgresOp( TableOp ):
 
 class ReadPostgresOp( TableOp ):
     """UC: postgres backend not yet implemented."""
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input   = [ InputSchema(
                 columns = { 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8 },
                 extra = 'forbidden',
             ) ],
-            output  = [ OutputSchema() ],
+            output  = [ OutputSchema( columns = columns ) ],
             effects = [ DBRead( backend_input = 0, backend_id_column = 'connection_string', output = 0 ) ],
         )
     #/def __init__
@@ -1260,6 +1285,201 @@ class ReadPostgresOp( TableOp ):
         raise NotImplementedError( 'UC: postgres backend not yet implemented' )
     #/def __call__
 #/class ReadPostgresOp
+
+# -- Static-path Table Ops (construction-time-known location)
+#
+# Unlike the ops above, these resolve their table's location entirely from
+# ctor kwargs -- nothing is read from a per-call input df. Read ops still
+# take a single arity-1 "trigger" input (InputSchema(extra='open'), value
+# ignored) since _WiringEngine (cell.py) never dispatches a node with an
+# empty declared source list. Write ops echo the data they wrote, verbatim
+# (not a config row like WriteSQLiteOp/BackendWriteOp, not fp/isfile like
+# WriteParquetOp) -- pairs with the "_" discard target convention
+# (cell.py) for callers that don't want the echo wired anywhere.
+
+def _write_parquet( df: pl.DataFrame, fp: str, if_exists: str ) -> None:
+    """Same fail/append/replace(-by-fallthrough) logic already inline in
+    BackendWriteOp's parquet branch -- factored out here so the new
+    WriteParquetStaticOp doesn't duplicate it a third time."""
+    if if_exists == 'fail' and path.isfile( fp ):
+        raise FileExistsError( f"Parquet file already exists: {fp}" )
+    if if_exists == 'append' and path.isfile( fp ):
+        df = pl.concat( [ pl.read_parquet( fp ), df ] )
+    df.write_parquet( fp )
+#/def _write_parquet
+
+class ReadParquetStaticOp( TableOp ):
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        path: str,
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+        self.path = path
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        if verbose > 0:
+            print( f'{verbose_prefix}Reading parquet (static): {self.path}' )
+        return ( pl.read_parquet( self.path ), )
+    #/def __call__
+#/class ReadParquetStaticOp
+
+class WriteParquetStaticOp( TableOp ):
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        path: str,
+        if_exists: str = 'fail',
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+        self.path      = path
+        self.if_exists = if_exists
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        data = dfs[ 0 ]
+        if verbose > 0:
+            print( f'{verbose_prefix}Writing parquet (static): {self.path} (if_exists={self.if_exists})' )
+        _write_parquet( data, self.path, self.if_exists )
+        return ( data, )
+    #/def __call__
+#/class WriteParquetStaticOp
+
+class ReadSQLiteStaticOp( TableOp ):
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        db_path: str,
+        table_name: str,
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+        self.db_path    = db_path
+        self.table_name = table_name
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        if verbose > 0:
+            print( f'{verbose_prefix}Reading SQLite (static): {self.db_path}:{self.table_name}' )
+        return ( _read_sqlite( self.db_path, self.table_name ), )
+    #/def __call__
+#/class ReadSQLiteStaticOp
+
+class WriteSQLiteStaticOp( TableOp ):
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        db_path: str,
+        table_name: str,
+        if_exists: str = 'fail',
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+        self.db_path    = db_path
+        self.table_name = table_name
+        self.if_exists  = if_exists
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        data = dfs[ 0 ]
+        if verbose > 0:
+            print( f'{verbose_prefix}Writing SQLite (static): {self.db_path}:{self.table_name} (if_exists={self.if_exists})' )
+        _write_sqlite( data, self.db_path, self.table_name, self.if_exists )
+        return ( data, )
+    #/def __call__
+#/class WriteSQLiteStaticOp
+
+# -- In-Memory Table Ops (no disk/backend access of their own)
+
+class MemoryOp( TableOp ):
+    """
+    Purely in-memory table cache -- holds the last value it was given
+    across repeated firings (even across separate Cell.__call__
+    invocations, since state lives on self, not per-call wiring state).
+    No disk/backend access of its own: seed it by wiring a reader op's
+    output (or the Cell's own external input) into its source; persist
+    it by wiring its output into a separate writer op elsewhere. This is
+    what makes "read once, mutate many times in memory, write back later"
+    possible entirely through ordinary wiring -- no read/write logic
+    lives here.
+
+    dfs[0]: next state -- replaces self._table
+    Returns self._table (current remembered state).
+
+    A lock guards the read-modify-write of self._table: the same
+    instance is shared across every _WiringEngine dispatch of this node,
+    including two concurrent external calls to the same Cell (each gets
+    its own _WiringEngine, but both dispatch through this one MemoryOp).
+    This prevents a torn read of self._table mid-assignment -- it does
+    NOT make concurrent ordering well-defined (two concurrent writers
+    still race on which value wins).
+    """
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+        self._table: pl.DataFrame | None = None
+        self._lock = threading.Lock()
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        with self._lock:
+            self._table = dfs[ 0 ]
+            if verbose > 0:
+                print( f'{verbose_prefix}MemoryOp remembering {self._table.shape[0]} row(s)' )
+            return ( self._table, )
+    #/def __call__
+#/class MemoryOp
 
 def _resolve_backend(
     backend_ref: pl.DataFrame,
@@ -1289,7 +1509,11 @@ class BackendReadOp( TableOp ):
 
     Returns the loaded data as a single DataFrame.
     """
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input = [
@@ -1299,7 +1523,7 @@ class BackendReadOp( TableOp ):
                 InputSchema( columns = { 'backend_id': pl.Utf8, 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
                 InputSchema( columns = { 'backend_id': pl.Utf8, 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
             ],
-            output  = [ OutputSchema() ],
+            output  = [ OutputSchema( columns = columns ) ],
             effects = [ DBRead( backend_input = 0, backend_id_column = 'backend_id', output = 0 ) ],
         )
     #/def __init__
@@ -1346,11 +1570,15 @@ class BackendWriteOp( TableOp ):
 
     Returns dfs[1] (backend_ref) unchanged.
     """
-    def __init__( self: Self, rng: np.random.Generator | None = None ) -> None:
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
         super().__init__(
             rng = rng,
             input = [
-                InputSchema( extra = 'open' ),
+                InputSchema( columns = columns, extra = 'open' ),
                 InputSchema( columns = { 'backend_id': pl.Utf8 }, extra = 'open' ),
                 InputSchema( columns = { 'backend_id': pl.Utf8, 'backend_table': pl.Utf8 }, extra = 'forbidden' ),
                 InputSchema( columns = { 'backend_id': pl.Utf8, 'fp': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),

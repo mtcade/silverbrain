@@ -60,8 +60,8 @@ def make_node_row(
 # one instance, same object under multiple keys):
 #
 #   tableOps = {
-#       'read_it':  BackendReadOp(),
-#       'write_it': BackendWriteOp(),
+#       'read_it':  BackendReadOp( columns={ 'a': pl.Int64 } ),
+#       'write_it': BackendWriteOp( columns={ 'a': pl.Int64 } ),
 #   }
 
 def backend_read_process(

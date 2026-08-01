@@ -107,6 +107,15 @@ class _WiringEngine:
     nothing newly fireable and nothing still in flight, but the Cell's own
     target isn't fully resolved, `future` gets a RuntimeError naming the
     unresolved names.
+
+    "_" is a reserved discard target: a node's target list may name a
+    result slot "_" to mean "run this (side effects included) but never
+    store or wire the result anywhere" -- e.g. a write op that always
+    echoes the table it wrote, when the caller doesn't want that echo
+    consumed by anything. Discarded results never enter `values`/`gen`, so
+    nothing can depend on them and they never contribute to resolving a
+    target. This is node-level only (register_node's target=) -- a Cell's
+    own external source/target contract is unaffected.
     """
 
     def __init__(
@@ -211,6 +220,12 @@ class _WiringEngine:
         targets = row[ 'target' ] or []
         with self.lock:
             for name, value in zip( targets, result ):
+                if name == '_':
+                    # Reserved discard target: the op still ran (side
+                    # effects, if any, already happened) but this result is
+                    # never stored, so nothing can ever depend on it and it
+                    # never contributes to resolving anything.
+                    continue
                 self.values[ name ] = value
                 if value is not None:
                     self.gen[ name ] = self.gen.get( name, 0 ) + 1
@@ -476,6 +491,10 @@ class Cell:
         target names need not be unique across nodes -- the wiring graph
         isn't required to be a DAG (see _WiringEngine); more than one node
         may legitimately claim the same target across different rounds.
+        This also means "_" (the reserved discard target -- see
+        _WiringEngine) needs no special-casing here: any number of nodes
+        may independently declare target=["_"] with no conflict, same as
+        any other repeated name.
         """
         if node_idn not in self.tableOps:
             raise KeyError(
