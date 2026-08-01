@@ -4,8 +4,8 @@
 #//
 
 """
-Tests for cell_from_file's nested [[children]] loading, delegated to
-configTree.py to build the flat initialization table (replaces
+Tests for cell_from_file's nested kind='cell' [[nodes]] loading, delegated
+to configTree.py to build the flat initialization table (replaces
 Web/web_from_toml -- see nested-gathering-russell.md §1.6 and the
 squishy-sleeping-snowflake plan): a Cell can nest other Cells directly via
 tableOps, with no separate composite class and no alias/exposure machinery.
@@ -17,6 +17,7 @@ import polars as pl
 import pytest
 
 from silverbrain.cell import Cell, cell_from_file
+from silverbrain.tableOps import PlaceholderOp
 from silverbrain.verify import verify_toml
 
 
@@ -43,8 +44,9 @@ _CHILD_TOML = """\
 source = ["inp"]
 target = ["out"]
 
-[[processes]]
+[[nodes]]
 node_idn = "double"
+kind     = "op"
 source   = ["inp"]
 target   = ["out"]
 """
@@ -56,8 +58,9 @@ def _parent_toml( child_toml_name: str = 'child.toml' ) -> str:
 source = ["inp"]
 target = ["out"]
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "{child_toml_name}"
 source   = ["inp"]
 target   = ["out"]
@@ -68,7 +71,7 @@ target   = ["out"]
 
 
 def test_nested_child_registered_as_actor( tmp_path: Path ) -> None:
-    """A [[children]] entry becomes a nested Cell registered under `node_idn` in tableOps."""
+    """A kind='cell' [[nodes]] entry becomes a nested Cell registered under `node_idn` in tableOps."""
     _write( tmp_path / 'child.toml', _CHILD_TOML )
     _write( tmp_path / 'parent.toml', _parent_toml() )
 
@@ -109,8 +112,9 @@ def test_two_levels_of_nesting( tmp_path: Path ) -> None:
 source = ["inp"]
 target = ["out"]
 
-[[children]]
+[[nodes]]
 node_idn = "grandkid"
+kind     = "cell"
 toml     = "grandchild.toml"
 source   = ["inp"]
 target   = ["out"]
@@ -154,8 +158,9 @@ def test_parameters_toml_syntax_flows_into_constructed_op( tmp_path: Path ) -> N
 source = ["inp"]
 target = ["out"]
 
-[[processes]]
+[[nodes]]
 node_idn = "scale"
+kind     = "op"
 source   = ["inp"]
 target   = ["out"]
 
@@ -183,6 +188,85 @@ def test_unsupported_format_raises( tmp_path: Path ) -> None:
         cell_from_file( tmp_path / 'parent.yaml', _OPS, main_id='parent' )
 
 
+def test_unknown_node_kind_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "mystery"
+kind     = "bogus"
+""" )
+    with pytest.raises( ValueError, match="unknown kind" ):
+        cell_from_file( tmp_path / 'cell.toml', _OPS, main_id='root' )
+
+
+# -- kind="placeholder"
+
+
+def test_placeholder_node_builds_placeholder_op( tmp_path: Path ) -> None:
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+source = ["inp"]
+target = ["out"]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+source   = ["inp"]
+target   = ["out"]
+columns  = { a = "Int64" }
+""" )
+
+    cell = cell_from_file( tmp_path / 'cell.toml', {}, main_id='root' )
+    op   = cell.tableOps[ 'future' ]
+    assert isinstance( op, PlaceholderOp )
+    assert op.input[ 0 ].columns == { 'a': pl.Int64 }
+    assert op.output[ 0 ].columns == { 'a': pl.Int64 }
+
+
+def test_placeholder_node_raises_if_actually_called( tmp_path: Path ) -> None:
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+source = ["inp"]
+target = ["out"]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+source   = ["inp"]
+target   = ["out"]
+columns  = { a = "Int64" }
+""" )
+
+    cell   = cell_from_file( tmp_path / 'cell.toml', {}, main_id='root' )
+    future = cell( ( pl.DataFrame( { 'a': [ 1 ] } ), ) )
+    with pytest.raises( NotImplementedError ):
+        future.result( timeout=5 )
+
+
+def test_placeholder_can_be_swapped_post_init( tmp_path: Path ) -> None:
+    """Nothing about tableOps[node_idn] pins a node to its build-time kind --
+    replacing the dict entry is enough for future dispatches to pick it up
+    (Cell._WiringEngine looks up self.cell.tableOps[node_idn] live)."""
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+source = ["inp"]
+target = ["out"]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+source   = ["inp"]
+target   = ["out"]
+columns  = { a = "Int64" }
+""" )
+
+    cell = cell_from_file( tmp_path / 'cell.toml', {}, main_id='root' )
+    cell.tableOps[ 'future' ] = _DoubleOp()
+    result = cell( ( pl.DataFrame( { 'v': [ 3 ] } ), ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() == [ 6 ]
+
+
 # -- verify_toml
 
 
@@ -203,13 +287,39 @@ def test_verify_duplicate_node_idn( tmp_path: Path ) -> None:
     _write( tmp_path / 'parent.toml', """\
 [cell]
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "child.toml"
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "child.toml"
 """ )
     issues = verify_toml( tmp_path / 'parent.toml' )
     assert any( 'Duplicate node_idn' in str( i ) for i in issues )
+
+
+def test_verify_unknown_kind( tmp_path: Path ) -> None:
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "mystery"
+kind     = "bogus"
+""" )
+    issues = verify_toml( tmp_path / 'cell.toml' )
+    assert any( 'unknown kind' in str( i ) for i in issues )
+
+
+def test_verify_placeholder_missing_columns( tmp_path: Path ) -> None:
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+""" )
+    issues = verify_toml( tmp_path / 'cell.toml' )
+    assert any( "missing 'columns'" in str( i ) for i in issues )

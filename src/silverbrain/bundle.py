@@ -153,8 +153,9 @@ def cell_from_bundle(
     """
     Load the top-level Cell for an installed bundle by id, resolving
     {cells_root}/{webs_root}. The bundle's map TOML (formerly a composite
-    Web, now a plain [cell] with [[children]]) is loaded via cell_from_file,
-    which delegates to configTree.py to recurse into any [[children]] itself.
+    Web, now a plain [cell] with kind='cell' [[nodes]] entries) is loaded
+    via cell_from_file, which delegates to configTree.py to recurse into
+    any of them itself.
     """
     from .cell import cell_from_file
 

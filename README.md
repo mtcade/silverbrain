@@ -29,33 +29,56 @@ registered it, it just has no wiring graph of its own to run through
 `__call__`.
 
 These names are **private to this Cell**. A parent that nests this Cell as
-one of its own children (via `[[children]]`, below) assigns its own,
-independent parent-level `source`/`target` names for it -- only the *arity*
-(tuple length) needs to agree across that boundary, never the names
-themselves.
+one of its own children (a `kind = "cell"` `[[nodes]]` entry, below)
+assigns its own, independent parent-level `source`/`target` names for it --
+only the *arity* (tuple length) needs to agree across that boundary, never
+the names themselves.
 
-### `[[processes]]` -- leaf ops
+### `[[nodes]]` -- every child this Cell owns
 
 ```toml
-[[processes]]
-node_idn = "double"     # key op_classes must resolve
-source   = ["a"]        # names this op's positional inputs are read from
-target   = ["b"]        # names this op's positional outputs are written under
+[[nodes]]
+node_idn = "double"     # unique among this file's own nodes
+kind     = "op"          # "op" | "cell" | "placeholder"
+source   = ["a"]        # names this node's positional inputs are read from
+target   = ["b"]        # names this node's positional outputs are written under
 ```
 
-One block per `TableOp` this Cell wires in. `node_idn` is the key looked up
-in `op_classes` (a `dict[str, type[TableOp]]`); the instance is built via
-`build_tableOps()` as `op_classes[node_idn](rng=rng, **kwargs)`, where
-`kwargs` comes from that op's own `[[parameters]]` entry, if any (below) --
-so an op with no declared parameters is just `cls(rng=rng)`, relying on its
-own defaults (or a `TypeError` for a missing required kwarg). `source`/
-`target` are names in *this Cell's own* namespace -- assigned here, by this
-Cell, not by the op itself.
+One block per leaf `TableOp`, nested `Cell`, or placeholder this Cell wires
+in -- `source`/`target` are names in *this Cell's own* namespace, assigned
+here regardless of `kind`. `node_idn` must be unique within one file (it's
+a dict key); it doubles as `self.tableOps[node_idn]`'s lookup key once the
+`Cell` is live, so any node -- whichever `kind` built it -- can later be
+swapped for a different `TableOp`/`Cell` instance post-construction without
+touching this file. `kind` only governs how the node is *parsed and built*:
+
+- **`kind = "op"`**: `node_idn` is the key looked up in `op_classes` (a
+  `dict[str, type[TableOp]]`); the instance is built via `build_tableOps()`
+  as `op_classes[node_idn](rng=rng, **kwargs)`, where `kwargs` comes from
+  that op's own `[[parameters]]` entry, if any (below) -- so an op with no
+  declared parameters is just `cls(rng=rng)`, relying on its own defaults
+  (or a `TypeError` for a missing required kwarg).
+
+- **`kind = "cell"`**: also requires `toml = "path/to/child.toml"`
+  (resolved relative to this file). Loaded recursively (`config_tree`/
+  `cell_from_file` infer file format from suffix at every level, so a child
+  can in principle use a different format than its parent -- only `.toml`
+  is implemented today). If `source`/`target` are both omitted, the child
+  is still constructed and registered in `tableOps` (reachable via
+  `bind(node_idn)`), just not wired into this Cell's own execution graph.
+
+- **`kind = "placeholder"`**: also requires `columns = { a = "Int64" }` (a
+  `{col_name = "DtypeStr"}` table). Its interface (an arity-1 input/output
+  pair matching `columns`) is declared up front, but no implementation is
+  bound -- it builds a `tableOps.PlaceholderOp`, which raises if ever
+  actually called. Wiring, schema checks, and `__table_op_schema__` all see
+  a real node from the start; swap `cell.tableOps[node_idn]` for a real
+  `TableOp`/`Cell` before this node is reached on a live execution path.
 
 A `target` name of `"_"` is reserved: it discards that result slot rather
-than wiring it anywhere -- the op still runs (side effects included), the
+than wiring it anywhere -- the node still runs (side effects included), the
 value just never enters this Cell's resolved values and nothing can depend
-on it. Useful for an op that always returns something you don't need
+on it. Useful for a node that always returns something you don't need
 downstream (e.g. a write op that echoes the table it wrote, per its own
 convention -- see the op's own docs). Any number of nodes may declare
 `target = ["_"]`; unlike real names, it's never ambiguous who "owns" it.
@@ -64,7 +87,7 @@ convention -- see the op's own docs). Any number of nodes may declare
 
 ```toml
 [[parameters]]
-node_idn  = "double"    # which [[processes]]/[[children]] node_idn (in this file)
+node_idn  = "double"    # which [[nodes]] node_idn (in this file, kind="op")
 threshold = 0.5         # inline kwargs, straight to op_classes[node_idn](rng=rng, **these)
 label     = "x"
 ```
@@ -97,30 +120,11 @@ consumers read -- but `build_tableOps()` itself only accepts concrete
 (`fixed`) values; a search/random spec on a node `op_classes` will actually
 construct raises at construction time.
 
-### `[[children]]` -- nested cells
-
-```toml
-[[children]]
-node_idn = "kid"                # key this child is registered under
-toml     = "path/to/child.toml" # resolved relative to this file
-source   = ["a"]                # optional
-target   = ["b"]                # optional
-```
-
-One block per nested `Cell`, loaded recursively (`config_tree`/
-`cell_from_file` infer file format from suffix at every level, so a child
-can in principle use a different format than its parent -- only `.toml` is
-implemented today). `source`/`target` here are assigned by *this* file, in
-its own namespace -- independent of the child's own `[cell].source`/
-`[cell].target`. If omitted, the child is still constructed and registered
-in `tableOps` (reachable via `bind(node_idn)`), just not wired into this
-Cell's own execution graph.
-
 ### Wiring, not a DAG
 
 `node_idn` must be unique within one file (it's a dict key), but `source`/
-`target` **names may repeat** across `[[processes]]`/`[[children]]` entries
--- the wiring graph is not required to be a DAG. A name may legitimately
+`target` **names may repeat** across `[[nodes]]` entries -- the wiring
+graph is not required to be a DAG. A name may legitimately
 feed more than one node (fan-out), and a node whose `source` lists more
 than one name (fan-in) only fires once every one of those names holds a
 value produced *since that node last consumed it* -- so four independent
@@ -156,13 +160,15 @@ node instead, which (thanks to gen-tracking) only fires once a real,
 non-null value actually arrives:
 
 ```toml
-[[processes]]
+[[nodes]]
 node_idn = "controller"
+kind     = "op"
 source   = ["n"]
 target   = ["n", "escape"]     # loops back to "n"; "escape" stays null while looping
 
-[[processes]]
+[[nodes]]
 node_idn = "passthrough"
+kind     = "op"
 source   = ["escape"]
 target   = ["done"]            # only fires once "escape" goes non-null
 ```

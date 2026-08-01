@@ -5,8 +5,9 @@
 
 from . import configTree, tableOps, tableProcesses, types
 from .actor import Actor
-from .tableOps import TableOp, TableOpSchema
+from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
+from .polarsDataTypeStrings import str_to_dtype
 from .schema import table_schemas, table_schemas_to_df
 
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Self, Sequence
 
 import inspect
+import json
 import threading
 
 import polars as pl
@@ -658,12 +660,20 @@ def _cell_from_tree(
     own_row = tree.filter(
         ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
     ).row( 0, named = True )
-    children      = tree.filter( pl.col( 'parent_idn' ) == node_idn )
-    op_children   = children.filter( pl.col( 'kind' ) == 'op'   ).to_dicts()
-    cell_children = children.filter( pl.col( 'kind' ) == 'cell' ).to_dicts()
+    children             = tree.filter( pl.col( 'parent_idn' ) == node_idn )
+    op_children          = children.filter( pl.col( 'kind' ) == 'op'          ).to_dicts()
+    placeholder_children = children.filter( pl.col( 'kind' ) == 'placeholder' ).to_dicts()
+    cell_children        = children.filter( pl.col( 'kind' ) == 'cell'        ).to_dicts()
 
     op_keys: list[ str ] = [ row[ 'node_idn' ] for row in op_children ]
     ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters )
+
+    for row in placeholder_children:
+        columns = {
+            col: str_to_dtype( dtype_str )
+            for col, dtype_str in json.loads( row[ 'placeholder_columns' ] ).items()
+        }
+        ops[ row[ 'node_idn' ] ] = PlaceholderOp( columns = columns, rng = rng )
 
     for row in cell_children:
         ops[ row[ 'node_idn' ] ] = _cell_from_tree(
@@ -684,7 +694,7 @@ def _cell_from_tree(
         parameters = parameters,
     )
 
-    for row in op_children:
+    for row in op_children + placeholder_children:
         cell.register_node( node_idn=row[ 'node_idn' ], source=row[ 'source' ], target=row[ 'target' ] )
     for row in cell_children:
         if row[ 'source' ] or row[ 'target' ]:
@@ -704,16 +714,16 @@ def cell_from_file(
 ) -> Cell:
     """
     Construct a Cell from a config file, delegating to configTree.config_tree
-    to recursively parse the file and its transitive [[children]] references
-    into a flat initialization table (topology + each cell's own binding),
-    then building nested Cells from that table bottom-up. File format is
-    inferred from suffix at every node in the walk (configTree.config_tree);
-    only '.toml' is implemented today.
+    to recursively parse the file and its transitive kind='cell' [[nodes]]
+    references into a flat initialization table (topology + each cell's own
+    binding), then building nested Cells from that table bottom-up. File
+    format is inferred from suffix at every node in the walk
+    (configTree.config_tree); only '.toml' is implemented today.
 
     Parameters
     ----------
     path        : path to the config file
-    op_classes  : dict[str, type[TableOp]] mapping each [[processes]]
+    op_classes  : dict[str, type[TableOp]] mapping each kind='op' [[nodes]]
                   node_idn to the TableOp subclass to construct for it. Each
                   instance is built via build_tableOps() as
                   cls(rng=rng, **kwargs) -- kwargs from the op's own node in
@@ -721,11 +731,13 @@ def cell_from_file(
                   TOML syntax populates it yet), so an op with no declared
                   parameters just gets `cls(rng=rng)`, relying on its own
                   defaults (or a TypeError for a missing required kwarg).
+                  kind='placeholder' nodes don't consult op_classes at all --
+                  they're built directly as tableOps.PlaceholderOp(columns=...).
     main_id     : passed to ``Cell.__init__`` and used as this file's own
                   node_idn in the parsed tree
     rng         : forwarded to every constructed TableOp, at every level
     verbose     : forwarded to ``Cell.__init__`` at every level
-    template_vars : optional ``{key}`` substitutions applied to [[children]]
+    template_vars : optional ``{key}`` substitutions applied to kind='cell'
                   ``toml`` strings before resolving (e.g. ``{cells_root}``)
 
     TOML schema expected
@@ -740,23 +752,32 @@ def cell_from_file(
                               # only reaches its children via bind(), never
                               # through its own __call__'s wiring engine.
 
-    [[processes]]                # one block per leaf op reference
-        node_idn = "..."          # must be a key op_classes resolves
-        source   = [...]          # names this op's positional inputs are
+    [[nodes]]                    # one block per node this file directly owns
+        node_idn = "..."          # unique among this file's own nodes
+        kind     = "op"           # "op" | "cell" | "placeholder"
+        source   = [...]          # names this node's positional inputs are
                                    # read from (this Cell's own namespace)
-        target   = [...]          # names this op's positional outputs are
+        target   = [...]          # names this node's positional outputs are
                                    # written under (ditto) -- need not be
-                                   # unique across [[processes]]/[[children]]
-                                   # entries; see squishy-sleeping-
-                                   # snowflake.md
+                                   # unique across [[nodes]] entries; see
+                                   # squishy-sleeping-snowflake.md
 
-    [[children]]                 # one block per nested Cell
-        node_idn = "..."          # key this child is registered under in
-                                   # the parent's tableOps
-        toml     = "path/to/child.toml"   # relative to this file
-        source   = [...]                  # optional -- omit to leave this
-        target   = [...]                  # child unregistered as a __nodes__
-                                           # row (still reachable via bind())
+        # kind="op": node_idn must be a key op_classes resolves; no other
+        #   fields required.
+
+        # kind="cell": one block per nested Cell --
+        #   toml     = "path/to/child.toml"   # relative to this file
+        #   node_idn is the key this child is registered under in the
+        #   parent's tableOps; source/target are optional -- omit both to
+        #   leave this child unregistered as a __nodes__ row (still
+        #   reachable via bind()).
+
+        # kind="placeholder": interface known, implementation not bound yet --
+        #   columns = { col_name = "DtypeStr", ... }   # e.g. { a = "Int64" }
+        #   Builds a tableOps.PlaceholderOp(columns=...) (arity-1
+        #   input/output, raises if actually called); swap
+        #   cell.tableOps[node_idn] for a real TableOp/Cell before this node
+        #   is reached on a live execution path.
     """
     tree, parameters, _ = configTree.config_tree(
         path          = path,

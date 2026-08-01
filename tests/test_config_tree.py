@@ -5,12 +5,13 @@
 
 """
 Tests for configTree.toml_config_tree: pure parsing of a cell TOML's
-transitive [[children]] file references into a flat node_idn/parent_idn
+transitive kind='cell' [[nodes]] file references into a flat node_idn/parent_idn
 dataframe, plus the TableOp construction-parameter forest sourced from
 [[parameters]] entries -- inline, or via an external .toml/.json reference
 (squishy-sleeping-snowflake.md §2). No live Cell construction.
 """
 
+import json
 from pathlib import Path
 
 import polars as pl
@@ -45,8 +46,9 @@ def test_single_file_root_row( tmp_path: Path ) -> None:
 source = ["inp"]
 target = ["out"]
 
-[[processes]]
+[[nodes]]
 node_idn = "double"
+kind     = "op"
 source   = ["inp"]
 target   = ["out"]
 """ )
@@ -77,16 +79,18 @@ def test_nested_children_multi_level_parent_idn( tmp_path: Path ) -> None:
 source = ["inp"]
 target = ["out"]
 
-[[processes]]
+[[nodes]]
 node_idn = "leaf_op"
+kind     = "op"
 source   = ["inp"]
 target   = ["out"]
 """ )
     _write( tmp_path / 'middle.toml', """\
 [cell]
 
-[[children]]
+[[nodes]]
 node_idn = "grandkid"
+kind     = "cell"
 toml     = "grandchild.toml"
 source   = ["mid_in"]
 target   = ["mid_out"]
@@ -94,8 +98,9 @@ target   = ["mid_out"]
     _write( tmp_path / 'top.toml', """\
 [cell]
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "middle.toml"
 source   = ["top_in"]
 target   = ["top_out"]
@@ -138,8 +143,9 @@ def test_format_inferred_at_each_step_child_suffix_checked_too( tmp_path: Path )
     _write( tmp_path / 'top.toml', """\
 [cell]
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "child.yaml"
 """ )
     with pytest.raises( ValueError, match="Unsupported config file format" ):
@@ -153,8 +159,9 @@ def test_parameters_inline( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
-[[processes]]
+[[nodes]]
 node_idn = "reader"
+kind     = "op"
 
 [[parameters]]
 node_idn  = "reader"
@@ -222,8 +229,9 @@ def test_parameters_across_multiple_files_collected_into_one_forest( tmp_path: P
     _write( tmp_path / 'child.toml', """\
 [cell]
 
-[[processes]]
+[[nodes]]
 node_idn = "writer"
+kind     = "op"
 
 [[parameters]]
 node_idn = "writer"
@@ -232,15 +240,17 @@ label    = "out"
     _write( tmp_path / 'top.toml', """\
 [cell]
 
-[[processes]]
+[[nodes]]
 node_idn = "reader"
+kind     = "op"
 
 [[parameters]]
 node_idn  = "reader"
 threshold = 0.5
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "child.toml"
 """ )
     _, params, next_node_idx = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
@@ -250,7 +260,7 @@ toml     = "child.toml"
     }
     # one [[parameters]] entry per file, each a flat (no _or/_and) group --
     # each contributes exactly one node_idx, and the counter is threaded
-    # into the [[children]] recursion, so the two don't collide.
+    # into the kind='cell' recursion, so the two don't collide.
     assert next_node_idx == 2
 
 
@@ -290,8 +300,9 @@ label    = "out"
 node_idn  = "reader"
 threshold = 0.5
 
-[[children]]
+[[nodes]]
 node_idn = "kid"
+kind     = "cell"
 toml     = "child.toml"
 """ )
     _, params, next_node_idx = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
@@ -318,3 +329,71 @@ toml     = "{params_root}/reader_params.toml"
         template_vars = { 'params_root': 'params_root' },
     )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
+
+
+# -- kind="placeholder"
+
+
+def test_placeholder_node_carries_columns_as_json( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+source   = ["inp"]
+target   = ["out"]
+columns  = { a = "Int64", b = "Utf8" }
+""" )
+    tree, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
+
+    assert row[ 'kind' ]       == 'placeholder'
+    assert row[ 'source' ]     == [ 'inp' ]
+    assert row[ 'target' ]     == [ 'out' ]
+    assert json.loads( row[ 'placeholder_columns' ] ) == { 'a': 'Int64', 'b': 'Utf8' }
+
+
+def test_placeholder_node_defaults_to_empty_columns( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
+    assert json.loads( row[ 'placeholder_columns' ] ) == {}
+
+
+def test_op_and_cell_nodes_have_null_placeholder_columns( tmp_path: Path ) -> None:
+    _write( tmp_path / 'child.toml', "[cell]\n" )
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "an_op"
+kind     = "op"
+
+[[nodes]]
+node_idn = "a_cell"
+kind     = "cell"
+toml     = "child.toml"
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
+    assert rows[ 'an_op' ][ 'placeholder_columns' ] is None
+    assert rows[ 'a_cell' ][ 'placeholder_columns' ] is None
+
+
+def test_unknown_kind_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "mystery"
+kind     = "bogus"
+""" )
+    with pytest.raises( ValueError, match="unknown kind" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )

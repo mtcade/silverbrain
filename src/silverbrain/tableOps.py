@@ -1481,6 +1481,44 @@ class MemoryOp( TableOp ):
     #/def __call__
 #/class MemoryOp
 
+# -- Placeholder Table Ops (interface known, implementation not bound yet)
+
+class PlaceholderOp( TableOp ):
+    """
+    Stands in for a node whose interface (columns) is declared but whose
+    implementation isn't bound yet -- built from a kind="placeholder"
+    [[nodes]] entry (configTree.py). Declares the same arity-1
+    input/output shape MemoryOp and the static-path read ops use, so
+    wiring, schema checks, and __table_op_schema__ all see a real
+    interface immediately. __call__ always raises: a placeholder is never
+    meant to actually run -- replace self.tableOps[node_idn] with a real
+    TableOp/Cell before this node is reached on a live execution path.
+    """
+    def __init__(
+        self: Self,
+        columns: dict[ str, pl.DataType ],
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__(
+            rng = rng,
+            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
+            output = [ OutputSchema( columns = columns ) ],
+        )
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame, ... ],
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame, ... ]:
+        raise NotImplementedError(
+            "PlaceholderOp has no implementation -- swap self.tableOps"
+            "[node_idn] for a real TableOp/Cell before this node is reached"
+        )
+    #/def __call__
+#/class PlaceholderOp
+
 def _resolve_backend(
     backend_ref: pl.DataFrame,
     backend_index: pl.DataFrame,

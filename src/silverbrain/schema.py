@@ -64,8 +64,13 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # parent_idn — parent node_idn in the same table; null = direct child
     #              of the owning Cell (always null in a live Cell's own
     #              table; may chain multiple levels in a configTree parse)
-    # kind       — 'op' (leaf TableOp) or 'cell' (nested Cell) -- both
-    #              resolved the same way, via self.tableOps[node_idn]
+    # kind       — 'op' (leaf TableOp) or 'cell' (nested Cell) in a live
+    #              Cell's own __nodes__ table -- both resolved the same way,
+    #              via self.tableOps[node_idn]. configTree.py's parse-time
+    #              tree additionally allows 'placeholder' (see
+    #              placeholder_columns below); a placeholder builds into a
+    #              PlaceholderOp, so it still shows up as kind='op' once a
+    #              live Cell reads it back via register_node.
     # source     — names this node's positional dfs inputs are read from,
     #              assigned by whoever registers it (its parent Cell); need
     #              not be unique -- a name may feed more than one node
@@ -82,6 +87,12 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # configTree.py: file-reference metadata for kind='cell' rows only, not
     # part of a live Cell's own __nodes__ table.
     'path':         pl.Utf8,
+    # configTree.py: kind='placeholder' rows' declared interface -- a
+    # JSON-encoded {col_name: dtype_str} object (dtype_str via
+    # polarsDataTypeStrings.dtype_to_str), null on every other kind. Used to
+    # construct a PlaceholderOp(columns=...) at build time, standing in
+    # until a real TableOp/Cell is swapped into self.tableOps[node_idn].
+    'placeholder_columns': pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
@@ -140,15 +151,18 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # -- TOML ↔ DataFrame schemas
 
     # configTree.py: a parsed, not-yet-constructed file-reference tree.
-    # Same shape as __nodes__ plus 'path'/'cell_source'/'cell_target' --
-    # only meaningful on kind='cell' rows: 'path' is which file this node
-    # came from (informational -- construction no longer needs to reopen
-    # it); 'cell_source'/'cell_target' are that cell's own external binding
+    # Same shape as __nodes__ plus 'path'/'cell_source'/'cell_target'/
+    # 'placeholder_columns'. 'path' and 'cell_source'/'cell_target' are only
+    # meaningful on kind='cell' rows: 'path' is which file this node came
+    # from (informational -- construction no longer needs to reopen it);
+    # 'cell_source'/'cell_target' are that cell's own external binding
     # ([cell].source/[cell].target in a TOML source), carried in the tree
     # alongside the row's own (parent-assigned) source/target so
     # construction never needs to open a file to learn either.
+    # 'placeholder_columns' is only meaningful on kind='placeholder' rows --
+    # see cannonical_schema above.
     'config_tree': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'path', 'cell_source', 'cell_target',
+        'path', 'cell_source', 'cell_target', 'placeholder_columns',
     )),
 }

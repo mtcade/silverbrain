@@ -11,10 +11,40 @@ The output is a (nodes, parameters, next_node_idx) triple:
 
 - nodes ('config_tree' schema, schema.py): a node_idn/parent_idn pair per
   node, spanning however many files a config transitively references via
-  [[children]]. This is the same node_idn/parent_idn convention Cell's own
-  __nodes__ table uses (schema.py), just with real multi-level parent_idn
-  chains, since a config's file-reference tree can be arbitrarily deep
-  before any live Cell exists.
+  kind='cell' [[nodes]] entries. This is the same node_idn/parent_idn
+  convention Cell's own __nodes__ table uses (schema.py), just with real
+  multi-level parent_idn chains, since a config's file-reference tree can
+  be arbitrarily deep before any live Cell exists.
+
+[[nodes]] -- one block per node this file directly owns, distinguished
+by kind (any leaf TableOp/nested Cell/child can, in principle, be swapped
+for another at the same node_idn post-construction -- see
+Cell.tableOps[node_idn] -- kind here only affects how this node is
+*parsed and built*, not whether it can later change):
+
+    [[nodes]]
+    node_idn = "..."          # must be unique among this file's own nodes
+    kind     = "op"           # "op" | "cell" | "placeholder"
+    source   = [...]          # this node's positional inputs, read from
+                               # this Cell's own namespace
+    target   = [...]          # this node's positional outputs, written
+                               # under these names (need not be unique --
+                               # see squishy-sleeping-snowflake.md)
+
+    # kind="op" additionally requires nothing else -- node_idn must be a
+    # key op_classes resolves (its ctor kwargs, if any, come from
+    # [[parameters]] below).
+
+    # kind="cell" additionally requires:
+    #   toml = "path/to/child.toml"   # relative to this file
+
+    # kind="placeholder" additionally requires:
+    #   columns = { col_name = "DtypeStr", ... }   # e.g. { a = "Int64" }
+    # Declares the node's interface (an arity-1 input/output pair) with no
+    # implementation bound yet -- built into a tableOps.PlaceholderOp,
+    # which raises if ever actually called. Swap
+    # cell.tableOps[node_idn] for a real TableOp/Cell before this node is
+    # reached on a live execution path.
 - parameters (ParameterParser's tree schema, parameterParse.py): a forest
   of TableOp construction-parameter trees. Every parameterized op's rows
   share one fixed par_group, parameterParse.TABLE_OPS_PARAMETERS_GROUP
@@ -31,7 +61,7 @@ The output is a (nodes, parameters, next_node_idx) triple:
   running counter (node_idx_start in, next_node_idx out -- the same
   dual-return pattern ParameterParser.to_polars()/to_polars_flat() already
   use) is threaded through every [[parameters]] entry at this level and,
-  recursively, every [[children]] call's own entries. A forest assembled
+  recursively, every kind='cell' [[nodes]] call's own entries. A forest assembled
   some other way without sharing that counter (e.g. Cell.merge()
   concatenating two independently-built forests) can reintroduce colliding
   node_idx across different ops -- see the caveat in parameterParse.py.
@@ -40,8 +70,9 @@ The output is a (nodes, parameters, next_node_idx) triple:
   node_idx_start when composing calls manually; cell_from_file's single
   root call doesn't need to, since nothing consumes it past that one call.
 
-[[parameters]] -- one block per parameterized [[processes]]/[[children]]
-node in *this* file:
+[[parameters]] -- one block per parameterized [[nodes]] entry in *this*
+file (kind='op' or kind='cell' -- a placeholder's interface is declared
+inline on its own [[nodes]] entry instead, see below):
 
     [[parameters]]
     node_idn = "..."   # which node (in this file) these params belong to
@@ -83,25 +114,27 @@ from typing import Any, Sequence
 
 
 def _config_tree_row(
-    node_idn:    str,
-    parent_idn:  str | None,
-    kind:        str,
-    source:      Sequence[ str ],
-    target:      Sequence[ str ],
-    path:        str | None,
-    cell_source: Sequence[ str ] | None = None,
-    cell_target: Sequence[ str ] | None = None,
+    node_idn:            str,
+    parent_idn:          str | None,
+    kind:                str,
+    source:              Sequence[ str ],
+    target:              Sequence[ str ],
+    path:                str | None,
+    cell_source:         Sequence[ str ] | None = None,
+    cell_target:         Sequence[ str ] | None = None,
+    placeholder_columns: str | None             = None,
     ) -> pl.DataFrame:
     return pl.DataFrame(
         {
-            'node_idn':    [ node_idn ],
-            'parent_idn':  [ parent_idn ],
-            'kind':        [ kind ],
-            'source':      [ list( source ) ],
-            'target':      [ list( target ) ],
-            'path':        [ path ],
-            'cell_source': [ list( cell_source ) if cell_source is not None else None ],
-            'cell_target': [ list( cell_target ) if cell_target is not None else None ],
+            'node_idn':             [ node_idn ],
+            'parent_idn':           [ parent_idn ],
+            'kind':                 [ kind ],
+            'source':               [ list( source ) ],
+            'target':               [ list( target ) ],
+            'path':                 [ path ],
+            'cell_source':          [ list( cell_source ) if cell_source is not None else None ],
+            'cell_target':          [ list( cell_target ) if cell_target is not None else None ],
+            'placeholder_columns':  [ placeholder_columns ],
         },
         schema = table_schemas[ 'config_tree' ],
     )
@@ -190,7 +223,7 @@ def config_tree(
     node_idx_start/next_node_idx: the same dual-return counter-threading
     pattern ParameterParser.to_polars()/to_polars_flat() already use --
     every [[parameters]] entry parsed anywhere in this file or its
-    transitive [[children]] draws its own parameter tree's node_idx values
+    transitive kind='cell' [[nodes]] entries draws its own parameter tree's node_idx values
     from one running counter, so the whole forest this call produces has
     globally-unique node_idx (not just unique per entry).
     """
@@ -222,7 +255,7 @@ def toml_config_tree(
     node_idx_start: int = 0,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
     """
-    Parse a cell TOML file and its transitive [[children]] file references
+    Parse a cell TOML file and its transitive kind='cell' [[nodes]] file references
     into (nodes, parameters, next_node_idx) dataframes.
 
     node_idn/parent_idn/source/target describe how *this* file was
@@ -257,29 +290,59 @@ def toml_config_tree(
     param_rows: list[ pl.DataFrame ] = [ _empty_parameters() ]
     node_idx = node_idx_start
 
-    for entry in data.get( 'processes', [] ):
-        node_rows.append( _config_tree_row(
-            node_idn   = entry[ 'node_idn' ],
-            parent_idn = node_idn,
-            kind       = 'op',
-            source     = entry.get( 'source', [] ),
-            target     = entry.get( 'target', [] ),
-            path       = None,
-        ) )
+    # Two passes over [[nodes]], not one: op/placeholder rows are appended
+    # immediately, but kind='cell' entries are only *collected* here and
+    # recursed into afterward, once this file's own [[parameters]] have
+    # claimed their node_idx range -- preserves the pre-unification
+    # ordering (this file's own params before any child's), so node_idx
+    # still grows depth-first in file-declaration order rather than a
+    # child's params jumping ahead of this file's own.
+    cell_entries: list[ dict ] = []
+
+    for entry in data.get( 'nodes', [] ):
+        entry_node_idn = entry[ 'node_idn' ]
+        kind           = entry[ 'kind' ]
+
+        if kind == 'op':
+            node_rows.append( _config_tree_row(
+                node_idn   = entry_node_idn,
+                parent_idn = node_idn,
+                kind       = 'op',
+                source     = entry.get( 'source', [] ),
+                target     = entry.get( 'target', [] ),
+                path       = None,
+            ) )
+        elif kind == 'placeholder':
+            node_rows.append( _config_tree_row(
+                node_idn            = entry_node_idn,
+                parent_idn          = node_idn,
+                kind                = 'placeholder',
+                source              = entry.get( 'source', [] ),
+                target              = entry.get( 'target', [] ),
+                path                = None,
+                placeholder_columns = json.dumps( entry.get( 'columns', {} ) ),
+            ) )
+        elif kind == 'cell':
+            cell_entries.append( entry )
+        else:
+            raise ValueError(
+                f"[[nodes]] entry {entry_node_idn!r} has unknown kind {kind!r} -- "
+                f"expected 'op', 'cell', or 'placeholder'"
+            )
 
     for entry in data.get( 'parameters', [] ):
         p_node_idn, group = _parameters_entry_group( entry, path.parent, tvars )
         p_tree, node_idx = parameter_group_to_tree( p_node_idn, group, node_idx_start = node_idx )
         param_rows.append( p_tree )
 
-    for child in data.get( 'children', [] ):
-        child_toml_path = ( path.parent / apply_template_vars( child[ 'toml' ], tvars ) ).resolve()
+    for entry in cell_entries:
+        child_toml_path = ( path.parent / apply_template_vars( entry[ 'toml' ], tvars ) ).resolve()
         child_nodes, child_params, node_idx = config_tree(
             path           = child_toml_path,
-            node_idn       = child[ 'node_idn' ],
+            node_idn       = entry[ 'node_idn' ],
             parent_idn     = node_idn,
-            source         = child.get( 'source', () ),
-            target         = child.get( 'target', () ),
+            source         = entry.get( 'source', () ),
+            target         = entry.get( 'target', () ),
             template_vars  = tvars,
             node_idx_start = node_idx,
         )
