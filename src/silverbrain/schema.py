@@ -5,11 +5,13 @@
 #//  Created by Evan Mason on 3/26/26.
 #//
 
-from typing import Sequence
+from collections import UserDict
+from dataclasses import dataclass, field
+from typing import Literal, Self, Sequence
 
 import polars as pl
 
-from .polarsDataTypeStrings import dtype_to_str
+from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
 
 cannonical_schema: dict[ str, pl.DataType ] = {
     'op_idn':           pl.Utf8,
@@ -166,3 +168,349 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
         'path', 'cell_source', 'cell_target', 'placeholder_columns',
     )),
 }
+
+# -- TableOpSchema
+
+Extra = Literal['forbidden', 'open', 'transparent']
+
+@dataclass
+class DiskWrite:
+    path_input: int     # index into inputs — which df holds the path
+    path_column: str    # column in that df containing the file path
+
+    def to_polars( self: Self, op_idn: str, effect_index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':             [ op_idn ],
+                'effect_index':       [ effect_index ],
+                'type':               [ 'DiskWrite' ],
+                'path_input':         [ self.path_input ],
+                'path_column':        [ self.path_column ],
+                'output':             [ None ],
+                'format':             [ None ],
+                'backend_input':      [ None ],
+                'backend_id_column':  [ None ],
+            },
+            schema = table_schemas['__table_op_effects__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'type': 'DiskWrite',
+            'path_input': self.path_input,
+            'path_column': self.path_column,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls( path_input = d['path_input'], path_column = d['path_column'] )
+#/class DiskWrite
+
+@dataclass
+class DiskRead:
+    path_input: int     # index into inputs — which df holds the path
+    path_column: str    # column in that df containing the file path
+    output: int         # index into outputs — which output receives the loaded data
+    format: str         # e.g. 'parquet', 'json'
+
+    def to_polars( self: Self, op_idn: str, effect_index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':             [ op_idn ],
+                'effect_index':       [ effect_index ],
+                'type':               [ 'DiskRead' ],
+                'path_input':         [ self.path_input ],
+                'path_column':        [ self.path_column ],
+                'output':             [ self.output ],
+                'format':             [ self.format ],
+                'backend_input':      [ None ],
+                'backend_id_column':  [ None ],
+            },
+            schema = table_schemas['__table_op_effects__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'type': 'DiskRead',
+            'path_input': self.path_input, 'path_column': self.path_column,
+            'output': self.output, 'format': self.format,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            path_input = d['path_input'], path_column = d['path_column'],
+            output = d['output'], format = d['format'],
+        )
+#/class DiskRead
+
+@dataclass
+class Mkdir:
+    path_input: int     # index into inputs — which df holds the paths
+    path_column: str    # column in that df containing the directory path
+
+    def to_polars( self: Self, op_idn: str, effect_index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':             [ op_idn ],
+                'effect_index':       [ effect_index ],
+                'type':               [ 'Mkdir' ],
+                'path_input':         [ self.path_input ],
+                'path_column':        [ self.path_column ],
+                'output':             [ None ],
+                'format':             [ None ],
+                'backend_input':      [ None ],
+                'backend_id_column':  [ None ],
+            },
+            schema = table_schemas['__table_op_effects__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'type': 'Mkdir',
+            'path_input': self.path_input,
+            'path_column': self.path_column,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls( path_input = d['path_input'], path_column = d['path_column'] )
+#/class Mkdir
+
+@dataclass
+class DBWrite:
+    backend_input: int      # index into inputs — which df holds the backend_ref
+    backend_id_column: str  # column in that df containing the backend_id
+
+    def to_polars( self: Self, op_idn: str, effect_index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':             [ op_idn ],
+                'effect_index':       [ effect_index ],
+                'type':               [ 'DBWrite' ],
+                'path_input':         [ None ],
+                'path_column':        [ None ],
+                'output':             [ None ],
+                'format':             [ None ],
+                'backend_input':      [ self.backend_input ],
+                'backend_id_column':  [ self.backend_id_column ],
+            },
+            schema = table_schemas['__table_op_effects__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'type': 'DBWrite',
+            'backend_input': self.backend_input,
+            'backend_id_column': self.backend_id_column,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            backend_input = d['backend_input'],
+            backend_id_column = d['backend_id_column'],
+        )
+#/class DBWrite
+
+@dataclass
+class DBRead:
+    backend_input: int      # index into inputs — which df holds the backend_ref
+    backend_id_column: str  # column in that df containing the backend_id
+    output: int             # index into outputs — which output receives the loaded data
+
+    def to_polars( self: Self, op_idn: str, effect_index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':             [ op_idn ],
+                'effect_index':       [ effect_index ],
+                'type':               [ 'DBRead' ],
+                'path_input':         [ None ],
+                'path_column':        [ None ],
+                'output':             [ self.output ],
+                'format':             [ None ],
+                'backend_input':      [ self.backend_input ],
+                'backend_id_column':  [ self.backend_id_column ],
+            },
+            schema = table_schemas['__table_op_effects__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'type': 'DBRead',
+            'backend_input': self.backend_input,
+            'backend_id_column': self.backend_id_column,
+            'output': self.output,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            backend_input = d['backend_input'],
+            backend_id_column = d['backend_id_column'],
+            output = d['output'],
+        )
+#/class DBRead
+
+Effect = DiskWrite | DiskRead | Mkdir | DBWrite | DBRead
+
+_EFFECT_CLASSES: dict[ str, type ] = {
+    'DiskWrite': DiskWrite,
+    'DiskRead':  DiskRead,
+    'Mkdir':     Mkdir,
+    'DBWrite':   DBWrite,
+    'DBRead':    DBRead,
+}
+
+@dataclass
+class InputSchema():
+    columns: dict[ str, pl.DataType ] = field( default_factory = dict )
+    extra: Extra = 'open'
+    #
+    # 'forbidden'   : no extra columns allowed
+    # 'open'        : extra columns allowed, ignored
+    # 'transparent' : extra columns allowed, flow to output (see OutputSchema.passthrough_from)
+    #
+
+    def to_polars( self: Self, op_idn: str, index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':           [ op_idn ],
+                'direction':        [ 'input' ],
+                'index':            [ index ],
+                'column_names':     [ list( self.columns.keys() ) ],
+                'column_types':     [
+                    [ dtype_to_str( t ) for t in self.columns.values() ]
+                ],
+                'extra':            [ self.extra ],
+                'passthrough_from': [ None ],
+            },
+            schema = table_schemas['__table_op_schema__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'columns': { col: dtype_to_str( t ) for col, t in self.columns.items() },
+            'extra': self.extra,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            columns = { col: str_to_dtype( s ) for col, s in d['columns'].items() },
+            extra = d['extra'],
+        )
+#/class InputSchema
+
+@dataclass
+class OutputSchema():
+    columns: dict[ str, pl.DataType ] = field( default_factory = dict )
+    passthrough_from: list[ int ] = field( default_factory = list )
+    #
+    # passthrough_from: indices into TableOpSchema.inputs —
+    #   extra columns from each listed input appear here
+    # columns: columns explicitly constructed by this op (added on top of any passthrough)
+    #
+
+    def to_polars( self: Self, op_idn: str, index: int ) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                'op_idn':           [ op_idn ],
+                'direction':        [ 'output' ],
+                'index':            [ index ],
+                'column_names':     [ list( self.columns.keys() ) ],
+                'column_types':     [
+                    [ dtype_to_str( t ) for t in self.columns.values() ]
+                ],
+                'extra':            [ None ],
+                'passthrough_from': [ self.passthrough_from ],
+            },
+            schema = table_schemas['__table_op_schema__'],
+        )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'columns': { col: dtype_to_str( t ) for col, t in self.columns.items() },
+            'passthrough_from': self.passthrough_from,
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            columns = { col: str_to_dtype( s ) for col, s in d['columns'].items() },
+            passthrough_from = d.get( 'passthrough_from', [] ),
+        )
+#/class OutputSchema
+
+@dataclass
+class TableOpSchema():
+    inputs: list[ InputSchema ]
+    outputs: list[ OutputSchema ]
+    effects: list[ Effect ] = field( default_factory = list )
+
+    def to_polars_schema( self: Self, op_idn: str ) -> pl.DataFrame:
+        frames = [
+            inp.to_polars( op_idn, i ) for i, inp in enumerate( self.inputs )
+        ] + [
+            out.to_polars( op_idn, i ) for i, out in enumerate( self.outputs )
+        ]
+        return pl.concat( frames, how = 'vertical' )
+
+    def to_polars_effects( self: Self, op_idn: str ) -> pl.DataFrame:
+        frames = [ eff.to_polars( op_idn, i ) for i, eff in enumerate( self.effects ) ]
+        return (
+            pl.concat( frames, how = 'vertical' ) if frames
+            else pl.DataFrame( schema = table_schemas['__table_op_effects__'] )
+        )
+
+    def to_polars( self: Self, op_idn: str ) -> tuple[ pl.DataFrame, pl.DataFrame ]:
+        return ( self.to_polars_schema( op_idn ), self.to_polars_effects( op_idn ) )
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'inputs':  [ inp.to_dict() for inp in self.inputs ],
+            'outputs': [ out.to_dict() for out in self.outputs ],
+            'effects': [ eff.to_dict() for eff in self.effects ],
+        }
+
+    @classmethod
+    def from_dict( cls, d: dict ) -> Self:
+        return cls(
+            inputs  = [ InputSchema.from_dict( i ) for i in d['inputs'] ],
+            outputs = [ OutputSchema.from_dict( o ) for o in d['outputs'] ],
+            effects = [
+                _EFFECT_CLASSES[ e['type'] ].from_dict( e )
+                for e in d.get( 'effects', [] )
+            ],
+        )
+#/class TableOpSchema
+
+class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
+    """A typed dict[str, TableOpSchema] mapping opId strings to their schemas."""
+
+    def to_dict( self: Self ) -> dict[ str, dict ]:
+        return { op_idn: op.to_dict() for op_idn, op in self.data.items() }
+
+    @classmethod
+    def from_dict( cls, d: dict[ str, dict ] ) -> Self:
+        return cls( { op_idn: TableOpSchema.from_dict( v ) for op_idn, v in d.items() } )
+
+    def to_polars_schema( self: Self ) -> pl.DataFrame:
+        if not self.data:
+            return pl.DataFrame( schema = table_schemas['__table_op_schema__'] )
+        return pl.concat(
+            [ op.to_polars_schema( op_idn ) for op_idn, op in self.data.items() ],
+            how = 'vertical',
+        )
+
+    def to_polars_effects( self: Self ) -> pl.DataFrame:
+        if not self.data:
+            return pl.DataFrame( schema = table_schemas['__table_op_effects__'] )
+        return pl.concat(
+            [ op.to_polars_effects( op_idn ) for op_idn, op in self.data.items() ],
+            how = 'vertical',
+        )
+
+    def to_polars_tuple( self: Self ) -> tuple[ pl.DataFrame, pl.DataFrame ]:
+        return ( self.to_polars_schema(), self.to_polars_effects() )
+#/class TableOpSchemaDict

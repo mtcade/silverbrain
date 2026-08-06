@@ -22,11 +22,11 @@ from silverbrain.tableOps import BackendReadOp, BackendWriteOp
 from silverbrain.tableProcesses import backend_read_process, backend_write_process
 
 
-def _double_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _double_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     return ( dfs[ 0 ].with_columns( ( pl.col( 'v' ) * 2 ).alias( 'v' ) ), )
 
 
-def _incr_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _incr_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     return ( dfs[ 0 ].with_columns( ( pl.col( 'v' ) + 1 ).alias( 'v' ) ), )
 
 
@@ -155,7 +155,7 @@ def test_validate_nodes_catches_dangling_reference() -> None:
 def test_discard_target_is_not_stored_or_wired() -> None:
     calls: list = []
 
-    def _write_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+    def _write_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
         calls.append( dfs[ 0 ][ 'v' ].to_list() )
         return ( dfs[ 0 ], )
 
@@ -175,7 +175,7 @@ def test_discard_target_is_not_stored_or_wired() -> None:
 
 
 def test_discard_target_mixed_with_real_target() -> None:
-    def _split_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+    def _split_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
         return ( dfs[ 0 ], dfs[ 0 ].with_columns( ( pl.col( 'v' ) * 10 ).alias( 'v' ) ) )
 
     c = Cell(
@@ -218,7 +218,7 @@ def test_fan_out_one_target_feeds_two_nodes() -> None:
     assert incremented[ 'v' ].to_list() == [ 2, 3, 4 ]
 
 
-def _zip_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _zip_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     a, b = dfs
     return ( a.with_columns( ( pl.col( 'v' ) + b[ 'v' ] ).alias( 'v' ) ), )
 
@@ -248,14 +248,14 @@ def test_fan_in_waits_for_both_named_sources() -> None:
 # real (non-null) value arrived.
 
 
-def _loop_controller_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _loop_controller_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     n = dfs[ 0 ][ 'n' ][ 0 ]
     if n < 3:
         return ( pl.DataFrame( { 'n': [ n + 1 ] } ), None )
     return ( None, dfs[ 0 ] )
 
 
-def _passthrough_op( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _passthrough_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     return ( dfs[ 0 ], )
 
 
@@ -283,7 +283,7 @@ def test_hand_written_sequencing_actor() -> None:
         def __init__( self, cell: Cell ) -> None:
             self._cell = cell
 
-        def __call__( self, dfs, verbose = 0, verbose_prefix = '' ) -> tuple:
+        def __call__( self, dfs, corr_id = (), verbose = 0, verbose_prefix = '' ) -> tuple:
             doubled = self._cell.bind( 'double' )( dfs, verbose=verbose, verbose_prefix=verbose_prefix ).result()
             return self._cell.bind( 'incr' )( doubled, verbose=verbose, verbose_prefix=verbose_prefix ).result()
 

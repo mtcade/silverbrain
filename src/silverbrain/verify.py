@@ -20,7 +20,8 @@ class VerifyIssue:
 
     def __str__( self ) -> str:
         return f"{self.path}: {self.issue}"
-
+    #/def __str__
+#class VerifyIssue
 
 def verify_toml( path: Path ) -> list[ VerifyIssue ]:
     """

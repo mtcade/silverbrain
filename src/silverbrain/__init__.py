@@ -1,4 +1,4 @@
-from .actor import Actor
+from .types import Actor
 from .bundle import (
     BundleDirs,
     cell_from_bundle,
@@ -9,8 +9,9 @@ from .bundle import (
     pull_from_hub,
     push_commons_to_hub,
     push_to_hub,
+    register_bundle,
+    resolve_map_fp,
 )
 from .cell import Cell, build_tableOps, cell_from_file
 from .configTree import config_tree, toml_config_tree
-from .maps import register_bundle, resolve_map_fp
 from .parameterParse import op_ctor_kwargs_forest

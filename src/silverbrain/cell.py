@@ -4,7 +4,7 @@
 #//
 
 from . import configTree, tableOps, tableProcesses, types
-from .actor import Actor
+from .types import Actor
 from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
 from .polarsDataTypeStrings import str_to_dtype
@@ -14,7 +14,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Self, Sequence
 
-import inspect
 import json
 import threading
 
@@ -44,19 +43,8 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
 _EXECUTOR = ThreadPoolExecutor( thread_name_prefix = 'silverbrain-actor' )
 
 
-def _accepts_corr_id( actor ) -> bool:
-    """Whether `actor`'s __call__ structurally accepts a corr_id kwarg.
-    TableOp.__call__ doesn't (left unchanged, out of scope for this
-    rearchitecture); Cell and any corr_id-aware Actor does."""
-    try:
-        return 'corr_id' in inspect.signature( actor ).parameters
-    except ( TypeError, ValueError ):
-        return False
-#/def _accepts_corr_id
-
-
 def _call_actor(
-    actor,
+    actor:          Actor,
     dfs:            tuple[ pl.DataFrame, ... ],
     corr_id:        tuple[ str, ... ],
     verbose:        int,
@@ -65,19 +53,17 @@ def _call_actor(
     """
     Invoke a bound Actor. Always runs on a thread-pool worker (see
     _EXECUTOR), never the original caller's thread -- this is what makes
-    __call__/bind() non-blocking from the caller's perspective. Passes
-    corr_id only if the target structurally accepts it. If the target
-    itself returns a Future (a nested Cell, or a Ray remote call already
-    wrapped), blocks this worker thread on it rather than the caller -- a
-    known simplification; see squishy-sleeping-snowflake.md.
+    __call__/bind() non-blocking from the caller's perspective. Every Actor
+    takes corr_id, so it's always passed. If the target itself returns a
+    Future (a nested Cell, or a Ray remote call already wrapped), blocks
+    this worker thread on it rather than the caller -- a known
+    simplification; see squishy-sleeping-snowflake.md.
     """
     if hasattr( actor, 'remote' ):
         import ray
         result = ray.get( actor.__call__.remote( dfs, corr_id, verbose, verbose_prefix ) )
-    elif _accepts_corr_id( actor ):
-        result = actor( dfs, corr_id = corr_id, verbose = verbose, verbose_prefix = verbose_prefix )
     else:
-        result = actor( dfs, verbose = verbose, verbose_prefix = verbose_prefix )
+        result = actor( dfs, corr_id = corr_id, verbose = verbose, verbose_prefix = verbose_prefix )
     if isinstance( result, Future ):
         result = result.result()
     return result
@@ -456,6 +442,7 @@ class Cell:
                     inputs = [], outputs = [], effects = op.effects,
                 ).to_polars( op_id )
                 _effects_rows.append( _effects_df )
+            #/if _has_schema/elif _has_effects and op.effects
         #/for op_id, op in ops.items()
 
         _new_schema  = (
@@ -718,7 +705,8 @@ def cell_from_file(
     references into a flat initialization table (topology + each cell's own
     binding), then building nested Cells from that table bottom-up. File
     format is inferred from suffix at every node in the walk
-    (configTree.config_tree); only '.toml' is implemented today.
+    (configTree.config_tree); both '.toml' and '.json' cell maps are
+    accepted, and a config's children may mix formats freely.
 
     Parameters
     ----------

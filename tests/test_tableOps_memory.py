@@ -44,7 +44,7 @@ def test_memory_op_remembers_and_echoes_last_value() -> None:
     assert op._table[ 'n' ].to_list() == [ 3 ]
 
 
-def _incr_or_escape( dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+def _incr_or_escape( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     """Loop controller: while n < 3, increment and loop (real -> 'feed',
     None -> 'escape'); once n == 3, stop looping and escape (None ->
     'feed', real -> 'escape') -- same shape as

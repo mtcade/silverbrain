@@ -27,7 +27,7 @@ class _DoubleOp:
     def __init__( self, rng = None ) -> None:
         self.rng = rng
 
-    def __call__( self, dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+    def __call__( self, dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
         return ( dfs[ 0 ].with_columns( ( pl.col( 'v' ) * 2 ).alias( 'v' ) ), )
 
 
@@ -150,7 +150,7 @@ def test_parameters_toml_syntax_flows_into_constructed_op( tmp_path: Path ) -> N
             self.rng    = rng
             self.factor = factor
 
-        def __call__( self, dfs: tuple, verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        def __call__( self, dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
             return ( dfs[ 0 ].with_columns( ( pl.col( 'v' ) * self.factor ).alias( 'v' ) ), )
 
     _write( tmp_path / 'cell.toml', """\

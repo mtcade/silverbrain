@@ -94,11 +94,13 @@ node_idn/toml/json) are read the same way.
 
 config_tree() is the format dispatcher, inferring which parser to use from
 the file suffix at every node in the walk (not just the root) -- so a
-config can reference children in a different format than itself, once more
-than one format exists. TOML (toml_config_tree) is the only one implemented
-right now; anything else raises. External [[parameters]] references are
-dispatched separately (by their own .toml/.json suffix, via _load_param_group)
-since they carry a raw ParamGroupDict, not another node in the topology.
+config can reference children in a different format than itself. '.toml'
+(toml_config_tree) and '.json' (json_config_tree) are both implemented,
+sharing all their parsing logic via _config_tree_from_data() once the file
+is loaded to a plain dict -- anything else raises. External [[parameters]]
+references are dispatched separately (by their own .toml/.json suffix, via
+_load_param_group) since they carry a raw ParamGroupDict, not another node
+in the topology.
 """
 
 from .parameterParse import ParameterParser, parameter_group_to_tree
@@ -152,13 +154,17 @@ def _load_param_group( path: Path ) -> dict[ str, Any ]:
     """Load an external [[parameters]] reference's raw ParamGroupDict,
     dispatching on suffix -- '.toml' and '.json' both just parse to a plain
     dict, handled identically from here on."""
-    suffix = path.suffix
-    if suffix == '.json':
+    suffix = path.suffix.lower()
+    if suffix == ".json":
         with open( path, 'r' ) as f:
             return json.load( f )
-    if suffix == '.toml':
+        #
+    #/if suffix == ".json"
+    if suffix == ".toml":
         with open( path, 'rb' ) as f:
             return tomllib.load( f )
+        #
+    #/if suffix == ".toml"
     raise ValueError(
         f"Unsupported external parameters file format {suffix!r} for { path!r } -- "
         f"only '.toml'/'.json' are supported"
@@ -217,8 +223,8 @@ def config_tree(
     """
     Parse a config file and its transitive child-file references into
     (nodes, parameters, next_node_idx) dataframes, dispatching to a
-    format-specific parser by path's suffix. Only '.toml' is implemented;
-    anything else raises.
+    format-specific parser by path's suffix. '.toml' and '.json' are both
+    implemented (toml_config_tree/json_config_tree); anything else raises.
 
     node_idx_start/next_node_idx: the same dual-return counter-threading
     pattern ParameterParser.to_polars()/to_polars_flat() already use --
@@ -227,20 +233,24 @@ def config_tree(
     from one running counter, so the whole forest this call produces has
     globally-unique node_idx (not just unique per entry).
     """
-    suffix = Path( path ).suffix
+    suffix = Path( path ).suffix.lower()
     if suffix == '.toml':
-        return toml_config_tree(
-            path           = path,
-            node_idn       = node_idn,
-            parent_idn     = parent_idn,
-            source         = source,
-            target         = target,
-            template_vars  = template_vars,
-            node_idx_start = node_idx_start,
+        parser = toml_config_tree
+    elif suffix == '.json':
+        parser = json_config_tree
+    else:
+        raise ValueError(
+            f"Unsupported config file format {suffix!r} for { path!r } -- "
+            f"only '.toml'/'.json' are implemented"
         )
-    raise ValueError(
-        f"Unsupported config file format {suffix!r} for { path!r } -- "
-        f"only '.toml' is implemented"
+    return parser(
+        path           = path,
+        node_idn       = node_idn,
+        parent_idn     = parent_idn,
+        source         = source,
+        target         = target,
+        template_vars  = template_vars,
+        node_idx_start = node_idx_start,
     )
 #/def config_tree
 
@@ -256,7 +266,74 @@ def toml_config_tree(
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
     """
     Parse a cell TOML file and its transitive kind='cell' [[nodes]] file references
-    into (nodes, parameters, next_node_idx) dataframes.
+    into (nodes, parameters, next_node_idx) dataframes. See
+    _config_tree_from_data() for the format-agnostic parsing logic shared
+    with json_config_tree().
+    """
+    path = Path( path ).resolve()
+    with open( path, 'rb' ) as f:
+        data = tomllib.load( f )
+    return _config_tree_from_data(
+        data           = data,
+        path           = path,
+        node_idn       = node_idn,
+        parent_idn     = parent_idn,
+        source         = source,
+        target         = target,
+        template_vars  = template_vars,
+        node_idx_start = node_idx_start,
+    )
+#/def toml_config_tree
+
+
+def json_config_tree(
+    path:           str | Path,
+    node_idn:       str,
+    parent_idn:     str | None      = None,
+    source:         Sequence[ str ] = (),
+    target:         Sequence[ str ] = (),
+    template_vars:  dict[ str, str ] | None = None,
+    node_idx_start: int = 0,
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    """
+    Parse a cell JSON file and its transitive kind='cell' [[nodes]] file
+    references into (nodes, parameters, next_node_idx) dataframes -- the
+    JSON equivalent of toml_config_tree(): same {'cell': {...}, 'nodes':
+    [...], 'parameters': [...]} shape TOML's [cell]/[[nodes]]/[[parameters]]
+    tables parse to, just spelled as JSON. See _config_tree_from_data() for
+    the shared parsing logic.
+    """
+    path = Path( path ).resolve()
+    with open( path, 'r' ) as f:
+        data = json.load( f )
+    return _config_tree_from_data(
+        data           = data,
+        path           = path,
+        node_idn       = node_idn,
+        parent_idn     = parent_idn,
+        source         = source,
+        target         = target,
+        template_vars  = template_vars,
+        node_idx_start = node_idx_start,
+    )
+#/def json_config_tree
+
+
+def _config_tree_from_data(
+    data:           dict[ str, Any ],
+    path:           Path,
+    node_idn:       str,
+    parent_idn:     str | None,
+    source:         Sequence[ str ],
+    target:         Sequence[ str ],
+    template_vars:  dict[ str, str ] | None,
+    node_idx_start: int,
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    """
+    Format-agnostic body shared by toml_config_tree()/json_config_tree():
+    given an already-parsed {'cell': {...}, 'nodes': [...], 'parameters':
+    [...]} dict plus the resolved path it came from, build this file's
+    (nodes, parameters, next_node_idx).
 
     node_idn/parent_idn/source/target describe how *this* file was
     referenced by its parent (root call: parent_idn=None, source/target
@@ -264,17 +341,14 @@ def toml_config_tree(
     node-level, parent-assigned names, distinct from this file's own
     [cell].source/[cell].target (this cell's external binding, read here
     and carried as cell_source/cell_target). Children are recursed into via
-    config_tree(), not toml_config_tree() directly, so format is inferred
-    fresh at each level.
+    config_tree(), not this helper directly, so format is inferred fresh at
+    each level.
 
     node_idx_start/next_node_idx thread one running counter through every
     [[parameters]] entry parsed at this level and, recursively, every
     child's -- see config_tree()'s docstring.
     """
-    path  = Path( path ).resolve()
     tvars = template_vars or {}
-    with open( path, 'rb' ) as f:
-        data = tomllib.load( f )
 
     cell_header = data.get( 'cell', {} )
     node_rows: list[ pl.DataFrame ] = [ _config_tree_row(
@@ -359,4 +433,4 @@ def toml_config_tree(
         pl.concat( param_rows, how = 'diagonal_relaxed' ),
         node_idx,
     )
-#/def toml_config_tree
+#/def _config_tree_from_data
