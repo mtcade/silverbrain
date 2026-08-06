@@ -18,8 +18,6 @@ import pytest
 
 from silverbrain.cell import Cell
 from silverbrain.parameterParse import ParameterParser
-from silverbrain.tableOps import BackendReadOp, BackendWriteOp
-from silverbrain.tableProcesses import backend_read_process, backend_write_process
 
 
 def _double_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
@@ -295,53 +293,6 @@ def test_hand_written_sequencing_actor() -> None:
     result = c( ( df_in, ) ).result( timeout=5 )
     assert result[ 0 ][ 'v' ].to_list() == [ 3, 5, 7 ]
 
-
-# -- BackendReadOp/BackendWriteOp wired through the __nodes__-shaped
-# backend_read_process/backend_write_process factories.
-
-
-def test_backend_write_then_read_via_nodes( tmp_path ) -> None:
-    c = Cell(
-        main_id = 'c',
-        ops = {
-            'read_it':  BackendReadOp( columns={ 'a': pl.Int64 } ),
-            'write_it': BackendWriteOp( columns={ 'a': pl.Int64 } ),
-        },
-        source = [ 'to_write', 'backend_ref', '__backend_index__', '__parquet_backend__', '__sqlite_backend__', '__postgres_backend__' ],
-        target = [ 'loaded' ],
-    )
-    write_row = backend_write_process(
-        node_idn = 'write_it',
-        source_data = 'to_write',
-        source_backend_ref = 'backend_ref',
-        target_status = 'written_ref',
-        source_backend_index    = '__backend_index__',
-        source_parquet_backend  = '__parquet_backend__',
-        source_sqlite_backend   = '__sqlite_backend__',
-        source_postgres_backend = '__postgres_backend__',
-    )
-    c.tables[ '__nodes__' ] = write_row
-    read_row = backend_read_process(
-        node_idn = 'read_it',
-        source_backend_ref = 'written_ref',
-        target_data = 'loaded',
-        source_backend_index    = '__backend_index__',
-        source_parquet_backend  = '__parquet_backend__',
-        source_sqlite_backend   = '__sqlite_backend__',
-        source_postgres_backend = '__postgres_backend__',
-    )
-    c.tables[ '__nodes__' ] = pl.concat( [ c.tables[ '__nodes__' ], read_row ], how = 'vertical' )
-
-    fp = str( tmp_path / 'data.parquet' )
-    to_write    = pl.DataFrame( { 'a': [ 1, 2 ] } )
-    backend_ref = pl.DataFrame( { 'backend_id': [ 'b1' ] } )
-    backend_index    = pl.DataFrame( { 'backend_id': [ 'b1' ], 'backend_table': [ '__parquet_backend__' ] } )
-    parquet_backend  = pl.DataFrame( { 'backend_id': [ 'b1' ], 'fp': [ fp ], 'if_exists': [ 'append' ] } )
-    sqlite_backend   = pl.DataFrame( schema = { 'backend_id': pl.Utf8, 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 } )
-    postgres_backend = pl.DataFrame( schema = { 'backend_id': pl.Utf8, 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8, 'if_exists': pl.Utf8 } )
-
-    result = c( (
-        to_write, backend_ref, backend_index, parquet_backend, sqlite_backend, postgres_backend,
-    ) ).result( timeout=5 )
-
-    assert sorted( result[ 0 ][ 'a' ].to_list() ) == [ 1, 2 ]
+# BackendReadOp/BackendWriteOp wiring tests (backend_read_process/
+# backend_write_process) live in silverflow/tests/test_cell_nodes_backend.py
+# alongside the backend-specific TableOps they exercise.

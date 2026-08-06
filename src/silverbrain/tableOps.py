@@ -5,25 +5,18 @@
 #//  Created by Evan Mason on 3/17/26.
 #//
 """
-    Atomic operations on tuples of tables. Most are memoryless, though some 
+    Atomic operations on tuples of tables. Most are memoryless, though some hold tables in memory. Backend-specific ops (parquet/sqlite/postgres readers and writers) live in silverflow, not here -- this module only holds the backend-agnostic core.
 """
 
 from . import types
 from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
-from .schema import (
-    DBRead, DBWrite, DiskRead, DiskWrite, Effect, Extra, InputSchema, Mkdir,
-    OutputSchema, TableOpSchema, TableOpSchemaDict, table_schemas,
-)
+from .schema import Effect, InputSchema, OutputSchema, TableOpSchema
 
 import polars as pl
 import numpy as np
 
 from abc import ABC, abstractmethod
-from itertools import chain
-from os import path
-from typing import Any, Self, Sequence, Type
-import json
-import sqlite3
+from typing import Self, Type
 import threading
 
 # -- TableOp functions
@@ -37,7 +30,7 @@ def add_pl_columns(
     if dtype == pl.List:
         return pl.concat_list( *expr )
     #
-    
+
     if dtype.is_numeric():
         return pl.sum_horizontal( *expr )
     #
@@ -60,7 +53,7 @@ def add_values_from_join(
     parameter_columns: tuple[ str, ... ] = tuple(
         col for col in update.columns if col not in ignore_columns
     )
-    
+
     return df.join(
         update,
         on = keys,
@@ -104,12 +97,12 @@ def update_df_on_keys(
     """
         Use a left join and merge to update keys
     """
-    
+
     # If no df to update, just set it to the new update
     if df is None:
         return update
     #
-    
+
     # Gather non id columns to join in
     join_columns: tuple[ str, ... ] = tuple(
         col for col in update.columns\
@@ -117,7 +110,7 @@ def update_df_on_keys(
             and col not in keys
         #/
     )
-    
+
     if not join_columns:
         raise ValueError(
             "Missing columns for update; found `update.columns={}` with `keys={}`".format(
@@ -126,7 +119,7 @@ def update_df_on_keys(
             )
         )
     #/if not join_columns
-    
+
     return df.join(
         update.select(
             keys + join_columns
@@ -167,14 +160,14 @@ def update_df_on_keys_by_namerColumn(
     ) -> pl.DataFrame:
     """
         When we get a join match based on keys, we look at the value in update of `namerCol`. This will be a column in `df`. Set the value of that column to the column `sourceCol` from update.
-        
+
         If you want to have some function instead of `sourceCol`, then make another transformer to make that column.
     """
     # Our namer and source might be in df, so we have to rename them to properly
     #   grab them after the join on keys
     namerCol_join = namerCol + '_right' if namerCol in df.columns else namerCol
     sourceCol_join = sourceCol + '_right' if sourceCol in df.columns else sourceCol
-    
+
     # Get the expression to find the col named by `namerCol`, after joining
     colNamer_expr_tup: tuple[ pl.Expr,... ] = tuple(
         pl.when(
@@ -189,7 +182,7 @@ def update_df_on_keys_by_namerColumn(
             for targetCol in update[ namerCol ].drop_nulls().unique()
         #/
     )
-    
+
     return df.join(
         update.select(
             keys + (namerCol,) + (sourceCol,)
@@ -220,7 +213,7 @@ class TableOp( ABC ):
         self.effects = effects
         return
     #/def __init__
-    
+
     @abstractmethod
     def __call__(
         self: Self,
@@ -234,64 +227,6 @@ class TableOp( ABC ):
 #/class TableOp
 
 # -- Atomic Table Ops
-
-class WriteParquetOp( TableOp ):
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input = [
-                InputSchema( columns = columns, extra = 'open' ),
-                InputSchema( columns = { 'fp': pl.Utf8 }, extra = 'transparent' ),
-            ],
-            output = [
-                OutputSchema(
-                    columns = { 'fp': pl.Utf8, 'isfile': pl.Boolean },
-                    passthrough_from = [ 1 ],
-                ),
-            ],
-            effects = [ DiskWrite( path_input = 1, path_column = 'fp' ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame, pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        """
-            :param dfs: `dfs[0]` will be written to the value `fp` in `dfs[1]`. Make sure this is an absolute path, or be very careful with your relative paths
-            :returns: a dfs with (fp:str,isfile:bool)
-        """
-        fp: str = dfs[1]['fp'].item()
-        
-        if verbose > 0:
-            print('{}Writing to {}'.format(verbose_prefix,fp))
-        #
-        
-        dfs[0].write_parquet(
-            fp
-        )
-        
-        _isfile: bool = path.isfile( fp )
-        return (
-            dfs[1].with_columns(
-                isfile = pl.when(
-                    pl.col('fp') == pl.lit( fp )
-                ).then(
-                    pl.lit(_isfile)
-                ).otherwise(
-                    pl.lit( False )
-                )
-            ),
-        )
-    #/def __call__
-#/class WriteParquetOp
 
 class SimpleGetOp( TableOp ):
     """
@@ -325,7 +260,7 @@ class SimplePrintOp( SimpleGetOp ):
         super().__init__(
             rng = rng,
         )
-        
+
         self.message = message
         return
     #/def __init__
@@ -338,16 +273,16 @@ class SimplePrintOp( SimpleGetOp ):
         if self.message:
             print( verbose_prefix + self.message )
         #
-        
+
         for i in range( len( dfs ) ):
             print( verbose_prefix + "{}".format(i) )
             print( verbose_prefix + "  " + str(dfs[i].schema) )
             print( dfs[i] )
         #/for i in range( len( dfs ) )
-        
+
         return
     #/def _print
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -375,19 +310,19 @@ class TransformPrintOp( SimplePrintOp ):
             dfs,
         #/
         ) -> None:
-        
+
         super().__init__(
             rng = rng,
             message = message,
         )
-        
+
         self.lam = lam
 
         return
     #/def __init__
-    
+
     #def _print
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -395,16 +330,16 @@ class TransformPrintOp( SimplePrintOp ):
         verbose: int = 0,
         verbose_prefix: str = '',
         ) -> tuple[ pl.DataFrame,... ]:
-        
+
         transformedDfs: tuple[ pl.DataFrame,... ] = self.lam(
             dfs, verbose, verbose_prefix
         )
-        
+
         self._print(
             dfs = transformedDfs,
             verbose_prefix = verbose_prefix,
         )
-        
+
         return dfs
     #/def __call__
 #/class TransformPrintOp
@@ -420,16 +355,16 @@ class AssertOp( SimpleGetOp ):
             True,
         #/
         ) -> None:
-        
+
         super().__init__(
             rng = rng,
         )
-        
+
         self.lam = lam
 
         return
     #/def __init__
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -463,7 +398,7 @@ class FilterOp( TableOp ):
         self.filter_expr = filter_expr
         return
     #/def __init__
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame, ],
@@ -586,7 +521,7 @@ class TransformOp( TableOp ):
             verbose_prefix,
         )
     #/def __call__
-    
+
     @classmethod
     def update_target_on_keys(
         cls: Type,
@@ -656,7 +591,7 @@ class TransformOp( TableOp ):
 class SQLOp( TableOp ):
     """
         Executes SQL strings, with a dataframe as the result from each entry in the tuple `self.sql`
-        
+
         Refer to inputs as 'df_{i}' for i in range(len( dfs ) )
     """
     def __init__(
@@ -673,10 +608,10 @@ class SQLOp( TableOp ):
             output = output,
             effects = effects,
         )
-        
+
         self.sql = sql
     #/def __init__
-    
+
     def __call__(
         self: Self,
         dfs: tuple[ pl.DataFrame,... ],
@@ -693,7 +628,7 @@ class SQLOp( TableOp ):
                 for i in range( len( dfs ) )
             }
         )
-        
+
         return tuple(
             ctx.execute(
                 _sql for _sql in self.sql
@@ -701,403 +636,6 @@ class SQLOp( TableOp ):
         )
     #/def __call__
 #/class SQLOp
-
-# -- Backend Storage Helpers
-
-def _pl_dtype_to_sqlite_type( dtype: pl.DataType ) -> str:
-    if dtype == pl.Boolean:
-        return 'INTEGER'
-    if dtype.is_integer():
-        return 'INTEGER'
-    if dtype.is_float():
-        return 'REAL'
-    return 'TEXT'
-#/def _pl_dtype_to_sqlite_type
-
-def _json_dumps_element( v: Any ) -> str | None:
-    """map_elements passes List/Array element values as pl.Series, not plain
-    Python lists/dicts -- normalize before handing to json.dumps."""
-    if v is None:
-        return None
-    if isinstance( v, pl.Series ):
-        v = v.to_list()
-    return json.dumps( v )
-#/def _json_dumps_element
-
-def _prepare_df_for_sqlite( df: pl.DataFrame ) -> pl.DataFrame:
-    """Serialize List/Struct/Array columns to JSON strings for SQLite storage."""
-    exprs = [
-        pl.col( col ).map_elements( _json_dumps_element, return_dtype = pl.String ).alias( col )
-        for col, dtype in df.schema.items()
-        if isinstance( dtype, ( pl.List, pl.Array, pl.Struct ) )
-    ]
-    return df.with_columns( exprs ) if exprs else df
-#/def _prepare_df_for_sqlite
-
-def _write_sqlite(
-    df: pl.DataFrame,
-    db_path: str,
-    table_name: str,
-    if_exists: str,
-) -> None:
-    df = _prepare_df_for_sqlite( df )
-    conn = sqlite3.connect( db_path )
-    try:
-        cursor = conn.cursor()
-        exists = cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ( table_name, )
-        ).fetchone() is not None
-        if exists:
-            if if_exists == 'fail':
-                raise ValueError( f"Table '{table_name}' already exists in {db_path}" )
-            elif if_exists == 'replace':
-                cursor.execute( f'DROP TABLE "{table_name}"' )
-                exists = False
-        if not exists:
-            col_defs = ', '.join(
-                f'"{col}" {_pl_dtype_to_sqlite_type( dtype )}'
-                for col, dtype in df.schema.items()
-            )
-            cursor.execute( f'CREATE TABLE "{table_name}" ({col_defs})' )
-        # Name columns explicitly rather than relying on positional order matching
-        # the table's physical column order -- callers appending rows built from a
-        # dict (e.g. one wide row per trial) commonly vary column order run to run
-        # even when the column set itself is stable, and a bare positional INSERT
-        # would silently write values into the wrong columns.
-        col_list     = ', '.join( f'"{col}"' for col in df.columns )
-        placeholders = ', '.join( '?' for _ in df.columns )
-        cursor.executemany(
-            f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
-            df.rows(),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-#/def _write_sqlite
-
-def _read_sqlite( db_path: str, table_name: str ) -> pl.DataFrame:
-    conn = sqlite3.connect( db_path )
-    try:
-        cursor = conn.cursor()
-        cursor.execute( f'SELECT * FROM "{table_name}"' )
-        rows = cursor.fetchall()
-        col_names = [ desc[0] for desc in cursor.description ]
-        if not rows:
-            return pl.DataFrame( { name: [] for name in col_names } )
-        # infer_schema_length=None: scan every row, not just a sample -- SQLite's
-        # per-value dynamic typing means an early NULL/int in a column can otherwise
-        # cause a later real value of a different type to fail construction.
-        return pl.DataFrame( rows, schema = col_names, orient = 'row', infer_schema_length = None )
-    finally:
-        conn.close()
-#/def _read_sqlite
-
-# -- Backend Storage Ops (per-backend)
-
-class ReadParquetOp( TableOp ):
-    """
-    Read data from a parquet file.
-    dfs[0]: row(s) with 'fp' column (e.g. from __parquet_backend__)
-    """
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input   = [ InputSchema( columns = { 'fp': pl.Utf8 }, extra = 'forbidden' ) ],
-            output  = [ OutputSchema( columns = columns ) ],
-            effects = [ DiskRead( path_input = 0, path_column = 'fp', output = 0, format = 'parquet' ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> tuple[ pl.DataFrame ]:
-        fp = dfs[0]['fp'].item()
-        if verbose > 0:
-            print( f'{verbose_prefix}Reading parquet: {fp}' )
-        return ( pl.read_parquet( fp ), )
-    #/def __call__
-#/class ReadParquetOp
-
-class WriteSQLiteOp( TableOp ):
-    """
-    Write data to a SQLite table.
-    dfs[0]: data to write
-    dfs[1]: config row with 'db_path', 'table_name', 'if_exists'
-    Returns dfs[1] unchanged.
-    """
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input = [
-                InputSchema( columns = columns, extra = 'open' ),
-                InputSchema(
-                    columns = { 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 },
-                    extra = 'forbidden',
-                ),
-            ],
-            output  = [ OutputSchema( passthrough_from = [ 1 ] ) ],
-            effects = [ DBWrite( backend_input = 1, backend_id_column = 'db_path' ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame, pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> tuple[ pl.DataFrame ]:
-        data, config = dfs[0], dfs[1]
-        cfg = config.row( 0, named = True )
-        if verbose > 0:
-            print( f"{verbose_prefix}Writing SQLite: {cfg['db_path']}:{cfg['table_name']} (if_exists={cfg['if_exists']})" )
-        _write_sqlite( data, cfg['db_path'], cfg['table_name'], cfg['if_exists'] )
-        return ( config, )
-    #/def __call__
-#/class WriteSQLiteOp
-
-class ReadSQLiteOp( TableOp ):
-    """
-    Read data from a SQLite table.
-    dfs[0]: config row with 'db_path', 'table_name'
-    Returns the loaded DataFrame.
-    """
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input   = [ InputSchema( columns = { 'db_path': pl.Utf8, 'table_name': pl.Utf8 }, extra = 'forbidden' ) ],
-            output  = [ OutputSchema( columns = columns ) ],
-            effects = [ DBRead( backend_input = 0, backend_id_column = 'db_path', output = 0 ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> tuple[ pl.DataFrame ]:
-        cfg = dfs[0].row( 0, named = True )
-        if verbose > 0:
-            print( f"{verbose_prefix}Reading SQLite: {cfg['db_path']}:{cfg['table_name']}" )
-        return ( _read_sqlite( cfg['db_path'], cfg['table_name'] ), )
-    #/def __call__
-#/class ReadSQLiteOp
-
-class WritePostgresOp( TableOp ):
-    """UC: postgres backend not yet implemented."""
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input = [
-                InputSchema( columns = columns, extra = 'open' ),
-                InputSchema(
-                    columns = {
-                        'connection_string': pl.Utf8, 'table_name': pl.Utf8,
-                        'schema_name': pl.Utf8, 'if_exists': pl.Utf8,
-                    },
-                    extra = 'forbidden',
-                ),
-            ],
-            output  = [ OutputSchema( passthrough_from = [ 1 ] ) ],
-            effects = [ DBWrite( backend_input = 1, backend_id_column = 'connection_string' ) ],
-        )
-    #/def __init__
-
-    def __call__( self, dfs, corr_id = (), verbose = 0, verbose_prefix = '' ):
-        raise NotImplementedError( 'UC: postgres backend not yet implemented' )
-    #/def __call__
-#/class WritePostgresOp
-
-class ReadPostgresOp( TableOp ):
-    """UC: postgres backend not yet implemented."""
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input   = [ InputSchema(
-                columns = { 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8 },
-                extra = 'forbidden',
-            ) ],
-            output  = [ OutputSchema( columns = columns ) ],
-            effects = [ DBRead( backend_input = 0, backend_id_column = 'connection_string', output = 0 ) ],
-        )
-    #/def __init__
-
-    def __call__( self, dfs, corr_id = (), verbose = 0, verbose_prefix = '' ):
-        raise NotImplementedError( 'UC: postgres backend not yet implemented' )
-    #/def __call__
-#/class ReadPostgresOp
-
-# -- Static-path Table Ops (construction-time-known location)
-#
-# Unlike the ops above, these resolve their table's location entirely from
-# ctor kwargs -- nothing is read from a per-call input df. Read ops still
-# take a single arity-1 "trigger" input (InputSchema(extra='open'), value
-# ignored) since _WiringEngine (cell.py) never dispatches a node with an
-# empty declared source list. Write ops echo the data they wrote, verbatim
-# (not a config row like WriteSQLiteOp/BackendWriteOp, not fp/isfile like
-# WriteParquetOp) -- pairs with the "_" discard target convention
-# (cell.py) for callers that don't want the echo wired anywhere.
-
-def _write_parquet( df: pl.DataFrame, fp: str, if_exists: str ) -> None:
-    """Same fail/append/replace(-by-fallthrough) logic already inline in
-    BackendWriteOp's parquet branch -- factored out here so the new
-    WriteParquetStaticOp doesn't duplicate it a third time."""
-    if if_exists == 'fail' and path.isfile( fp ):
-        raise FileExistsError( f"Parquet file already exists: {fp}" )
-    if if_exists == 'append' and path.isfile( fp ):
-        df = pl.concat( [ pl.read_parquet( fp ), df ] )
-    df.write_parquet( fp )
-#/def _write_parquet
-
-class ReadParquetStaticOp( TableOp ):
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        path: str,
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input  = [ InputSchema( extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
-        )
-        self.path = path
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        if verbose > 0:
-            print( f'{verbose_prefix}Reading parquet (static): {self.path}' )
-        return ( pl.read_parquet( self.path ), )
-    #/def __call__
-#/class ReadParquetStaticOp
-
-class WriteParquetStaticOp( TableOp ):
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        path: str,
-        if_exists: str = 'fail',
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
-        )
-        self.path      = path
-        self.if_exists = if_exists
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        data = dfs[ 0 ]
-        if verbose > 0:
-            print( f'{verbose_prefix}Writing parquet (static): {self.path} (if_exists={self.if_exists})' )
-        _write_parquet( data, self.path, self.if_exists )
-        return ( data, )
-    #/def __call__
-#/class WriteParquetStaticOp
-
-class ReadSQLiteStaticOp( TableOp ):
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        db_path: str,
-        table_name: str,
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input  = [ InputSchema( extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
-        )
-        self.db_path    = db_path
-        self.table_name = table_name
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        if verbose > 0:
-            print( f'{verbose_prefix}Reading SQLite (static): {self.db_path}:{self.table_name}' )
-        return ( _read_sqlite( self.db_path, self.table_name ), )
-    #/def __call__
-#/class ReadSQLiteStaticOp
-
-class WriteSQLiteStaticOp( TableOp ):
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        db_path: str,
-        table_name: str,
-        if_exists: str = 'fail',
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
-        )
-        self.db_path    = db_path
-        self.table_name = table_name
-        self.if_exists  = if_exists
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame ]:
-        data = dfs[ 0 ]
-        if verbose > 0:
-            print( f'{verbose_prefix}Writing SQLite (static): {self.db_path}:{self.table_name} (if_exists={self.if_exists})' )
-        _write_sqlite( data, self.db_path, self.table_name, self.if_exists )
-        return ( data, )
-    #/def __call__
-#/class WriteSQLiteStaticOp
 
 # -- In-Memory Table Ops (no disk/backend access of their own)
 
@@ -1191,153 +729,3 @@ class PlaceholderOp( TableOp ):
         )
     #/def __call__
 #/class PlaceholderOp
-
-def _resolve_backend(
-    backend_ref: pl.DataFrame,
-    backend_index: pl.DataFrame,
-) -> tuple[ str, str, dict ]:
-    """
-    Returns (backend_id, backend_table, backend_ref_row).
-    backend_ref_row includes all columns from backend_ref as a dict.
-    """
-    backend_id = backend_ref['backend_id'].item()
-    row = backend_index.filter( pl.col('backend_id') == backend_id )
-    if row.is_empty():
-        raise KeyError( f"backend_id '{backend_id}' not found in __backend_index__" )
-    backend_table = row['backend_table'].item()
-    return backend_id, backend_table, backend_ref.row( 0, named = True )
-#/def _resolve_backend
-
-class BackendReadOp( TableOp ):
-    """
-    Dispatches a read to the correct storage backend.
-
-    dfs[0]: backend_ref — single row with 'backend_id'
-    dfs[1]: __backend_index__
-    dfs[2]: __parquet_backend__
-    dfs[3]: __sqlite_backend__
-    dfs[4]: __postgres_backend__
-
-    Returns the loaded data as a single DataFrame.
-    """
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input = [
-                InputSchema( columns = { 'backend_id': pl.Utf8 }, extra = 'open' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'backend_table': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'fp': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-            ],
-            output  = [ OutputSchema( columns = columns ) ],
-            effects = [ DBRead( backend_input = 0, backend_id_column = 'backend_id', output = 0 ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> tuple[ pl.DataFrame ]:
-        backend_ref, backend_index, parquet_cfg, sqlite_cfg, postgres_cfg = dfs
-        backend_id, backend_table, _ = _resolve_backend( backend_ref, backend_index )
-
-        if backend_table == '__parquet_backend__':
-            row = parquet_cfg.filter( pl.col('backend_id') == backend_id ).row( 0, named = True )
-            if verbose > 0:
-                print( f"{verbose_prefix}BackendRead parquet: {row['fp']}" )
-            return ( pl.read_parquet( row['fp'] ), )
-
-        elif backend_table == '__sqlite_backend__':
-            row = sqlite_cfg.filter( pl.col('backend_id') == backend_id ).row( 0, named = True )
-            if verbose > 0:
-                print( f"{verbose_prefix}BackendRead sqlite: {row['db_path']}:{row['table_name']}" )
-            return ( _read_sqlite( row['db_path'], row['table_name'] ), )
-
-        elif backend_table == '__postgres_backend__':
-            raise NotImplementedError( 'UC: postgres backend not yet implemented' )
-
-        else:
-            raise ValueError( f"Unknown backend_table: '{backend_table}'" )
-    #/def __call__
-#/class BackendReadOp
-
-class BackendWriteOp( TableOp ):
-    """
-    Dispatches a write to the correct storage backend.
-
-    dfs[0]: data to write
-    dfs[1]: backend_ref — single row with 'backend_id'; optionally 'if_exists' to override config default
-    dfs[2]: __backend_index__
-    dfs[3]: __parquet_backend__
-    dfs[4]: __sqlite_backend__
-    dfs[5]: __postgres_backend__
-
-    Returns dfs[1] (backend_ref) unchanged.
-    """
-    def __init__(
-        self: Self,
-        columns: dict[ str, pl.DataType ],
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        super().__init__(
-            rng = rng,
-            input = [
-                InputSchema( columns = columns, extra = 'open' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8 }, extra = 'open' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'backend_table': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'fp': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'db_path': pl.Utf8, 'table_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-                InputSchema( columns = { 'backend_id': pl.Utf8, 'connection_string': pl.Utf8, 'table_name': pl.Utf8, 'schema_name': pl.Utf8, 'if_exists': pl.Utf8 }, extra = 'forbidden' ),
-            ],
-            output  = [ OutputSchema( passthrough_from = [ 1 ] ) ],
-            effects = [ DBWrite( backend_input = 1, backend_id_column = 'backend_id' ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame, ... ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-    ) -> tuple[ pl.DataFrame ]:
-        data, backend_ref, backend_index, parquet_cfg, sqlite_cfg, postgres_cfg = dfs
-        backend_id, backend_table, ref_row = _resolve_backend( backend_ref, backend_index )
-        override_if_exists: str | None = ref_row.get( 'if_exists' )
-
-        if backend_table == '__parquet_backend__':
-            row = parquet_cfg.filter( pl.col('backend_id') == backend_id ).row( 0, named = True )
-            if_exists = override_if_exists if override_if_exists is not None else row['if_exists']
-            fp = row['fp']
-            if verbose > 0:
-                print( f"{verbose_prefix}BackendWrite parquet: {fp} (if_exists={if_exists})" )
-            if if_exists == 'fail' and path.isfile( fp ):
-                raise FileExistsError( f"Parquet file already exists: {fp}" )
-            if if_exists == 'append' and path.isfile( fp ):
-                data = pl.concat( [ pl.read_parquet( fp ), data ] )
-            data.write_parquet( fp )
-
-        elif backend_table == '__sqlite_backend__':
-            row = sqlite_cfg.filter( pl.col('backend_id') == backend_id ).row( 0, named = True )
-            if_exists = override_if_exists if override_if_exists is not None else row['if_exists']
-            if verbose > 0:
-                print( f"{verbose_prefix}BackendWrite sqlite: {row['db_path']}:{row['table_name']} (if_exists={if_exists})" )
-            _write_sqlite( data, row['db_path'], row['table_name'], if_exists )
-
-        elif backend_table == '__postgres_backend__':
-            raise NotImplementedError( 'UC: postgres backend not yet implemented' )
-
-        else:
-            raise ValueError( f"Unknown backend_table: '{backend_table}'" )
-
-        return ( backend_ref, )
-    #/def __call__
-#/class BackendWriteOp

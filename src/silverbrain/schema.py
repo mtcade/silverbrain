@@ -31,7 +31,6 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'passthrough_from': pl.List( pl.Int32 ),
     # paths
     'key':              pl.Utf8,
-    'fp':               pl.Utf8,
     'isfile':           pl.Boolean,
     'isdir':            pl.Boolean,
     # tables schema
@@ -45,14 +44,6 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'format':            pl.Utf8,
     'backend_input':     pl.Int32,
     'backend_id_column': pl.Utf8,
-    # backend storage
-    'backend_id':        pl.Utf8,
-    'backend_table':     pl.Utf8,
-    'db_path':           pl.Utf8,
-    'table_name':        pl.Utf8,
-    'if_exists':         pl.Utf8,
-    'connection_string': pl.Utf8,
-    'schema_name':       pl.Utf8,
     # parameter spec rows
     'par_idx':          pl.UInt32,
 } | {
@@ -134,18 +125,9 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__tables_schema__': cannonical_schema_for_keys((
         'table_idn', 'column_names', 'column_types',
     )),
-    '__backend_index__': cannonical_schema_for_keys((
-        'backend_id', 'backend_table',
-    )),
-    '__parquet_backend__': cannonical_schema_for_keys((
-        'backend_id', 'fp', 'if_exists',
-    )),
-    '__sqlite_backend__': cannonical_schema_for_keys((
-        'backend_id', 'db_path', 'table_name', 'if_exists',
-    )),
-    '__postgres_backend__': cannonical_schema_for_keys((
-        'backend_id', 'connection_string', 'table_name', 'schema_name', 'if_exists',
-    )),
+    # Backend storage table schemas (__backend_index__, __parquet_backend__,
+    # __sqlite_backend__, __postgres_backend__) live in silverflow.schema
+    # alongside the backend-specific TableOps that read/write them.
     '__nodes__': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
     )),
