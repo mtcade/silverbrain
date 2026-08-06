@@ -5,7 +5,7 @@
 
 """
 Parses config files into a flat, initialization-ready node tree -- pure
-parsing, no live Cell construction (see squishy-sleeping-snowflake.md §2).
+parsing, no live Cell construction
 
 The output is a (nodes, parameters, next_node_idx) triple:
 

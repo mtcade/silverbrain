@@ -9,11 +9,6 @@ MAPS_INDEX_FILE_DEFAULT:  Path = Path('maps_index.toml')
 CELLS_INDEX_FILE_DEFAULT: Path = Path('cells_index.toml')
 BUNDLE_TOML_DEFAULT:      Path = Path('bundle.toml')
 
-"""
-    TODO:
-        - get rid of BigBrainStuff hardcoding in `_fetch_missing_commons`
-"""
-
 # -- Generic idn -> path TOML index. maps_index.toml (bundle main_id -> its
 # default cell's absolute path) and cells_index.toml (cell_idn -> absolute
 # path, one per cells/ directory) both reuse this exact shape -- an
@@ -452,7 +447,6 @@ def _fetch_missing_commons(
 
     commons_repo = os.environ.get(
         f'{app_name.upper()}_COMMONS_REPO',
-        'BigBrainStuff/sk-commons',
     )
 
     from huggingface_hub import snapshot_download
