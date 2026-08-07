@@ -729,3 +729,40 @@ class PlaceholderOp( TableOp ):
         )
     #/def __call__
 #/class PlaceholderOp
+
+# -- Expression Resolution Table Ops (interface not yet finalized)
+
+class ResolveExpressionOp( TableOp ):
+    """
+    UC: variable-binding expression resolution not yet implemented -- see
+    bdd.py for the underlying set-expression algebra (union/intersect/
+    difference over named atoms and free ColVar placeholders) this will
+    resolve against.
+
+    Intended eventual shape (undecided -- this stub commits to no
+    input/output schema): dfs[0] an expression forest (bdd.expr_to_polars
+    schema) possibly containing free ColVar leaves; dfs[1] a var_name-
+    tagged bindings forest (bdd.bindings_to_polars schema) defining what
+    each free ColVar resolves to. __call__ would transitively substitute
+    (bdd.BDDManager.compose) every bound variable and return the fully-
+    grounded expression forest.
+    """
+    def __init__(
+        self: Self,
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        super().__init__( rng = rng )
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame, ... ],
+        corr_id: tuple[ str, ... ] = (),
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame, ... ]:
+        raise NotImplementedError(
+            'UC: expression-variable resolution not yet implemented'
+        )
+    #/def __call__
+#/class ResolveExpressionOp
