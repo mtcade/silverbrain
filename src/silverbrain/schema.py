@@ -79,10 +79,13 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # part of a live Cell's own __nodes__ table.
     'path':         pl.Utf8,
     # configTree.py: kind='placeholder' rows' declared interface -- a
-    # JSON-encoded {col_name: dtype_str} object (dtype_str via
-    # polarsDataTypeStrings.dtype_to_str), null on every other kind. Used to
-    # construct a PlaceholderOp(columns=...) at build time, standing in
-    # until a real TableOp/Cell is swapped into self.tableOps[node_idn].
+    # bdd.Expr serialized via exprParse.expr_to_text (may reference
+    # ColVar; every Atom always carries an explicit dtype in this stored
+    # form, even though the TOML/JSON source may have omitted one for
+    # inference -- see exprParse.py's module docstring), null on every
+    # other kind. Used to construct a PlaceholderOp(expr=...) at build
+    # time, standing in until a real TableOp/Cell is swapped into
+    # self.tableOps[node_idn].
     'placeholder_columns': pl.Utf8,
 }
 

@@ -11,13 +11,14 @@ dataframe, plus the TableOp construction-parameter forest sourced from
 (squishy-sleeping-snowflake.md §2). No live Cell construction.
 """
 
-import json
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+from silverbrain.bdd import Atom, BDDManager, ColVar, Union
 from silverbrain.configTree import config_tree, toml_config_tree
+from silverbrain.exprParse import parse_expr
 from silverbrain.parameterParse import TABLE_OPS_PARAMETERS_GROUP, ParameterParser, op_ctor_kwargs_forest
 
 
@@ -334,7 +335,7 @@ toml     = "{params_root}/reader_params.toml"
 # -- kind="placeholder"
 
 
-def test_placeholder_node_carries_columns_as_json( tmp_path: Path ) -> None:
+def test_placeholder_node_carries_columns_as_expr_text( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
@@ -351,7 +352,10 @@ columns  = { a = "Int64", b = "Utf8" }
     assert row[ 'kind' ]       == 'placeholder'
     assert row[ 'source' ]     == [ 'inp' ]
     assert row[ 'target' ]     == [ 'out' ]
-    assert json.loads( row[ 'placeholder_columns' ] ) == { 'a': 'Int64', 'b': 'Utf8' }
+
+    m = BDDManager()
+    expr = parse_expr( row[ 'placeholder_columns' ] )
+    assert expr.to_bdd( m ) is Union( Atom( 'a', pl.Int64 ), Atom( 'b', pl.Utf8 ) ).to_bdd( m )
 
 
 def test_placeholder_node_defaults_to_empty_columns( tmp_path: Path ) -> None:
@@ -364,7 +368,50 @@ kind     = "placeholder"
 """ )
     tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
-    assert json.loads( row[ 'placeholder_columns' ] ) == {}
+    m = BDDManager()
+    from silverbrain.bdd import FALSE
+    assert parse_expr( row[ 'placeholder_columns' ] ).to_bdd( m ) is FALSE
+
+
+def test_placeholder_node_dict_form_infers_via_sentinel( tmp_path: Path ) -> None:
+    """A dict value of "?" means "infer from schema.cannonical_schema" --
+    same sentinel spelling exprParse.py's text grammar uses."""
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+columns  = { op_idn = "?" }
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
+
+    from silverbrain.schema import cannonical_schema
+    m = BDDManager()
+    expr = parse_expr( row[ 'placeholder_columns' ] )
+    assert expr.to_bdd( m ) is Atom( 'op_idn', cannonical_schema[ 'op_idn' ] ).to_bdd( m )
+
+
+def test_placeholder_node_text_form_with_colvar( tmp_path: Path ) -> None:
+    """The new ColVar-capable interface form -- the main use case: a saved
+    map with a placeholder whose interface references a column variable,
+    to be resolved later once the placeholder is filled in."""
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
+
+    m = BDDManager()
+    expr = parse_expr( row[ 'placeholder_columns' ] )
+    expected = Union( ColVar( 'C' ), Atom( 'nu_col_0', pl.Int64 ) )
+    assert expr.to_bdd( m ) is expected.to_bdd( m )
 
 
 def test_op_and_cell_nodes_have_null_placeholder_columns( tmp_path: Path ) -> None:

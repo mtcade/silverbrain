@@ -3,18 +3,16 @@
 #//  silverbrain
 #//
 
-from . import configTree, tableOps, tableProcesses, types
+from . import configTree, exprParse, tableOps, tableProcesses, types
 from .types import Actor
 from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
-from .polarsDataTypeStrings import str_to_dtype
 from .schema import table_schemas, table_schemas_to_df
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Self, Sequence
 
-import json
 import threading
 
 import polars as pl
@@ -662,11 +660,12 @@ def _cell_from_tree(
     ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters )
 
     for row in placeholder_children:
-        columns = {
-            col: str_to_dtype( dtype_str )
-            for col, dtype_str in json.loads( row[ 'placeholder_columns' ] ).items()
-        }
-        ops[ row[ 'node_idn' ] ] = PlaceholderOp( columns = columns, rng = rng )
+        # configTree.py already fully resolved every atom's dtype before
+        # storing (exprParse.expr_to_text always emits them explicitly),
+        # so this parse is pure deserialization -- never expected to hit
+        # the inference-error path.
+        expr = exprParse.parse_expr( row[ 'placeholder_columns' ] )
+        ops[ row[ 'node_idn' ] ] = PlaceholderOp( expr = expr, rng = rng )
 
     for row in cell_children:
         ops[ row[ 'node_idn' ] ] = _cell_from_tree(

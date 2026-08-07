@@ -40,6 +40,11 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
 
     # kind="placeholder" additionally requires:
     #   columns = { col_name = "DtypeStr", ... }   # e.g. { a = "Int64" }
+    #     -- or, for a ColVar-capable interface (exprParse.py's grammar):
+    #   columns = "Union(ColVar('C'), 'nu_col_0')"
+    # A dict value of "?" or "" (and any bare-name atom in the string
+    # form, e.g. 'nu_col_0' above) means "infer this column's dtype from
+    # schema.cannonical_schema" -- see exprParse.py's module docstring.
     # Declares the node's interface (an arity-1 input/output pair) with no
     # implementation bound yet -- built into a tableOps.PlaceholderOp,
     # which raises if ever actually called. Swap
@@ -103,6 +108,8 @@ _load_param_group) since they carry a raw ParamGroupDict, not another node
 in the topology.
 """
 
+from . import bdd
+from .exprParse import expr_to_text, parse_expr
 from .parameterParse import ParameterParser, parameter_group_to_tree
 from .schema import table_schemas
 from .utilities import apply_template_vars
@@ -141,6 +148,31 @@ def _config_tree_row(
         schema = table_schemas[ 'config_tree' ],
     )
 #/def _config_tree_row
+
+
+def _placeholder_expr( columns: Any ) -> bdd.Expr:
+    """
+    Normalize a kind='placeholder' [[nodes]] entry's `columns` field to one
+    bdd.Expr -- either a TOML/JSON dict ({name = "DtypeStr", ...},
+    backward compatible -- "?" or "" as a value now also means "infer",
+    same sentinel spelling exprParse.py's text grammar uses) or a plain
+    string, parsed via exprParse.parse_expr (the new ColVar-capable form).
+    The dict form is normalized by transcribing it to the same text
+    grammar and parsing that, rather than duplicating the dtype-inference
+    rule here.
+    """
+    if isinstance( columns, str ):
+        return parse_expr( columns )
+    if isinstance( columns, dict ):
+        atoms_text = ', '.join(
+            "Atom('{}', {})".format( name, token if token not in ( '', '?' ) else '?' )
+            for name, token in columns.items()
+        )
+        return parse_expr( f'Union({atoms_text})' )
+    raise TypeError(
+        f"placeholder 'columns' must be a dict or a string (exprParse grammar), got {type(columns)!r}"
+    )
+#/def _placeholder_expr
 
 
 def _empty_parameters() -> pl.DataFrame:
@@ -394,7 +426,7 @@ def _config_tree_from_data(
                 source              = entry.get( 'source', [] ),
                 target              = entry.get( 'target', [] ),
                 path                = None,
-                placeholder_columns = json.dumps( entry.get( 'columns', {} ) ),
+                placeholder_columns = expr_to_text( _placeholder_expr( entry.get( 'columns', {} ) ) ),
             ) )
         elif kind == 'cell':
             cell_entries.append( entry )

@@ -229,6 +229,45 @@ columns  = { a = "Int64" }
     assert m.resolve_to_typed_columns( op.output[ 0 ].expr.to_bdd( m ) ) == { 'a': pl.Int64 }
 
 
+def test_placeholder_node_with_colvar_interface( tmp_path: Path ) -> None:
+    """The main use case: a saved map with a placeholder whose interface
+    references a ColVar (exprParse.py's text grammar), not just literal
+    columns -- once this placeholder is later filled in with a real op/
+    Cell, bdd.resolve_signatures can infer more about the whole cell's
+    columns from whatever binds that ColVar."""
+    _write( tmp_path / 'cell.toml', """\
+[cell]
+source = ["inp"]
+target = ["out"]
+
+[[nodes]]
+node_idn = "future"
+kind     = "placeholder"
+source   = ["inp"]
+target   = ["out"]
+columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
+""" )
+
+    cell = cell_from_file( tmp_path / 'cell.toml', {}, main_id='root' )
+    op   = cell.tableOps[ 'future' ]
+    assert isinstance( op, PlaceholderOp )
+
+    from silverbrain.bdd import Atom, ColVar, Union
+    m = BDDManager()
+    expected = Union( ColVar( 'C' ), Atom( 'nu_col_0', pl.Int64 ) )
+    assert op.expr.to_bdd( m ) is expected.to_bdd( m )
+
+    # genuinely unresolved -- resolve_to_columns must refuse to guess.
+    with pytest.raises( ValueError, match = 'C' ):
+        m.resolve_to_columns( op.expr.to_bdd( m ) )
+
+    # but bdd.resolve_signatures (the machinery this feature is *for*) can
+    # resolve it once a binding for C shows up.
+    from silverbrain.bdd import resolve_signatures
+    resolved = resolve_signatures( m, { 'sig': op.expr }, { 'C': Atom( 'nu_col_1', pl.Utf8 ) } )
+    assert m.resolve_to_columns( resolved[ 'sig' ].to_bdd( m ) ) == frozenset( { 'nu_col_0', 'nu_col_1' } )
+
+
 def test_placeholder_node_raises_if_actually_called( tmp_path: Path ) -> None:
     _write( tmp_path / 'cell.toml', """\
 [cell]

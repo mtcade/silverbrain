@@ -711,7 +711,7 @@ class MemoryOp( TableOp ):
 
 class PlaceholderOp( TableOp ):
     """
-    Stands in for a node whose interface (columns) is declared but whose
+    Stands in for a node whose interface is declared but whose
     implementation isn't bound yet -- built from a kind="placeholder"
     [[nodes]] entry (configTree.py). Declares the same arity-1
     input/output shape MemoryOp and the static-path read ops use, so
@@ -719,16 +719,33 @@ class PlaceholderOp( TableOp ):
     interface immediately. __call__ always raises: a placeholder is never
     meant to actually run -- replace self.tableOps[node_idn] with a real
     TableOp/Cell before this node is reached on a live execution path.
+
+    The declared interface is a bdd.Expr -- pass it directly via `expr`
+    (may reference ColVar, e.g. a config-map placeholder parsed by
+    exprParse.py), or pass `columns` for the common fully-literal case
+    (builds `Union(*[Atom(n,t) for n,t in columns.items()])` internally).
+    Exactly one of expr/columns must be given.
     """
     def __init__(
         self: Self,
-        columns: dict[ str, pl.DataType ],
+        expr: bdd.Expr | None = None,
+        columns: dict[ str, pl.DataType ] | None = None,
         rng: np.random.Generator | None = None,
         ) -> None:
+        if ( expr is None ) == ( columns is None ):
+            raise ValueError( 'PlaceholderOp requires exactly one of expr or columns' )
+        if columns is not None:
+            expr = bdd.Union( *( bdd.Atom( n, t ) for n, t in columns.items() ) )
+        self.expr = expr
+        # input tolerates extra columns beyond the declared interface (a
+        # fresh anonymous ColVar, same 'open' behavior the old columns-only
+        # constructor had) -- independent of whether expr itself already
+        # references its own ColVars.
+        _extra = bdd.ColVar( f'_placeholder_extra_{uuid4().hex}' )
         super().__init__(
             rng = rng,
-            input  = [ InputSchema.from_columns( columns, extra = 'open' ) ],
-            output = [ OutputSchema.from_columns( columns ) ],
+            input  = [ InputSchema( expr = bdd.Union( expr, _extra ) ) ],
+            output = [ OutputSchema( expr = expr ) ],
         )
     #/def __init__
 
