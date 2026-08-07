@@ -44,6 +44,23 @@ via the binary `or`/`and` primitives). Difference is strictly binary
 are ambiguous and must be nested explicitly (`Difference(Difference(A,B),
 C)` for `A - B - C`).
 
+DTYPE-CARRYING ATOMS
+
+Atom(name, dtype) carries a pl.DataType -- there is no bare-string
+shorthand for an atom anymore (there's no dtype to give it), so
+Union/Intersect/Difference/Cond only accept Expr instances, never a
+naked str. ColVar is unchanged (it denotes a whole *list* of columns, not
+one typed value -- dtype doesn't apply until it's resolved down to
+concrete atoms). BDDManager keeps a name -> pl.DataType registry,
+populated the first time an atom with that name is compiled; declaring
+the same name with a *different* dtype anywhere in the same manager
+raises ValueError -- dtype is metadata keyed by name, not part of the
+variable's boolean identity (two Atom('a', Int64) uses must agree; they
+don't become "different variables" the way the atom/var namespaces do).
+manager.dtype(name) looks it up. resolve_to_typed_columns() is the
+dtype-aware sibling of resolve_to_columns() below, for once you actually
+want a real dict[str, pl.DataType] back out, not just names.
+
 EXTRACTING A CONCRETE COLUMN SET
 
 Once every ColVar in an expression has been bound away (no 'var'-namespace
@@ -56,13 +73,14 @@ restrict the formula to `x_a = 1` and every *other* atom variable to `0`
 and check whether the result is the TRUE terminal. If so, `a` is a member
 of the resolved set.
 
-Worked example: `Difference(Union('a', 'b'), 'a')` compiles to
-`(x_a OR x_b) AND NOT x_a`.
+Worked example (atoms written as bare names here for readability -- real
+code writes Atom('a', dtype)): `Difference(Union('a', 'b'), 'a')`
+compiles to `(x_a OR x_b) AND NOT x_a`.
   - test point 'a' (x_a=1, x_b=0): (1 OR 0) AND NOT 1 = 0 -> 'a' NOT in result
   - test point 'b' (x_a=0, x_b=1): (0 OR 1) AND NOT 0 = 1 -> 'b' IS in result
   -> resolved set is {'b'}, matching plain set-difference semantics.
 
-See resolve_to_columns().
+See resolve_to_columns()/resolve_to_typed_columns().
 
 PREDICATES
 
@@ -143,6 +161,63 @@ carries the var_name it defines -- the same multi-tree-in-one-DataFrame
 trick parameterParse.py already uses for multiple ops' parameter trees.
 See bindings_to_polars()/polars_to_bindings().
 
+RESOLUTION -- DECOMPILING A BDDNODE BACK TO EXPR
+
+tableOps.ResolveExpressionOp resolves a table-processes signature map
+(each child actor's declared inputs/outputs, as expressions -- see
+signatures_to_polars() below) against a bindings map, substituting every
+ColVar the bindings cover and leaving the rest untouched -- "resolve as
+much as possible," not "require full grounding." ColVar scope is GLOBAL:
+one shared symbol table across the whole map, not qualified per actor, so
+the same ColVar('C') referenced by two different actors' signatures is
+the same variable and one binding resolves it everywhere. Every atom
+carries its own dtype (see "DTYPE-CARRYING ATOMS" above), so once a
+signature is fully grounded, resolve_to_typed_columns() can turn it
+directly into a real dict[str, pl.DataType] -- no separate dtype-lookup
+step needed.
+
+Composing a binding into a signature's BDDNode is easy (compose(), see
+above) -- the hard direction is turning the *result* back into an Expr
+tree for re-serialization, since resolve_to_columns() only works once
+everything is fully grounded, but partial resolution must still produce
+valid output. decompile() does this via the standard Shannon-expansion
+identity, rewritten to use only Union/Intersect/Difference (no raw
+negation exposed): for a node (var=v, low=L, high=H),
+    ite(x_v, H, L) = (x_v AND H) OR (L AND NOT x_v) = (x_v INTERSECT H) UNION (L DIFFERENCE x_v)
+i.e. `Union(Intersect(leaf(v), decompile(H)), Difference(decompile(L), leaf(v)))`.
+decompile(FALSE) = Union() (empty union, our existing empty-set
+convention).
+
+TRUE needs care, and it can genuinely appear on EITHER a HIGH or a LOW
+cofactor -- there is no invariant that rules LOW out (an earlier version
+of this docstring claimed one; it was wrong -- a HIGH decision taken
+higher up the tree, e.g. some other variable pinned to 1, can make a
+*later* variable's LOW branch collapse to TRUE too, not just its own
+leaf's HIGH). On a HIGH cofactor this is routine and harmless -- every
+bare Atom/ColVar leaf's own high branch is TRUE by construction ("once
+this one variable is 1, the formula is unconditionally satisfied") --
+decompile() special-cases it directly (Intersect(leaf, "everything") is
+just leaf, no recursion into decompile(TRUE) needed). On a LOW cofactor
+it is NOT handleable: it means "everything (from here down) satisfies the
+formula regardless of every remaining variable," which requires the
+complement/universal-set notion this module deliberately has no way to
+express. This is a real, reachable failure mode, not just a defensive
+check -- e.g. resolving Difference(Union(ColVar('C'), 'a', 'b'),
+Intersect('a', ColVar('D'))) hits it: at a=0 the subtracted term
+Intersect('a', ColVar('D')) is false regardless of ColVar('D'), so the
+difference is unconditionally true there, regardless of D -- decompile()
+raises ValueError rather than guessing. Caveat: decompile() does not
+preserve BDD DAG sharing -- the output tree can be larger than the input
+DAG in pathological cases; fine at table-schema scale.
+
+Resolving one signature in isolation isn't enough, since a binding can
+itself reference *other* ColVars ("involve other variable expressions") --
+close_bindings() first closes the whole bindings dict against itself
+(topologically ordered by dependency, composing each binding's own
+referenced bindings into it before it becomes available to later ones),
+raising ValueError on a genuine cycle, before resolve_signatures() applies
+the closed bindings to every signature and decompiles the result.
+
 SCOPE
 
 There is no dynamic variable reordering, and BDDManager does not validate
@@ -151,18 +226,14 @@ mixing nodes across managers silently produces meaningless results, since
 variable indices are manager-relative. Acceptable at the expected scale
 (variable count = number of distinct column/ColVar names a schema ever
 references, not a SAT-scale problem); revisit if that stops being true.
-
-NOT YET IMPLEMENTED
-
-The TableOp that actually resolves an expression forest against a
-bindings forest (tableOps.ResolveExpressionOp) is a stub -- see its
-docstring for the intended eventual shape.
 """
 
 import polars as pl
 
 from dataclasses import dataclass
 from typing import Self, Sequence
+
+from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
 
 # -- BDD core
 
@@ -228,6 +299,9 @@ class BDDManager:
         self._var_names: list[ tuple[ str, str ] ]       = []
         self._unique:    dict[ tuple[ int, int, int ], BDDNode ] = {}
         self._ite_cache: dict[ tuple[ int, int, int ], BDDNode ] = {}
+        # name -> dtype, populated the first time an atom with that name
+        # is compiled -- see module docstring's "DTYPE-CARRYING ATOMS".
+        self._dtypes: dict[ str, pl.DataType ] = {}
     #/def __init__
 
     # -- variable registration
@@ -247,6 +321,22 @@ class BDDManager:
         return self._var_names[ var_idx ]
     #/def var_name
 
+    def dtype( self: Self, name: str ) -> pl.DataType:
+        """The registered dtype for an atom name -- see module docstring's 'DTYPE-CARRYING ATOMS'."""
+        return self._dtypes[ name ]
+    #/def dtype
+
+    def _register_dtype( self: Self, name: str, dtype: pl.DataType ) -> None:
+        existing = self._dtypes.get( name )
+        if existing is None:
+            self._dtypes[ name ] = dtype
+        elif existing != dtype:
+            raise ValueError(
+                f'Atom {name!r} already registered with dtype {existing!r}, '
+                f'got conflicting dtype {dtype!r}'
+            )
+    #/def _register_dtype
+
     # -- canonical construction
 
     def _mk( self: Self, var_idx: int, low: BDDNode, high: BDDNode ) -> BDDNode:
@@ -260,8 +350,9 @@ class BDDManager:
         return node
     #/def _mk
 
-    def atom( self: Self, name: str ) -> BDDNode:
-        """A literal, already-resolved single column -- see the 'atom' namespace."""
+    def atom( self: Self, name: str, dtype: pl.DataType ) -> BDDNode:
+        """A literal, already-resolved single column -- see the 'atom' namespace. Raises ValueError if `name` was already registered with a different dtype."""
+        self._register_dtype( name, dtype )
         idx = self._var_index( 'atom', name )
         return self._mk( idx, FALSE, TRUE )
     #/def atom
@@ -429,6 +520,11 @@ class BDDManager:
         return frozenset( result )
     #/def resolve_to_columns
 
+    def resolve_to_typed_columns( self: Self, f: BDDNode ) -> dict[ str, pl.DataType ]:
+        """Dtype-aware sibling of resolve_to_columns() -- same rules, same ValueError on an unbound ColVar, but returns dtype per column via the manager's dtype registry."""
+        return { name: self.dtype( name ) for name in self.resolve_to_columns( f ) }
+    #/def resolve_to_typed_columns
+
     # -- predicates (see module docstring's "PREDICATES")
     #
     # NOTE ON CORRECTNESS: these cannot be plain "is difference(f,g)
@@ -526,25 +622,46 @@ class BDDManager:
 # -- Expression AST
 
 class Expr:
-    """Base class for the set-expression AST -- every leaf/op knows how to compile itself to a canonical BDDNode via a BDDManager."""
+    """
+    Base class for the set-expression AST -- every leaf/op knows how to
+    compile itself to a canonical BDDNode via a BDDManager, and how to
+    serialize to/from a plain dict (see expr_from_dict() below for the
+    dict -> Expr direction). No bare-string shorthand anywhere in this
+    AST -- see Atom's docstring for why.
+    """
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         raise NotImplementedError
     #/def to_bdd
-#/class Expr
 
-def _coerce( x: 'Expr | str' ) -> Expr:
-    """Bare str args auto-wrap as Atom -- atoms only; ColVar is always explicit (never coerced from a string)."""
-    return Atom( x ) if isinstance( x, str ) else x
-#/def _coerce
+    def to_dict( self: Self ) -> dict:
+        raise NotImplementedError
+    #/def to_dict
+#/class Expr
 
 @dataclass( frozen = True )
 class Atom( Expr ):
-    """A single, already-resolved literal column name."""
-    name: str
+    """
+    A single, already-resolved literal column, carrying its pl.DataType --
+    see module docstring's 'DTYPE-CARRYING ATOMS'. No bare-string
+    shorthand: unlike the pre-dtype version of this module, there's no
+    dtype to give a naked str, so every atom is written explicitly as
+    Atom(name, dtype).
+    """
+    name:  str
+    dtype: pl.DataType
 
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
-        return manager.atom( self.name )
+        return manager.atom( self.name, self.dtype )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return { 'kind': 'atom', 'name': self.name, 'dtype': dtype_to_str( self.dtype ) }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( d[ 'name' ], str_to_dtype( d[ 'dtype' ] ) )
+    #/def from_dict
 #/class Atom
 
 @dataclass( frozen = True )
@@ -561,50 +678,81 @@ class ColVar( Expr ):
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         return manager.colvar( self.name )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return { 'kind': 'colvar', 'name': self.name }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( d[ 'name' ] )
+    #/def from_dict
 #/class ColVar
 
 @dataclass( frozen = True )
 class Union( Expr ):
-    """N-ary, associative + commutative union of its args (bare str args auto-coerce to Atom)."""
+    """N-ary, associative + commutative union of its args."""
     args: tuple[ Expr, ... ]
 
-    def __init__( self: Self, *args: 'Expr | str' ) -> None:
-        object.__setattr__( self, 'args', tuple( _coerce( a ) for a in args ) )
+    def __init__( self: Self, *args: Expr ) -> None:
+        object.__setattr__( self, 'args', tuple( args ) )
     #/def __init__
 
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         return manager.union( *( a.to_bdd( manager ) for a in self.args ) )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return { 'kind': 'union', 'args': [ a.to_dict() for a in self.args ] }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( *( expr_from_dict( a ) for a in d[ 'args' ] ) )
+    #/def from_dict
 #/class Union
 
 @dataclass( frozen = True )
 class Intersect( Expr ):
-    """N-ary, associative + commutative intersection of its args (bare str args auto-coerce to Atom)."""
+    """N-ary, associative + commutative intersection of its args."""
     args: tuple[ Expr, ... ]
 
-    def __init__( self: Self, *args: 'Expr | str' ) -> None:
-        object.__setattr__( self, 'args', tuple( _coerce( a ) for a in args ) )
+    def __init__( self: Self, *args: Expr ) -> None:
+        object.__setattr__( self, 'args', tuple( args ) )
     #/def __init__
 
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         return manager.intersect( *( a.to_bdd( manager ) for a in self.args ) )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return { 'kind': 'intersect', 'args': [ a.to_dict() for a in self.args ] }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( *( expr_from_dict( a ) for a in d[ 'args' ] ) )
+    #/def from_dict
 #/class Intersect
 
 @dataclass( frozen = True )
 class Difference( Expr ):
-    """Strictly binary: left - right (order matters -- see module docstring's 'BINARY VS N-ARY'). Bare str args auto-coerce to Atom."""
+    """Strictly binary: left - right (order matters -- see module docstring's 'BINARY VS N-ARY')."""
     left:  Expr
     right: Expr
-
-    def __init__( self: Self, left: 'Expr | str', right: 'Expr | str' ) -> None:
-        object.__setattr__( self, 'left', _coerce( left ) )
-        object.__setattr__( self, 'right', _coerce( right ) )
-    #/def __init__
 
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         return manager.difference( self.left.to_bdd( manager ), self.right.to_bdd( manager ) )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return { 'kind': 'difference', 'left': self.left.to_dict(), 'right': self.right.to_dict() }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( expr_from_dict( d[ 'left' ] ), expr_from_dict( d[ 'right' ] ) )
+    #/def from_dict
 #/class Difference
 
 @dataclass( frozen = True )
@@ -614,18 +762,11 @@ class Cond( Expr ):
     letting a generated schema branch on a flag (typically a ColVar later
     bound to TRUE/FALSE via compose()). No Not/NotFlag exists to negate
     `flag` -- swap then_/else_ instead (exactly equivalent for a binary
-    conditional); see module docstring's "COND / FLAGS". Bare str args
-    auto-coerce to Atom.
+    conditional); see module docstring's "COND / FLAGS".
     """
     flag:  Expr
     then_: Expr
     else_: Expr
-
-    def __init__( self: Self, flag: 'Expr | str', then_: 'Expr | str', else_: 'Expr | str' ) -> None:
-        object.__setattr__( self, 'flag', _coerce( flag ) )
-        object.__setattr__( self, 'then_', _coerce( then_ ) )
-        object.__setattr__( self, 'else_', _coerce( else_ ) )
-    #/def __init__
 
     def to_bdd( self: Self, manager: BDDManager ) -> BDDNode:
         return manager.ite(
@@ -634,7 +775,187 @@ class Cond( Expr ):
             self.else_.to_bdd( manager ),
         )
     #/def to_bdd
+
+    def to_dict( self: Self ) -> dict:
+        return {
+            'kind':  'cond',
+            'flag':  self.flag.to_dict(),
+            'then_': self.then_.to_dict(),
+            'else_': self.else_.to_dict(),
+        }
+    #/def to_dict
+
+    @classmethod
+    def from_dict( cls: type, d: dict ) -> Self:
+        return cls( expr_from_dict( d[ 'flag' ] ), expr_from_dict( d[ 'then_' ] ), expr_from_dict( d[ 'else_' ] ) )
+    #/def from_dict
 #/class Cond
+
+_EXPR_CLASSES: dict[ str, type ] = {
+    'atom':       Atom,
+    'colvar':     ColVar,
+    'union':      Union,
+    'intersect':  Intersect,
+    'difference': Difference,
+    'cond':       Cond,
+}
+
+def expr_from_dict( d: dict ) -> Expr:
+    """Reconstruct an Expr from a dict produced by any Expr subclass's to_dict()."""
+    return _EXPR_CLASSES[ d[ 'kind' ] ].from_dict( d )
+#/def expr_from_dict
+
+def colvar_names( expr: Expr ) -> set[ str ]:
+    """
+    Every ColVar name expr references, transitively -- a plain Expr-tree
+    walk, no BDDManager/compilation involved (this is pure AST
+    inspection, used e.g. to recover InputSchema/OutputSchema's old
+    extra/passthrough_from semantics from ColVar presence/sharing alone).
+    """
+    if isinstance( expr, ColVar ):
+        return { expr.name }
+    if isinstance( expr, Atom ):
+        return set()
+    if isinstance( expr, ( Union, Intersect ) ):
+        return set().union( *( colvar_names( a ) for a in expr.args ) ) if expr.args else set()
+    if isinstance( expr, Difference ):
+        return colvar_names( expr.left ) | colvar_names( expr.right )
+    if isinstance( expr, Cond ):
+        return colvar_names( expr.flag ) | colvar_names( expr.then_ ) | colvar_names( expr.else_ )
+    raise TypeError( f'Unrecognized Expr subtype: {type(expr)!r}' )
+#/def colvar_names
+
+
+# -- Decompiling a BDDNode back to Expr (see module docstring's "RESOLUTION")
+
+def _leaf_expr( manager: BDDManager, var_idx: int ) -> Expr:
+    namespace, name = manager.var_name( var_idx )
+    return ColVar( name ) if namespace == 'var' else Atom( name, manager.dtype( name ) )
+#/def _leaf_expr
+
+def decompile( manager: BDDManager, node: BDDNode ) -> Expr:
+    """
+    Reconstruct an Expr tree denoting the same set as `node` -- not
+    necessarily the same syntax that produced it (canonical BDDs don't
+    remember that), just an equivalent one. See module docstring's
+    "RESOLUTION" for the algorithm and for when this can genuinely fail.
+
+    TRUE can legitimately appear on a HIGH cofactor (every bare Atom/
+    ColVar leaf's high branch, routinely -- "once this one variable is 1,
+    the rest doesn't matter") and that's handled directly: Intersect(leaf,
+    "everything") is just leaf. TRUE on a LOW cofactor is different and
+    NOT handleable: it means, at this point in the decomposition,
+    "everything (from here down) satisfies the formula regardless of
+    every remaining variable" -- expressing that requires the complement/
+    universal-set notion this module deliberately has no way to write
+    (same reason raw Not/complement was excluded from the AST). This is a
+    real, reachable case for some Difference-with-ColVar combinations
+    (e.g. resolving can produce a sub-formula like NOT(a AND ColVar('D'))
+    -- at a=0 that's unconditionally true, regardless of what ColVar('D')
+    ever binds to) -- decompile raises ValueError rather than guessing.
+    """
+    if node is FALSE:
+        return Union()
+    if node is TRUE:
+        raise ValueError(
+            'decompile() cannot express this result without the universal-set/'
+            'complement notion this module deliberately excludes -- the resolved '
+            'expression, at this point, is true regardless of every remaining '
+            'variable, which has no Union/Intersect/Difference/Atom/ColVar '
+            'representation; see module docstring\'s "RESOLUTION"'
+        )
+
+    leaf = _leaf_expr( manager, node.var )
+    # node.high is TRUE routinely (e.g. every bare leaf's high branch) --
+    # Intersect(leaf, "everything") is just leaf, so simplify directly
+    # rather than recursing into decompile(TRUE).
+    high_part = leaf if node.high is TRUE else Intersect( leaf, decompile( manager, node.high ) )
+    low_part  = Difference( decompile( manager, node.low ), leaf )
+    return Union( high_part, low_part )
+#/def decompile
+
+
+# -- Resolution: closing bindings against each other, then applying them
+
+def _topological_order( deps: dict[ str, set[ str ] ] ) -> list[ str ]:
+    """Kahn's algorithm. Raises ValueError naming the cycle if `deps` isn't a DAG."""
+    remaining = { name: set( d ) for name, d in deps.items() }
+    order: list[ str ] = []
+
+    while remaining:
+        ready = sorted( name for name, d in remaining.items() if not d )
+        if not ready:
+            raise ValueError(
+                'Cyclic ColVar bindings: {}'.format( ', '.join( sorted( remaining ) ) )
+            )
+        for name in ready:
+            del remaining[ name ]
+        for d in remaining.values():
+            d.difference_update( ready )
+        order.extend( ready )
+
+    return order
+#/def _topological_order
+
+def close_bindings( manager: BDDManager, bindings: dict[ str, Expr ] ) -> dict[ str, BDDNode ]:
+    """
+    Fully substitute each binding's own ColVar references against the
+    *other* bindings (transitively, dependency-ordered), so every closed
+    binding is ready to compose directly into anything else. A ColVar a
+    binding references that is NOT itself a key of `bindings` is left
+    free (not an error) -- an intentionally still-symbolic binding.
+    Raises ValueError on a cyclic binding graph (see _topological_order).
+    """
+    compiled = { name: expr.to_bdd( manager ) for name, expr in bindings.items() }
+    deps = {
+        name: {
+            manager.var_name( i )[ 1 ]
+            for i in manager.support( node )
+            if manager.var_name( i )[ 0 ] == 'var'
+            and manager.var_name( i )[ 1 ] in bindings
+            and manager.var_name( i )[ 1 ] != name
+        }
+        for name, node in compiled.items()
+    }
+    order = _topological_order( deps )
+
+    closed: dict[ str, BDDNode ] = {}
+    for name in order:
+        node = compiled[ name ]
+        for dep_name in deps[ name ]:
+            dep_idx = manager._var_index( 'var', dep_name )
+            node = manager.compose( node, dep_idx, closed[ dep_name ] )
+        closed[ name ] = node
+    return closed
+#/def close_bindings
+
+def apply_bindings( manager: BDDManager, node: BDDNode, closed: dict[ str, BDDNode ] ) -> BDDNode:
+    """Compose every already-closed binding into `node` -- order doesn't matter once bindings are closed against each other."""
+    for name, bound_node in closed.items():
+        idx = manager._var_index( 'var', name )
+        node = manager.compose( node, idx, bound_node )
+    return node
+#/def apply_bindings
+
+def resolve_signatures(
+    manager:    BDDManager,
+    signatures: dict,
+    bindings:   dict[ str, Expr ],
+    ) -> dict:
+    """
+    Resolve every signature expression against `bindings`, substituting
+    as many ColVars as possible (transitively, through other bindings).
+    ColVars bindings doesn't cover remain in the result -- not an error,
+    per "resolve as much as possible." Generic over the signature dict's
+    key type (e.g. the (op_idn, direction, index) triples
+    signatures_to_polars uses).
+    """
+    closed = close_bindings( manager, bindings )
+    return {
+        key: decompile( manager, apply_bindings( manager, expr.to_bdd( manager ), closed ) )
+        for key, expr in signatures.items()
+    }
+#/def resolve_signatures
 
 
 # -- Forest serialization
@@ -648,11 +969,20 @@ _EXPR_TREE_COLS: dict[ str, pl.DataType ] = {
     'parent_idx': pl.UInt32,
     'kind':       pl.Utf8,   # 'union' | 'intersect' | 'difference' | 'cond' | 'colvar' | 'atom'
     'name':       pl.Utf8,   # non-null only on 'colvar'/'atom' leaves
+    'dtype':      pl.Utf8,   # non-null only on 'atom' leaves -- dtype_to_str-encoded, see module docstring's 'DTYPE-CARRYING ATOMS'
     'branch':     pl.UInt8,  # non-null only on a 'difference' node's children (0=left/1=right) or a 'cond' node's children (0=flag/1=then_/2=else_)
 }
 
 _BINDINGS_TREE_COLS: dict[ str, pl.DataType ] = _EXPR_TREE_COLS | {
     'var_name': pl.Utf8,  # non-null only on root rows -- which ColVar this subtree defines
+}
+
+_SIGNATURE_TREE_COLS: dict[ str, pl.DataType ] = _EXPR_TREE_COLS | {
+    # non-null only on root rows -- which actor-signature slot this subtree
+    # defines. Mirrors schema.py's __table_op_schema__ identifier columns.
+    'op_idn':    pl.Utf8,
+    'direction': pl.Utf8,  # 'input' | 'output'
+    'index':     pl.UInt32,
 }
 
 def _expr_rows(
@@ -667,23 +997,23 @@ def _expr_rows(
     next_idx  = node_idx_start + 1
 
     if isinstance( expr, Atom ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'atom', 'name': expr.name, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'atom', 'name': expr.name, 'dtype': dtype_to_str( expr.dtype ), 'branch': branch } )
     elif isinstance( expr, ColVar ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'colvar', 'name': expr.name, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'colvar', 'name': expr.name, 'dtype': None, 'branch': branch } )
     elif isinstance( expr, Union ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'union', 'name': None, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'union', 'name': None, 'dtype': None, 'branch': branch } )
         for child in expr.args:
             next_idx = _expr_rows( child, next_idx, node_idx, None, rows )
     elif isinstance( expr, Intersect ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'intersect', 'name': None, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'intersect', 'name': None, 'dtype': None, 'branch': branch } )
         for child in expr.args:
             next_idx = _expr_rows( child, next_idx, node_idx, None, rows )
     elif isinstance( expr, Difference ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'difference', 'name': None, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'difference', 'name': None, 'dtype': None, 'branch': branch } )
         next_idx = _expr_rows( expr.left, next_idx, node_idx, 0, rows )
         next_idx = _expr_rows( expr.right, next_idx, node_idx, 1, rows )
     elif isinstance( expr, Cond ):
-        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'cond', 'name': None, 'branch': branch } )
+        rows.append( { 'node_idx': node_idx, 'parent_idx': parent_idx, 'kind': 'cond', 'name': None, 'dtype': None, 'branch': branch } )
         next_idx = _expr_rows( expr.flag, next_idx, node_idx, 0, rows )
         next_idx = _expr_rows( expr.then_, next_idx, node_idx, 1, rows )
         next_idx = _expr_rows( expr.else_, next_idx, node_idx, 2, rows )
@@ -705,7 +1035,7 @@ def _expr_from_row( df: pl.DataFrame, node_idx: int ) -> Expr:
     kind = row[ 'kind' ]
 
     if kind == 'atom':
-        return Atom( row[ 'name' ] )
+        return Atom( row[ 'name' ], str_to_dtype( row[ 'dtype' ] ) )
     if kind == 'colvar':
         return ColVar( row[ 'name' ] )
 
@@ -772,10 +1102,55 @@ def bindings_to_polars(
 #/def bindings_to_polars
 
 def polars_to_bindings( df: pl.DataFrame ) -> dict[ str, Expr ]:
-    """Reconstruct a var_name -> expression dict from a bindings_to_polars() forest."""
+    """Reconstruct a var_name -> expression dict from a bindings_to_polars() forest. Raises ValueError on a duplicate root var_name (silently picking a winner would hide a real data bug)."""
     roots = df.filter( pl.col( 'parent_idx' ).is_null() )
+    var_names = roots[ 'var_name' ].to_list()
+    dupes = { name for name in var_names if var_names.count( name ) > 1 }
+    if dupes:
+        raise ValueError( f'Duplicate var_name root(s) in bindings forest: {sorted(dupes)}' )
     return {
         row[ 'var_name' ]: _expr_from_row( df, row[ 'node_idx' ] )
         for row in roots.to_dicts()
     }
 #/def polars_to_bindings
+
+def signatures_to_polars(
+    signatures:     dict[ tuple[ str, str, int ], Expr ],
+    node_idx_start: int = 0,
+    ) -> tuple[ pl.DataFrame, int ]:
+    """
+    Serialize an (op_idn, direction, index) -> expression signature dict
+    (a Cell's table-processes map) as one shared, multi-root forest --
+    sibling of bindings_to_polars, tagged by the compound key instead of a
+    single var_name. Returns (forest, next_node_idx).
+    """
+    rows: list[ dict ] = []
+    next_idx = node_idx_start
+    root_key: dict[ int, tuple[ str, str, int ] ] = {}
+
+    for key, expr in signatures.items():
+        root_idx = next_idx
+        next_idx = _expr_rows( expr, next_idx, None, None, rows )
+        root_key[ root_idx ] = key
+
+    for row in rows:
+        key = root_key.get( row[ 'node_idx' ] )
+        row[ 'op_idn' ]    = key[ 0 ] if key is not None else None
+        row[ 'direction' ] = key[ 1 ] if key is not None else None
+        row[ 'index' ]     = key[ 2 ] if key is not None else None
+
+    return pl.DataFrame( rows, schema = _SIGNATURE_TREE_COLS ), next_idx
+#/def signatures_to_polars
+
+def polars_to_signatures( df: pl.DataFrame ) -> dict[ tuple[ str, str, int ], Expr ]:
+    """Reconstruct an (op_idn, direction, index) -> expression dict from a signatures_to_polars() forest. Raises ValueError on a duplicate root key."""
+    roots = df.filter( pl.col( 'parent_idx' ).is_null() )
+    keys = [ ( r[ 'op_idn' ], r[ 'direction' ], r[ 'index' ] ) for r in roots.to_dicts() ]
+    dupes = { k for k in keys if keys.count( k ) > 1 }
+    if dupes:
+        raise ValueError( f'Duplicate (op_idn, direction, index) root(s) in signature forest: {sorted(dupes)}' )
+    return {
+        ( row[ 'op_idn' ], row[ 'direction' ], row[ 'index' ] ): _expr_from_row( df, row[ 'node_idx' ] )
+        for row in roots.to_dicts()
+    }
+#/def polars_to_signatures

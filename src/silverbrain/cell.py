@@ -315,6 +315,12 @@ class Cell:
             # __tables_schema__ bootstraps itself — its own schema is one of the rows
             '__tables_schema__':         table_schemas_to_df( _SYSTEM_SCHEMAS ),
         }
+        # __table_op_schema__ is now bdd's (op_idn, direction, index)-rooted
+        # expression forest -- node_idx must stay globally unique across
+        # every register_tableOps() call this Cell instance ever makes, so
+        # the counter lives here, not reset per call (same threading
+        # convention as configTree.py/ParameterParser.to_polars()).
+        self._next_schema_node_idx: int = 0
 
         if ops:
             self.register_tableOps( ops )
@@ -429,18 +435,18 @@ class Cell:
             _has_schema  = getattr( op, 'input', None ) is not None or getattr( op, 'output',  None ) is not None
             _has_effects = getattr( op, 'effects', None ) is not None
             if _has_schema:
-                _schema_df, _effects_df = TableOpSchema(
+                _schema_df, _effects_df, self._next_schema_node_idx = TableOpSchema(
                     inputs  = op.input  or [],
                     outputs = op.output or [],
                     effects = getattr( op, 'effects', None ) or [],
-                ).to_polars( op_id )
+                ).to_polars( op_id, node_idx_start = self._next_schema_node_idx )
                 _schema_rows.append( _schema_df )
                 if not _effects_df.is_empty():
                     _effects_rows.append( _effects_df )
             elif _has_effects and op.effects:
-                _, _effects_df = TableOpSchema(
+                _, _effects_df, self._next_schema_node_idx = TableOpSchema(
                     inputs = [], outputs = [], effects = op.effects,
-                ).to_polars( op_id )
+                ).to_polars( op_id, node_idx_start = self._next_schema_node_idx )
                 _effects_rows.append( _effects_df )
             #/if _has_schema/elif _has_effects and op.effects
         #/for op_id, op in ops.items()

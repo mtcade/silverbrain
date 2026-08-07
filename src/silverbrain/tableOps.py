@@ -8,7 +8,7 @@
     Atomic operations on tuples of tables. Most are memoryless, though some hold tables in memory. Backend-specific ops (parquet/sqlite/postgres readers and writers) live in silverflow, not here -- this module only holds the backend-agnostic core.
 """
 
-from . import types
+from . import bdd, types
 from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
 from .schema import Effect, InputSchema, OutputSchema, TableOpSchema
 
@@ -17,7 +17,23 @@ import numpy as np
 
 from abc import ABC, abstractmethod
 from typing import Self, Type
+from uuid import uuid4
 import threading
+
+def _open_passthrough_schema() -> tuple[ list[ InputSchema ], list[ OutputSchema ] ]:
+    """
+    input[0] accepts any columns; output[0] is exactly what input[0]
+    received, unchanged -- a fresh ColVar per call (not a shared literal
+    name) so unrelated op instances never accidentally share identity once
+    compiled through the same BDDManager (ColVar scope is global -- see
+    bdd.py's module docstring).
+    """
+    rest = bdd.ColVar( f'_passthrough_{uuid4().hex}' )
+    return (
+        [ InputSchema( expr = bdd.Union( rest ) ) ],
+        [ OutputSchema( expr = bdd.Union( rest ) ) ],
+    )
+#/def _open_passthrough_schema
 
 # -- TableOp functions
 
@@ -391,8 +407,8 @@ class FilterOp( TableOp ):
         ) -> None:
         super().__init__(
             rng = rng,
-            input   = input   if input   is not None else [ InputSchema( extra = 'open' ) ],
-            output  = output  if output  is not None else [ OutputSchema( passthrough_from = [ 0 ] ) ],
+            input   = input   if input   is not None else _open_passthrough_schema()[ 0 ],
+            output  = output  if output  is not None else _open_passthrough_schema()[ 1 ],
             effects = effects if effects is not None else [],
         )
         self.filter_expr = filter_expr
@@ -426,8 +442,8 @@ class HeadOp( TableOp ):
         ) -> None:
         super().__init__(
             rng = rng,
-            input   = input   if input   is not None else [ InputSchema( extra = 'open' ) ],
-            output  = output  if output  is not None else [ OutputSchema( passthrough_from = [ 0 ] ) ],
+            input   = input   if input   is not None else _open_passthrough_schema()[ 0 ],
+            output  = output  if output  is not None else _open_passthrough_schema()[ 1 ],
             effects = effects if effects is not None else [],
         )
         self.count = count
@@ -461,8 +477,8 @@ class TailOp( TableOp ):
         ) -> None:
         super().__init__(
             rng = rng,
-            input   = input   if input   is not None else [ InputSchema( extra = 'open' ) ],
-            output  = output  if output  is not None else [ OutputSchema( passthrough_from = [ 0 ] ) ],
+            input   = input   if input   is not None else _open_passthrough_schema()[ 0 ],
+            output  = output  if output  is not None else _open_passthrough_schema()[ 1 ],
             effects = effects if effects is not None else [],
         )
         self.count = count
@@ -669,8 +685,8 @@ class MemoryOp( TableOp ):
         ) -> None:
         super().__init__(
             rng = rng,
-            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
+            input  = [ InputSchema.from_columns( columns, extra = 'open' ) ],
+            output = [ OutputSchema.from_columns( columns ) ],
         )
         self._table: pl.DataFrame | None = None
         self._lock = threading.Lock()
@@ -711,8 +727,8 @@ class PlaceholderOp( TableOp ):
         ) -> None:
         super().__init__(
             rng = rng,
-            input  = [ InputSchema( columns = columns, extra = 'open' ) ],
-            output = [ OutputSchema( columns = columns ) ],
+            input  = [ InputSchema.from_columns( columns, extra = 'open' ) ],
+            output = [ OutputSchema.from_columns( columns ) ],
         )
     #/def __init__
 
@@ -730,39 +746,55 @@ class PlaceholderOp( TableOp ):
     #/def __call__
 #/class PlaceholderOp
 
-# -- Expression Resolution Table Ops (interface not yet finalized)
+# -- Expression Resolution Table Ops
 
 class ResolveExpressionOp( TableOp ):
     """
-    UC: variable-binding expression resolution not yet implemented -- see
-    bdd.py for the underlying set-expression algebra (union/intersect/
-    difference over named atoms and free ColVar placeholders) this will
-    resolve against.
+    Resolves a Cell's table-processes signature map (each child actor's
+    declared inputs/outputs, written as bdd.Expr set-expressions --
+    bdd.signatures_to_polars schema) against a var_name-tagged bindings
+    forest (bdd.bindings_to_polars schema), substituting every ColVar the
+    bindings cover -- transitively, since a binding may itself reference
+    other ColVars -- and leaving the rest untouched. This is "resolve as
+    much as possible," not "require full grounding": a ColVar with no
+    matching binding stays a ColVar leaf in the output, it isn't an error.
+    ColVar scope is global across the whole call -- one BDDManager, so the
+    same ColVar name referenced by two different actors' signatures is the
+    same variable. See bdd.py's module docstring ("RESOLUTION") for the
+    algorithm (bdd.close_bindings/bdd.resolve_signatures) and why this
+    only ever resolves column *names* -- dtype attachment is a separate,
+    later step.
 
-    Intended eventual shape (undecided -- this stub commits to no
-    input/output schema): dfs[0] an expression forest (bdd.expr_to_polars
-    schema) possibly containing free ColVar leaves; dfs[1] a var_name-
-    tagged bindings forest (bdd.bindings_to_polars schema) defining what
-    each free ColVar resolves to. __call__ would transitively substitute
-    (bdd.BDDManager.compose) every bound variable and return the fully-
-    grounded expression forest.
+    dfs[0]: signature forest (bdd.signatures_to_polars schema)
+    dfs[1]: bindings forest (bdd.bindings_to_polars schema)
+    Returns the resolved signature forest (same schema as dfs[0]).
     """
     def __init__(
         self: Self,
         rng: np.random.Generator | None = None,
         ) -> None:
-        super().__init__( rng = rng )
+        super().__init__(
+            rng = rng,
+            input = [
+                InputSchema.from_columns( bdd._SIGNATURE_TREE_COLS ),
+                InputSchema.from_columns( bdd._BINDINGS_TREE_COLS ),
+            ],
+            output = [ OutputSchema.from_columns( bdd._SIGNATURE_TREE_COLS ) ],
+        )
     #/def __init__
 
     def __call__(
         self: Self,
-        dfs: tuple[ pl.DataFrame, ... ],
+        dfs: tuple[ pl.DataFrame, pl.DataFrame ],
         corr_id: tuple[ str, ... ] = (),
         verbose: int = 0,
         verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame, ... ]:
-        raise NotImplementedError(
-            'UC: expression-variable resolution not yet implemented'
-        )
+        ) -> tuple[ pl.DataFrame ]:
+        manager    = bdd.BDDManager()
+        signatures = bdd.polars_to_signatures( dfs[0] )
+        bindings   = bdd.polars_to_bindings( dfs[1] )
+        resolved   = bdd.resolve_signatures( manager, signatures, bindings )
+        out_df, _  = bdd.signatures_to_polars( resolved )
+        return ( out_df, )
     #/def __call__
 #/class ResolveExpressionOp

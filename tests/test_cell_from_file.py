@@ -16,6 +16,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from silverbrain.bdd import BDDManager
 from silverbrain.cell import Cell, cell_from_file
 from silverbrain.tableOps import PlaceholderOp
 from silverbrain.verify import verify_toml
@@ -220,8 +221,12 @@ columns  = { a = "Int64" }
     cell = cell_from_file( tmp_path / 'cell.toml', {}, main_id='root' )
     op   = cell.tableOps[ 'future' ]
     assert isinstance( op, PlaceholderOp )
-    assert op.input[ 0 ].columns == { 'a': pl.Int64 }
-    assert op.output[ 0 ].columns == { 'a': pl.Int64 }
+    m = BDDManager()
+    # input carries an extra='open' ColVar (see PlaceholderOp/tableOps.py),
+    # so it's not fully grounded -- check the declared atom's dtype directly.
+    op.input[ 0 ].expr.to_bdd( m )
+    assert m.dtype( 'a' ) == pl.Int64
+    assert m.resolve_to_typed_columns( op.output[ 0 ].expr.to_bdd( m ) ) == { 'a': pl.Int64 }
 
 
 def test_placeholder_node_raises_if_actually_called( tmp_path: Path ) -> None:

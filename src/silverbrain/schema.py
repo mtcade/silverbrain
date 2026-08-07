@@ -8,10 +8,12 @@
 from collections import UserDict
 from dataclasses import dataclass, field
 from typing import Literal, Self, Sequence
+from uuid import uuid4
 
 import polars as pl
 
-from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
+from . import bdd
+from .polarsDataTypeStrings import dtype_to_str
 
 cannonical_schema: dict[ str, pl.DataType ] = {
     'op_idn':           pl.Utf8,
@@ -22,13 +24,9 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # by whoever registers that node (see squishy-sleeping-snowflake.md).
     'cell_source':      pl.List( pl.Utf8 ),
     'cell_target':      pl.List( pl.Utf8 ),
-    # schemas df
-    'direction':        pl.Utf8,
-    'index':            pl.UInt32,
+    # __tables_schema__ (generic domain-table schema registry)
     'column_names':     pl.List( pl.Utf8 ),
     'column_types':     pl.List( pl.Utf8 ),
-    'extra':            pl.Utf8,
-    'passthrough_from': pl.List( pl.Int32 ),
     # paths
     'key':              pl.Utf8,
     'isfile':           pl.Boolean,
@@ -112,11 +110,13 @@ def table_schemas_to_df(
 #/table_schemas_to_df
 
 table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
-    '__table_op_schema__':  cannonical_schema_for_keys((
-        'op_idn', 'direction', 'index',
-        'column_names', 'column_types',
-        'extra', 'passthrough_from',
-    )),
+    # InputSchema/OutputSchema declare a bdd.Expr, not a flat column list --
+    # __table_op_schema__ is exactly bdd's (op_idn, direction, index)-rooted
+    # expression forest (bdd._SIGNATURE_TREE_COLS), not a cannonical_schema
+    # subset. extra/passthrough_from no longer exist as separate columns --
+    # see InputSchema/OutputSchema below for how those are recovered from
+    # ColVar presence/sharing instead.
+    '__table_op_schema__': bdd._SIGNATURE_TREE_COLS,
     '__table_op_effects__':  cannonical_schema_for_keys((
         'op_idn', 'effect_index', 'type',
         'path_input', 'path_column', 'output',
@@ -152,8 +152,6 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
 }
 
 # -- TableOpSchema
-
-Extra = Literal['forbidden', 'open', 'transparent']
 
 @dataclass
 class DiskWrite:
@@ -346,82 +344,87 @@ _EFFECT_CLASSES: dict[ str, type ] = {
 
 @dataclass
 class InputSchema():
-    columns: dict[ str, pl.DataType ] = field( default_factory = dict )
-    extra: Extra = 'open'
-    #
-    # 'forbidden'   : no extra columns allowed
-    # 'open'        : extra columns allowed, ignored
-    # 'transparent' : extra columns allowed, flow to output (see OutputSchema.passthrough_from)
-    #
-
-    def to_polars( self: Self, op_idn: str, index: int ) -> pl.DataFrame:
-        return pl.DataFrame(
-            {
-                'op_idn':           [ op_idn ],
-                'direction':        [ 'input' ],
-                'index':            [ index ],
-                'column_names':     [ list( self.columns.keys() ) ],
-                'column_types':     [
-                    [ dtype_to_str( t ) for t in self.columns.values() ]
-                ],
-                'extra':            [ self.extra ],
-                'passthrough_from': [ None ],
-            },
-            schema = table_schemas['__table_op_schema__'],
-        )
+    """
+    expr declares this input's set of columns -- literal Atoms, ColVars,
+    or any combination via Union/Intersect/Difference/Cond. The old
+    'forbidden'/'open'/'transparent' Extra enum is gone: those three
+    behaviors are now consequences of whether expr references a ColVar at
+    all (no ColVar == forbidden, extra columns disallowed) and, for
+    'transparent', whether that same ColVar is ALSO referenced by one of
+    the same TableOp's own outputs (see passthrough_inputs() below) --
+    nothing to declare separately. See from_columns() for the common
+    fully-literal case, expressed without hand-writing bdd.Expr directly.
+    """
+    expr: bdd.Expr
 
     def to_dict( self: Self ) -> dict:
-        return {
-            'columns': { col: dtype_to_str( t ) for col, t in self.columns.items() },
-            'extra': self.extra,
-        }
+        return { 'expr': self.expr.to_dict() }
 
     @classmethod
     def from_dict( cls, d: dict ) -> Self:
-        return cls(
-            columns = { col: str_to_dtype( s ) for col, s in d['columns'].items() },
-            extra = d['extra'],
-        )
+        return cls( expr = bdd.expr_from_dict( d['expr'] ) )
+
+    @classmethod
+    def from_columns(
+        cls,
+        columns: dict[ str, pl.DataType ],
+        extra: "Literal['forbidden', 'open'] | bdd.ColVar" = 'forbidden',
+        ) -> Self:
+        """
+        Build an InputSchema from a plain column dict, without hand-writing
+        bdd.Expr -- the ergonomic bridge for the common fully-literal case.
+        extra='forbidden' (default): no ColVar, nothing but `columns`
+        allowed. extra='open': an anonymous ColVar is added (extra columns
+        allowed, dropped -- nothing references this ColVar elsewhere, so
+        it can never become a passthrough). extra=<a bdd.ColVar instance>:
+        that ColVar is added instead of an anonymous one -- pass the same
+        ColVar into the corresponding OutputSchema.from_columns(...,
+        passthrough=...) call to declare it flows through.
+        """
+        atoms = [ bdd.Atom( name, dtype ) for name, dtype in columns.items() ]
+        if extra == 'forbidden':
+            return cls( expr = bdd.Union( *atoms ) )
+        if extra == 'open':
+            return cls( expr = bdd.Union( *atoms, bdd.ColVar( f'_extra_{uuid4().hex}' ) ) )
+        if isinstance( extra, bdd.ColVar ):
+            return cls( expr = bdd.Union( *atoms, extra ) )
+        raise ValueError( f"extra must be 'forbidden', 'open', or a ColVar instance, got {extra!r}" )
 #/class InputSchema
 
 @dataclass
 class OutputSchema():
-    columns: dict[ str, pl.DataType ] = field( default_factory = dict )
-    passthrough_from: list[ int ] = field( default_factory = list )
-    #
-    # passthrough_from: indices into TableOpSchema.inputs —
-    #   extra columns from each listed input appear here
-    # columns: columns explicitly constructed by this op (added on top of any passthrough)
-    #
-
-    def to_polars( self: Self, op_idn: str, index: int ) -> pl.DataFrame:
-        return pl.DataFrame(
-            {
-                'op_idn':           [ op_idn ],
-                'direction':        [ 'output' ],
-                'index':            [ index ],
-                'column_names':     [ list( self.columns.keys() ) ],
-                'column_types':     [
-                    [ dtype_to_str( t ) for t in self.columns.values() ]
-                ],
-                'extra':            [ None ],
-                'passthrough_from': [ self.passthrough_from ],
-            },
-            schema = table_schemas['__table_op_schema__'],
-        )
+    """
+    expr declares this output's set of columns, same as InputSchema.expr.
+    The old passthrough_from: list[int] is gone -- "which input's extras
+    flow to this output" is now derived by checking which ColVar names
+    this output's expr shares with each input's expr (passthrough_inputs()
+    below), not declared as an index list.
+    """
+    expr: bdd.Expr
 
     def to_dict( self: Self ) -> dict:
-        return {
-            'columns': { col: dtype_to_str( t ) for col, t in self.columns.items() },
-            'passthrough_from': self.passthrough_from,
-        }
+        return { 'expr': self.expr.to_dict() }
 
     @classmethod
     def from_dict( cls, d: dict ) -> Self:
-        return cls(
-            columns = { col: str_to_dtype( s ) for col, s in d['columns'].items() },
-            passthrough_from = d.get( 'passthrough_from', [] ),
-        )
+        return cls( expr = bdd.expr_from_dict( d['expr'] ) )
+
+    @classmethod
+    def from_columns(
+        cls,
+        columns: dict[ str, pl.DataType ],
+        passthrough: 'bdd.ColVar | None' = None,
+        ) -> Self:
+        """
+        Build an OutputSchema from a plain column dict. Pass the same
+        ColVar instance given to some InputSchema.from_columns(...,
+        extra=that_colvar) call to declare that input's extras flow
+        through to this output.
+        """
+        atoms = [ bdd.Atom( name, dtype ) for name, dtype in columns.items() ]
+        if passthrough is not None:
+            atoms = [ *atoms, passthrough ]
+        return cls( expr = bdd.Union( *atoms ) )
 #/class OutputSchema
 
 @dataclass
@@ -430,13 +433,13 @@ class TableOpSchema():
     outputs: list[ OutputSchema ]
     effects: list[ Effect ] = field( default_factory = list )
 
-    def to_polars_schema( self: Self, op_idn: str ) -> pl.DataFrame:
-        frames = [
-            inp.to_polars( op_idn, i ) for i, inp in enumerate( self.inputs )
-        ] + [
-            out.to_polars( op_idn, i ) for i, out in enumerate( self.outputs )
-        ]
-        return pl.concat( frames, how = 'vertical' )
+    def to_polars_schema( self: Self, op_idn: str, node_idx_start: int = 0 ) -> tuple[ pl.DataFrame, int ]:
+        signatures = {
+            ( op_idn, 'input', i ): inp.expr for i, inp in enumerate( self.inputs )
+        } | {
+            ( op_idn, 'output', i ): out.expr for i, out in enumerate( self.outputs )
+        }
+        return bdd.signatures_to_polars( signatures, node_idx_start = node_idx_start )
 
     def to_polars_effects( self: Self, op_idn: str ) -> pl.DataFrame:
         frames = [ eff.to_polars( op_idn, i ) for i, eff in enumerate( self.effects ) ]
@@ -445,8 +448,9 @@ class TableOpSchema():
             else pl.DataFrame( schema = table_schemas['__table_op_effects__'] )
         )
 
-    def to_polars( self: Self, op_idn: str ) -> tuple[ pl.DataFrame, pl.DataFrame ]:
-        return ( self.to_polars_schema( op_idn ), self.to_polars_effects( op_idn ) )
+    def to_polars( self: Self, op_idn: str, node_idx_start: int = 0 ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+        schema_df, next_idx = self.to_polars_schema( op_idn, node_idx_start )
+        return ( schema_df, self.to_polars_effects( op_idn ), next_idx )
 
     def to_dict( self: Self ) -> dict:
         return {
@@ -467,6 +471,21 @@ class TableOpSchema():
         )
 #/class TableOpSchema
 
+def passthrough_inputs( schema: TableOpSchema, output_index: int ) -> list[ int ]:
+    """
+    Which input indices' extra columns flow to schema.outputs[output_index]
+    -- an input and the given output "share a passthrough" iff their
+    expressions reference at least one common ColVar name. Replaces the
+    old OutputSchema.passthrough_from: list[int] -- computed on demand,
+    never stored, so it can't drift from the expressions themselves.
+    """
+    output_colvars = bdd.colvar_names( schema.outputs[ output_index ].expr )
+    return [
+        i for i, inp in enumerate( schema.inputs )
+        if bdd.colvar_names( inp.expr ) & output_colvars
+    ]
+#/def passthrough_inputs
+
 class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
     """A typed dict[str, TableOpSchema] mapping opId strings to their schemas."""
 
@@ -480,10 +499,12 @@ class TableOpSchemaDict( UserDict[ str, TableOpSchema ] ):
     def to_polars_schema( self: Self ) -> pl.DataFrame:
         if not self.data:
             return pl.DataFrame( schema = table_schemas['__table_op_schema__'] )
-        return pl.concat(
-            [ op.to_polars_schema( op_idn ) for op_idn, op in self.data.items() ],
-            how = 'vertical',
-        )
+        signatures = {}
+        for op_idn, op in self.data.items():
+            signatures |= { ( op_idn, 'input', i ): inp.expr for i, inp in enumerate( op.inputs ) }
+            signatures |= { ( op_idn, 'output', i ): out.expr for i, out in enumerate( op.outputs ) }
+        df, _ = bdd.signatures_to_polars( signatures )
+        return df
 
     def to_polars_effects( self: Self ) -> pl.DataFrame:
         if not self.data:
