@@ -9,7 +9,7 @@ MAPS_INDEX_FILE_DEFAULT:  Path = Path('maps_index.toml')
 CELLS_INDEX_FILE_DEFAULT: Path = Path('cells_index.toml')
 BUNDLE_TOML_DEFAULT:      Path = Path('bundle.toml')
 
-# -- Generic idn -> path TOML index. maps_index.toml (bundle main_id -> its
+# -- Generic idn -> path TOML index. maps_index.toml (bundle cell_idn -> its
 # default cell's absolute path) and cells_index.toml (cell_idn -> absolute
 # path, one per cells/ directory) both reuse this exact shape -- an
 # idn/path pair per [[<array_key>]] block. TOML-only by design: index/
@@ -52,55 +52,127 @@ def _write_idn_index(
 #/def _write_idn_index
 
 
-# -- Maps index (bundle main_id -> its default cell's absolute path)
+# -- Maps index (bundle cell_idn -> its default cell's absolute path)
 
 def _read_maps_index( fp: Path ) -> dict[ str, Path ]:
-    return _read_idn_index( fp, array_key='maps', idn_key='main_id' )
+    return _read_idn_index( fp, array_key='maps', idn_key='cell_idn' )
 #/def _read_maps_index
 
 def _write_maps_index( fp: Path, maps: dict[ str, Path ] ) -> None:
-    _write_idn_index( fp, maps, array_key='maps', idn_key='main_id' )
+    _write_idn_index( fp, maps, array_key='maps', idn_key='cell_idn' )
 #/def _write_maps_index
 
 def resolve_map_fp(
-    main_id:                str,
+    cell_idn:               str,
     app_name:               str,
-    local_maps_index_fp:    Path | None = None,
+    fallback_data_roots:    dict[ str, Path ] | None = None,
     maps_index_file:        Path = MAPS_INDEX_FILE_DEFAULT,
     ) -> Path:
     """
-    Find the cell map file for a given main_id.
+    Find the cell map file for a given cell_idn.
 
     Search order (first match wins):
-      1. Repo-local maps_index.toml (local_maps_index_fp) — dev/WIP configs
-      2. User-global maps_index.toml (platformdirs) — installed bundles
+      1. User-global maps_index.toml (platformdirs) — installed bundles
+      2. Each directory in fallback_data_roots, in insertion order — e.g.
+         {'impl_data_root': <some implementation repo>/data,
+          'silverflow_data_root': <silverflow repo>/data}: an
+         implementation's own local/dev maps_index.toml, checked before a
+         shared library's shipped-defaults one. This function has no
+         opinion on what those names/directories represent -- naming them
+         meaningfully is what lets template_vars_for_map() below turn the
+         identical dict into {impl_data_root}/etc. substitutions for cell
+         TOML files; resolve_map_fp() itself only ever reads the dict's
+         values, in order.
     """
-    # 1. repo-local
-    if local_maps_index_fp is not None:
-        local_fp = Path( local_maps_index_fp )
-        if local_fp.exists():
-            local_maps = _read_maps_index( local_fp )
-            if main_id in local_maps:
-                return local_maps[ main_id ]
-            #/if main_id in local_maps
-        #/if local_fp.exists()
-    #/if local_maps_index_fp is not None
-
-    # 2. user-global
+    # 1. user-global
     global_index = PlatformDirs( app_name ).user_data_path / maps_index_file
+    checked: list[ Path ] = [ global_index ]
     if global_index.exists():
         global_maps = _read_maps_index( global_index )
-        if main_id in global_maps:
-            return global_maps[ main_id ]
-        #/if main_id in global_maps
+        if cell_idn in global_maps:
+            return global_maps[ cell_idn ]
+        #/if cell_idn in global_maps
     #/if global_index.exists()
 
+    # 2. fallback data roots, in order
+    for root in ( fallback_data_roots or {} ).values():
+        fallback_fp = Path( root ) / maps_index_file
+        checked.append( fallback_fp )
+        if fallback_fp.exists():
+            fallback_maps = _read_maps_index( fallback_fp )
+            if cell_idn in fallback_maps:
+                return fallback_maps[ cell_idn ]
+            #/if cell_idn in fallback_maps
+        #/if fallback_fp.exists()
+    #/for root in ( fallback_data_roots or {} ).values()
+
     raise ValueError(
-        f"main_id={main_id!r} not found in"
-        + ( f" {local_maps_index_fp!r} or" if local_maps_index_fp else "" )
-        + f" {global_index!r}"
+        f"cell_idn={cell_idn!r} not found in any of {checked!r}"
     )
 #/def resolve_map_fp
+
+
+def template_vars_for_map(
+    bundle_id:              str,
+    app_name:               str,
+    fallback_data_roots:    dict[ str, Path ] | None = None,
+    ) -> dict[ str, str ]:
+    """
+    {bundle_root}, plus one {name} entry per fallback_data_roots key (e.g.
+    {impl_data_root}/{silverflow_data_root}) -- for cell TOML files loaded
+    via cell_from_map()/resolve_map_fp(). bundle_root is this bundle's own
+    platformdirs directory (BundleDirs(bundle_id, app_name).root), same
+    meaning {bundle_root} has everywhere else in this module even though a
+    cell_from_map() bundle has no bundle.toml/cells_index.toml of its own.
+    """
+    tvars: dict[ str, str ] = {
+        'bundle_root': str( BundleDirs( bundle_id, app_name ).root ),
+    }
+    for name, root in ( fallback_data_roots or {} ).items():
+        tvars[ name ] = str( Path( root ) )
+    #/for name, root in ( fallback_data_roots or {} ).items()
+    return tvars
+#/def template_vars_for_map
+
+
+def cell_from_map(
+    cell_idn:               str,
+    app_name:               str,
+    op_classes:             dict[ str, type ],
+    fallback_data_roots:    dict[ str, Path ] | None = None,
+    maps_index_file:        Path = MAPS_INDEX_FILE_DEFAULT,
+    rng                          = None,
+    verbose:                int  = 0,
+    ):
+    """
+    Load the top-level Cell for cell_idn via resolve_map_fp()'s
+    maps_index.toml search (platformdirs, then fallback_data_roots in
+    order) -- a lighter-weight route than cell_from_bundle()'s
+    bundle.toml/cells_index.toml machinery, for an application that just
+    wants "cell_idn -> one cell file", with {bundle_root} plus one
+    template var per fallback_data_roots entry (template_vars_for_map())
+    available to that file and its transitive kind='cell'/[[parameters]]
+    references. app_name/fallback_data_roots/maps_index_file are also
+    forwarded to cell_from_file so any *nested* kind='cell' entry
+    (anywhere in the transitive walk) can itself use cell_idn, resolved
+    the same way this top-level one was.
+    """
+    from .cell import cell_from_file
+
+    cell_fp = resolve_map_fp( cell_idn, app_name, fallback_data_roots, maps_index_file )
+    template_vars = template_vars_for_map( cell_idn, app_name, fallback_data_roots )
+    return cell_from_file(
+        path                = cell_fp,
+        op_classes          = op_classes,
+        main_id             = cell_idn,
+        rng                 = rng,
+        verbose             = verbose,
+        template_vars       = template_vars,
+        app_name            = app_name,
+        fallback_data_roots = fallback_data_roots,
+        maps_index_file     = maps_index_file,
+    )
+#/def cell_from_map
 
 def register_bundle(
     bundle_id:          str,

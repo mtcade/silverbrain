@@ -180,7 +180,7 @@ def test_parameters_external_toml_reference( tmp_path: Path ) -> None:
 
 [[parameters]]
 node_idn = "reader"
-toml     = "reader_params.toml"
+_toml    = "reader_params.toml"
 """ )
     _, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
@@ -193,7 +193,7 @@ def test_parameters_external_json_reference( tmp_path: Path ) -> None:
 
 [[parameters]]
 node_idn = "reader"
-json     = "reader_params.json"
+_json    = "reader_params.json"
 """ )
     _, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
@@ -205,10 +205,10 @@ def test_parameters_both_toml_and_json_raises( tmp_path: Path ) -> None:
 
 [[parameters]]
 node_idn = "reader"
-toml     = "a.toml"
-json     = "a.json"
+_toml    = "a.toml"
+_json    = "a.json"
 """ )
-    with pytest.raises( ValueError, match="both 'toml' and 'json'" ):
+    with pytest.raises( ValueError, match="both '_toml' and '_json'" ):
         toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
 
 
@@ -219,7 +219,7 @@ def test_parameters_inline_mixed_with_external_reference_raises( tmp_path: Path 
 
 [[parameters]]
 node_idn  = "reader"
-toml      = "params.toml"
+_toml     = "params.toml"
 threshold = 0.9
 """ )
     with pytest.raises( ValueError, match="mixes an external reference" ):
@@ -323,7 +323,7 @@ def test_parameters_template_vars_apply_to_external_reference( tmp_path: Path ) 
 
 [[parameters]]
 node_idn = "reader"
-toml     = "{params_root}/reader_params.toml"
+_toml    = "{params_root}/reader_params.toml"
 """ )
     _, params, _ = toml_config_tree(
         tmp_path / 'leaf.toml', node_idn='root',
@@ -444,3 +444,244 @@ kind     = "bogus"
 """ )
     with pytest.raises( ValueError, match="unknown kind" ):
         toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+# -- kind="cell": cell_idn resolution (bundle.resolve_map_fp)
+
+
+def test_cell_kind_resolves_via_cell_idn( tmp_path: Path ) -> None:
+    data_root = tmp_path / 'data_root'
+    ( data_root / 'cells' ).mkdir( parents=True )
+    _write( data_root / 'maps_index.toml', """\
+[[maps]]
+cell_idn = "child_cell"
+path     = "cells/child.toml"
+""" )
+    _write( data_root / 'cells' / 'child.toml', "[cell]\n" )
+    _write( tmp_path / 'parent.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+cell_idn = "child_cell"
+""" )
+    tree, _, _ = toml_config_tree(
+        tmp_path / 'parent.toml', node_idn='root',
+        app_name='nonexistent_test_app',
+        fallback_data_roots={ 'data_root': data_root },
+    )
+    rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
+    assert rows[ 'kid' ][ 'path' ] == str( ( data_root / 'cells' / 'child.toml' ).resolve() )
+
+
+def test_cell_kind_both_toml_and_cell_idn_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'parent.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+cell_idn = "child_cell"
+""" )
+    with pytest.raises( ValueError, match="both 'toml' and 'cell_idn'" ):
+        toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
+
+
+def test_cell_kind_cell_idn_without_app_name_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'parent.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+cell_idn = "child_cell"
+""" )
+    with pytest.raises( ValueError, match="no app_name was supplied" ):
+        toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
+
+
+def test_cell_kind_neither_toml_nor_cell_idn_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'parent.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+""" )
+    with pytest.raises( ValueError, match="neither 'toml' nor 'cell_idn'" ):
+        toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
+
+
+# -- op_type / anonymous node_idn
+
+
+def test_op_node_idn_is_optional_and_auto_generated( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+kind     = "op"
+op_type  = "make_constant"
+source   = ["trig"]
+target   = ["out"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    op_rows = tree.filter( pl.col( 'kind' ) == 'op' ).to_dicts()
+    assert len( op_rows ) == 1
+    assert op_rows[ 0 ][ 'node_idn' ].startswith( 'make_constant__' )
+    assert op_rows[ 0 ][ 'op_type' ] == 'make_constant'
+
+
+def test_op_type_defaults_to_node_idn_when_omitted( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "reader"
+kind     = "op"
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'reader' ).row( 0, named = True )
+    assert row[ 'op_type' ] == 'reader'
+
+
+def test_two_anonymous_nodes_share_op_type_with_distinct_node_idn( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+kind    = "op"
+op_type = "make_constant"
+source  = ["trig"]
+target  = ["a"]
+
+[[nodes]]
+kind    = "op"
+op_type = "make_constant"
+source  = ["trig"]
+target  = ["b"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    op_rows = tree.filter( pl.col( 'kind' ) == 'op' ).to_dicts()
+    assert len( op_rows ) == 2
+    node_idns = { row[ 'node_idn' ] for row in op_rows }
+    assert len( node_idns ) == 2  # distinct, despite sharing op_type
+    assert all( row[ 'op_type' ] == 'make_constant' for row in op_rows )
+
+
+def test_duplicate_explicit_node_idn_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "dup"
+kind     = "op"
+
+[[nodes]]
+node_idn = "dup"
+kind     = "op"
+""" )
+    with pytest.raises( ValueError, match="duplicate node_idn='dup'" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+# -- join/join_k/round_origin (Token/round-id wiring model)
+
+
+def test_join_join_k_default_to_all_none( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "plain"
+kind     = "op"
+source   = ["a"]
+target   = ["out"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'plain' ).row( 0, named = True )
+    assert row[ 'join' ]   == 'all'
+    assert row[ 'join_k' ] is None
+
+
+def test_join_any_threads_through( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "merger"
+kind     = "op"
+op_type  = "merge"
+join     = "any"
+source   = ["a", "b"]
+target   = ["out"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'merger' ).row( 0, named = True )
+    assert row[ 'join' ]   == 'any'
+    assert row[ 'join_k' ] is None
+
+
+def test_join_at_least_k_requires_valid_join_k( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "quorum"
+kind     = "op"
+join     = "at_least_k"
+join_k   = 2
+source   = ["a", "b", "c"]
+target   = ["out"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'quorum' ).row( 0, named = True )
+    assert row[ 'join' ]   == 'at_least_k'
+    assert row[ 'join_k' ] == 2
+
+
+def test_join_at_least_k_missing_join_k_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "quorum"
+kind     = "op"
+join     = "at_least_k"
+source   = ["a", "b"]
+target   = ["out"]
+""" )
+    with pytest.raises( ValueError, match="join_k" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_join_k_without_at_least_k_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "plain"
+kind     = "op"
+join_k   = 1
+source   = ["a"]
+target   = ["out"]
+""" )
+    with pytest.raises( ValueError, match="join_k" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_invalid_join_value_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "plain"
+kind     = "op"
+join     = "bogus"
+source   = ["a"]
+target   = ["out"]
+""" )
+    with pytest.raises( ValueError, match="join" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_join_on_nested_cell_node_threads_through( tmp_path: Path ) -> None:
+    _write( tmp_path / 'child.toml', """\
+[cell]
+source = ["a", "b"]
+target = ["out"]
+""" )
+    _write( tmp_path / 'parent.toml', """\
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+join     = "any"
+source   = ["a", "b"]
+target   = ["out"]
+""" )
+    tree, _, _ = toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
+    row = tree.filter( ( pl.col( 'node_idn' ) == 'kid' ) & ( pl.col( 'kind' ) == 'cell' ) ).row( 0, named = True )
+    assert row[ 'join' ] == 'any'

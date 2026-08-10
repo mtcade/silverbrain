@@ -90,3 +90,70 @@ def test_default_cell_idn_raises_when_key_missing( tmp_path: Path ) -> None:
 
     with pytest.raises( ValueError, match="default_cell_idn" ):
         _default_cell_idn( dirs, 'b', Path( 'bundle.toml' ) )
+
+
+# -- maps_index.toml (cell_idn -> cell map file), resolve_map_fp/cell_from_map/register_bundle
+
+
+def _write_maps_index_fixture( fp: Path, cell_idn: str, target_path: Path ) -> None:
+    fp.parent.mkdir( parents=True, exist_ok=True )
+    fp.write_text( f'[[maps]]\ncell_idn = {cell_idn!r}\npath = {str(target_path)!r}\n' )
+
+
+def test_resolve_map_fp_finds_cell_idn_in_fallback_data_root( tmp_path: Path ) -> None:
+    from silverbrain.bundle import resolve_map_fp
+
+    data_root = tmp_path / 'data_root'
+    target    = tmp_path / 'somewhere' / 'root.toml'
+    target.parent.mkdir( parents=True )
+    target.write_text( '[cell]\n' )
+    _write_maps_index_fixture( data_root / 'maps_index.toml', 'my_cell', target )
+
+    resolved = resolve_map_fp(
+        'my_cell', app_name='nonexistent_test_app_xyz',
+        fallback_data_roots={ 'data_root': data_root },
+    )
+    assert resolved == target.resolve()
+
+
+def test_resolve_map_fp_raises_when_cell_idn_not_found( tmp_path: Path ) -> None:
+    from silverbrain.bundle import resolve_map_fp
+
+    with pytest.raises( ValueError, match="cell_idn='missing'" ):
+        resolve_map_fp(
+            'missing', app_name='nonexistent_test_app_xyz',
+            fallback_data_roots={ 'data_root': tmp_path },
+        )
+
+
+def test_cell_from_map_builds_cell_via_cell_idn( tmp_path: Path ) -> None:
+    from silverbrain.bundle import cell_from_map
+
+    data_root = tmp_path / 'data_root'
+    target    = tmp_path / 'cells' / 'root.toml'
+    target.parent.mkdir( parents=True )
+    target.write_text( '[cell]\nsource = ["inp"]\ntarget = ["out"]\n' )
+    _write_maps_index_fixture( data_root / 'maps_index.toml', 'my_cell', target )
+
+    cell = cell_from_map(
+        'my_cell', app_name='nonexistent_test_app_xyz', op_classes={},
+        fallback_data_roots={ 'data_root': data_root },
+    )
+    assert cell.main_id == 'my_cell'
+
+
+def test_register_bundle_then_resolve_map_fp_round_trips( tmp_path: Path, monkeypatch: pytest.MonkeyPatch ) -> None:
+    from silverbrain import bundle as bundle_module
+
+    monkeypatch.setattr(
+        bundle_module, 'PlatformDirs',
+        lambda app_name: type( 'P', (), { 'user_data_path': tmp_path } )(),
+    )
+    target = tmp_path / 'somewhere' / 'root.toml'
+    target.parent.mkdir( parents=True )
+    target.write_text( '[cell]\n' )
+
+    bundle_module.register_bundle( 'my_cell', target, app_name='nonexistent_test_app_xyz' )
+
+    resolved = bundle_module.resolve_map_fp( 'my_cell', app_name='nonexistent_test_app_xyz' )
+    assert resolved == target.resolve()

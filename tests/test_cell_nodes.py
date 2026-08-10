@@ -13,6 +13,8 @@ caller. register_node is the declarative-bookkeeping step that makes a
 tableOps entry participate in this wiring.
 """
 
+import threading
+
 import polars as pl
 import pytest
 
@@ -238,15 +240,21 @@ def test_fan_in_waits_for_both_named_sources() -> None:
 
 # -- Loops: a stateless controller node fires null to the loop body and
 # non-null to the escape branch (or vice versa) based purely on its input,
-# no framework-level iteration cap. Because the Cell's own declared target
-# resolves as soon as its name is merely *present* in values (regardless of
-# null-ness), a controller must never write directly to the Cell's own
-# target across multiple rounds -- route the escape branch through a
-# passthrough node instead, which only fires once gen-tracking confirms a
-# real (non-null) value arrived.
+# no framework-level iteration cap. A null token is an ordinary value now
+# (not specially suppressed by the engine), so a controller reading its own
+# prior output as a source (a self-referencing loop) must itself guard
+# against being re-invoked with a null input once it has emitted its own
+# termination signal -- the engine will happily keep dispatching it
+# otherwise. The Cell's own declared target resolves on each name's first
+# NON-null token specifically (see _WiringEngine._scan), so routing the
+# escape branch through a passthrough node isn't required for correctness
+# here, but is kept to exercise fan-in-style node-to-node wiring too.
 
 
 def _loop_controller_op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+    if dfs[ 0 ] is None:
+        # Already terminated (see module comment above) -- stay inert.
+        return ( None, None )
     n = dfs[ 0 ][ 'n' ][ 0 ]
     if n < 3:
         return ( pl.DataFrame( { 'n': [ n + 1 ] } ), None )
@@ -292,6 +300,126 @@ def test_hand_written_sequencing_actor() -> None:
     df_in = pl.DataFrame( { 'v': [ 1, 2, 3 ] } )
     result = c( ( df_in, ) ).result( timeout=5 )
     assert result[ 0 ][ 'v' ].to_list() == [ 3, 5, 7 ]
+
+
+# -- join='any'/'at_least_k', round_origin, fan-out cursor independence,
+# and misaligned-round deadlock detection (Token/round-id wiring model)
+
+
+def _record_op( calls: list ):
+    """Returns an Actor that appends dfs[0] (or None) to `calls` and
+    passes it through unchanged -- used to observe how many times/with
+    what a node actually fired."""
+    def _op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        calls.append( dfs[ 0 ] if dfs[ 0 ] is None else dfs[ 0 ][ 'v' ].to_list() )
+        return ( dfs[ 0 ], )
+    return _op
+
+
+def test_join_any_fires_with_only_one_of_two_sources_ever_written() -> None:
+    calls: list = []
+    c = Cell(
+        main_id='c',
+        ops={ 'merge_like': _record_op( calls ) },
+        source=[ 'inp' ], target=[ 'out' ],
+    )
+    # 'never_written' is declared but nothing ever seeds/produces it.
+    c.register_node( 'merge_like', source=[ 'inp', 'never_written' ], target=[ 'out' ], join='any' )
+
+    df_in = pl.DataFrame( { 'v': [ 1 ] } )
+    result = c( ( df_in, ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() == [ 1 ]
+    assert calls == [ [ 1 ] ]
+
+
+def test_join_at_least_k_fires_once_k_sources_agree() -> None:
+    calls: list = []
+    c = Cell(
+        main_id='c',
+        ops={ 'quorum': _record_op( calls ) },
+        source=[ 'a', 'b' ], target=[ 'out' ],
+    )
+    # 3 declared sources, only 2 ('a','b') ever get written -- 'c_unwritten'
+    # never does; join_k=2 still lets it fire on 'a'+'b' alone.
+    c.register_node( 'quorum', source=[ 'a', 'b', 'c_unwritten' ], target=[ 'out' ], join='at_least_k', join_k=2 )
+
+    result = c( ( pl.DataFrame( { 'v': [ 1 ] } ), pl.DataFrame( { 'v': [ 2 ] } ) ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() in ( [ 1 ], [ 2 ] )  # whichever 'a'/'b' resolved first, by declared order
+
+
+def test_at_least_k_requires_join_k_in_valid_range() -> None:
+    c = Cell( main_id='c', ops={ 'op': _passthrough_op }, source=[ 'a' ], target=[ 'out' ] )
+    with pytest.raises( ValueError ):
+        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join='at_least_k', join_k=2 )  # k > len(source)
+    with pytest.raises( ValueError ):
+        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join='at_least_k' )  # missing join_k
+    with pytest.raises( ValueError ):
+        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join_k=1 )  # join_k without at_least_k
+
+
+def test_corr_id_relays_unchanged_through_a_chain() -> None:
+    """corr_id is purely a tracing aid now (see Token/_WiringEngine docs)
+    -- every ordinary firing relays whatever corr_id its participating
+    source port carried, unchanged, with no extension or re-minting."""
+    seen: list = []
+
+    def _relay( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        seen.append( corr_id )
+        return ( dfs[ 0 ], )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'a': _relay, 'b': _relay },
+        source=[ 'inp' ], target=[ 'out' ],
+    )
+    c.register_node( 'a', source=[ 'inp' ], target=[ 'mid' ] )
+    c.register_node( 'b', source=[ 'mid' ], target=[ 'out' ] )
+
+    root_corr_id = ( 'root-marker', )
+    c( ( pl.DataFrame( { 'v': [ 1 ] } ), ), corr_id=root_corr_id ).result( timeout=5 )
+    assert seen == [ root_corr_id, root_corr_id ]
+
+
+def test_fan_out_cursors_are_independent_per_consumer() -> None:
+    """'x' has a single token. Both 'fast' (source=['x']) and 'gate_setup'
+    (source=['x']) read it independently and fire immediately; 'slow'
+    (source=['x','gate']) also needs its own read of that SAME 'x' token,
+    paired with 'gate_setup's output, once both are available. If cursors
+    were shared/pop-based instead of per-(node_idn, name), 'fast' or
+    'gate_setup' reading 'x' first would exhaust it, and 'slow' would
+    deadlock waiting for an 'x' token that's already gone. 'fast' itself
+    is dispatched concurrently with no ordering relative to the Cell's own
+    resolution (its result is discarded, '_'), so it's observed via an
+    Event rather than racily checked immediately after .result() returns."""
+    fast_calls: list = []
+    fast_done = threading.Event()
+
+    def _fast( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        fast_calls.append( dfs[ 0 ][ 'v' ].to_list() )
+        fast_done.set()
+        return ( dfs[ 0 ], )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'fast': _fast, 'gate_setup': _passthrough_op, 'slow': _passthrough_op },
+        source=[ 'x' ], target=[ 'slowed' ],
+    )
+    c.register_node( 'fast',       source=[ 'x' ],          target=[ '_' ] )
+    c.register_node( 'gate_setup', source=[ 'x' ],          target=[ 'gate' ] )
+    c.register_node( 'slow',       source=[ 'x', 'gate' ],  target=[ 'slowed' ] )
+
+    result = c( ( pl.DataFrame( { 'v': [ 7 ] } ), ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() == [ 7 ]
+    assert fast_done.wait( timeout=5 )
+    assert fast_calls == [ [ 7 ] ]
+
+
+def test_rewire_is_an_unimplemented_future_stub() -> None:
+    c = Cell( main_id='c', ops={ 'a': _passthrough_op }, source=[ 'inp' ], target=[ 'out' ] )
+    c.register_node( 'a', source=[ 'inp' ], target=[ 'out' ] )
+    with pytest.raises( NotImplementedError, match="FUTURE" ):
+        c._rewire( 'a', [ 'somewhere_else' ] )
+
 
 # BackendReadOp/BackendWriteOp wiring tests (backend_read_process/
 # backend_write_process) live in silverflow/tests/test_cell_nodes_backend.py

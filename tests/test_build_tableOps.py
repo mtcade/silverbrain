@@ -88,3 +88,46 @@ def test_build_tableOps_empty_op_keys_returns_empty_dict() -> None:
     empty = pl.DataFrame( schema = p.schema )
     assert build_tableOps( { 'a': _DefaultsOp }, [], None, empty ) == {}
 #/def test_build_tableOps_empty_op_keys_returns_empty_dict
+
+
+def test_build_tableOps_op_types_resolves_class_independent_of_op_idn() -> None:
+    """Two distinct op_idn (wiring identity) both build the same class via
+    a shared op_type -- the decoupling that makes anonymous, auto-generated
+    node_idn safe to reuse the same class across multiple nodes."""
+    p     = _params_parser()
+    empty = pl.DataFrame( schema = p.schema )
+    ops   = build_tableOps(
+        { 'defaults_op': _DefaultsOp }, [ 'node_1', 'node_2' ], None, empty,
+        op_types = { 'node_1': 'defaults_op', 'node_2': 'defaults_op' },
+    )
+    assert isinstance( ops[ 'node_1' ], _DefaultsOp )
+    assert isinstance( ops[ 'node_2' ], _DefaultsOp )
+    assert ops[ 'node_1' ] is not ops[ 'node_2' ]
+#/def test_build_tableOps_op_types_resolves_class_independent_of_op_idn
+
+
+def test_build_tableOps_op_types_kwargs_stay_keyed_by_op_idn() -> None:
+    """Even sharing an op_type, each op_idn's own ctor kwargs (from the
+    parameters forest) stay independent -- op_types only redirects the
+    class lookup, not the kwargs lookup."""
+    from silverbrain.parameterParse import parameter_group_to_tree
+
+    tree_1, next_idx = parameter_group_to_tree( 'node_1', { 'threshold': 0.1 } )
+    tree_2, _        = parameter_group_to_tree( 'node_2', { 'threshold': 0.9 }, node_idx_start = next_idx )
+    tree = pl.concat( ( tree_1, tree_2 ), how = 'diagonal_relaxed' )
+
+    ops = build_tableOps(
+        { 'defaults_op': _DefaultsOp }, [ 'node_1', 'node_2' ], None, tree,
+        op_types = { 'node_1': 'defaults_op', 'node_2': 'defaults_op' },
+    )
+    assert ops[ 'node_1' ].threshold == 0.1
+    assert ops[ 'node_2' ].threshold == 0.9
+#/def test_build_tableOps_op_types_kwargs_stay_keyed_by_op_idn
+
+
+def test_build_tableOps_op_types_omitted_matches_today_behavior() -> None:
+    p     = _params_parser()
+    empty = pl.DataFrame( schema = p.schema )
+    ops   = build_tableOps( { 'a': _DefaultsOp }, [ 'a' ], None, empty )
+    assert isinstance( ops[ 'a' ], _DefaultsOp )
+#/def test_build_tableOps_op_types_omitted_matches_today_behavior

@@ -10,6 +10,7 @@ from .parameterParse import ParameterParser, op_ctor_kwargs_forest
 from .schema import table_schemas, table_schemas_to_df
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, Sequence
 
@@ -41,6 +42,30 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
 _EXECUTOR = ThreadPoolExecutor( thread_name_prefix = 'silverbrain-actor' )
 
 
+# Sentinel distinguishing "no non-null token yet" from a genuine None
+# result value in _WiringEngine._scan's target resolution.
+_UNRESOLVED = object()
+
+
+@dataclass( frozen = True )
+class Token:
+    """
+    One value appended to a named port's log (_WiringEngine.logs) -- an
+    entry in that port's FIFO queue, never overwritten by a later write
+    (see _WiringEngine's docstring: this is a point-to-point/Kahn Process
+    Network-style wiring model, not a shared overwritable blackboard).
+    corr_id is carried along purely for tracing/correlation -- relayed
+    unchanged from whichever token(s) triggered the firing that produced
+    this one (see _WiringEngine._dispatch); it plays no role in which
+    tokens get paired together, that's decided entirely by each port's own
+    queue position. value is the dataframe itself (or None -- a legitimate
+    token, not a missing one; see _WiringEngine._on_done).
+    """
+    corr_id: tuple[ str, ... ]
+    value:   pl.DataFrame | None
+#/class Token
+
+
 def _call_actor(
     actor:          Actor,
     dfs:            tuple[ pl.DataFrame, ... ],
@@ -70,38 +95,73 @@ def _call_actor(
 
 class _WiringEngine:
     """
-    Runs one Cell.__call__ invocation's wiring graph: fires any registered
-    node whose declared source names have all received a value since it
-    last fired, feeding results forward by target name, until every name in
-    the Cell's own declared target is available -- then resolves `future`
-    with those values, in order.
+    Runs one Cell.__call__ invocation's wiring graph as a point-to-point,
+    Kahn Process Network-style network: each named port is an append-only
+    FIFO log of Tokens, never an overwritable "latest value" slot -- a
+    token is never silently lost to a later write. Each registered node
+    keeps its own read cursor per source name (self.cursor, keyed by
+    (node_idn, source_name)), so fan-out (several nodes reading the same
+    name) works for free -- every consumer sees every token, in order, at
+    its own pace, independent of any other consumer's pace.
+
+    A node's `join` firing rule (__nodes__ row) decides when it's ready,
+    checking each declared source's presence (does it have an unread
+    token at all) -- there is no cross-source identity/round check:
+      - 'all' (default): fires once every declared source has an unread
+        token (an AND-join).
+      - 'any': fires once at least one declared source has an unread
+        token; sources with nothing unread contribute None this firing.
+      - 'at_least_k': fires once join_k declared sources have an unread
+        token; the rest contribute None.
+    Every source that had an unread token when the node fired has its
+    cursor advanced by one (its oldest unread token consumed); a source
+    with nothing unread is simply left for a future scan.
+
+    Correctness of pairing across a node's several source ports rests on
+    Kahn Process Network determinism, not on any explicit correlation id:
+    since a node is never dispatched again while a prior firing of itself
+    is still in flight (self.in_flight), and each port's queue is strictly
+    FIFO, "the i-th token on port A" and "the i-th token on port B" are
+    whatever the graph's own causal/topological structure produced them
+    to be -- consuming the oldest unread token from each required port,
+    every firing, correctly reconstructs that pairing with no separate
+    round-tracking machinery required. This is what replaced an earlier,
+    more complicated round-id-matching design (see git history) once it
+    became clear the round-matching problem it solved was itself only a
+    symptom of routing through shared, overwritable named slots -- with
+    genuine per-port FIFO queues the disambiguation need mostly dissolves.
 
     Not restricted to a DAG. The same node may fire more than once (a
-    loop); each firing gets its own corr_id segment
-    (root_id + "node_idn:n"), derived from a simple per-node fire counter,
-    not from graph analysis. A null/None value written to a target does
-    NOT count as a "new" round for downstream consumers -- their
-    generation-tracking per source name only advances on non-null writes.
-    This is how loop termination propagates: a controller node emitting
-    null to one target and real data to another lets the null branch's
-    consumers stop advancing while the real branch's consumers fire; the
-    controller itself needs no internal state; "which iteration am I on"
-    is carried entirely by the corr_id its own trigger arrived under and
-    the fire-count-derived id of whatever it emits next.
+    loop). corr_id is carried purely for tracing/correlation, not
+    correctness -- see Token's docstring and Cell.__call__'s corr_id
+    propagation notes; a firing's output tokens are tagged with the
+    corr_id of whichever source port (first in declared order) actually
+    participated, relayed unchanged, with no minting/extension performed
+    here.
 
     Deadlock is detected, not silently hung forever: if a scan finds
     nothing newly fireable and nothing still in flight, but the Cell's own
     target isn't fully resolved, `future` gets a RuntimeError naming the
     unresolved names.
 
+    A Cell's own target resolves on each name's first NON-null token, not
+    merely its first token -- an internal null token (e.g. a loop's
+    in-progress signal on one branch while the real result is still being
+    computed on another) is never mistaken for "the Cell is done." A node
+    that reads its own prior output as a source (a self-referencing loop)
+    must itself guard against being re-invoked with a null input once it
+    has emitted its own termination signal -- nothing here silently stops
+    dispatching it just because a value happens to be null (see Token's
+    docstring: null is an ordinary value, not a special engine-level case).
+
     "_" is a reserved discard target: a node's target list may name a
     result slot "_" to mean "run this (side effects included) but never
     store or wire the result anywhere" -- e.g. a write op that always
     echoes the table it wrote, when the caller doesn't want that echo
-    consumed by anything. Discarded results never enter `values`/`gen`, so
-    nothing can depend on them and they never contribute to resolving a
-    target. This is node-level only (register_node's target=) -- a Cell's
-    own external source/target contract is unaffected.
+    consumed by anything. Discarded results never enter `logs`, so nothing
+    can depend on them and they never contribute to resolving a target.
+    This is node-level only (register_node's target=) -- a Cell's own
+    external source/target contract is unaffected.
     """
 
     def __init__(
@@ -117,10 +177,8 @@ class _WiringEngine:
         self.verbose_prefix = verbose_prefix
         self.future: Future = Future()
         self.lock           = threading.Lock()
-        self.values: dict[ str, pl.DataFrame | None ] = {}
-        self.gen:    dict[ str, int ]                  = {}
-        self.seen:   dict[ str, dict[ str, int ] ]     = {}
-        self.fire_count: dict[ str, int ]              = {}
+        self.logs:   dict[ str, list[ Token ] ]        = {}
+        self.cursor: dict[ tuple[ str, str ], int ]    = {}
         self.in_flight:  set[ str ]                    = set()
         self._nodes = cell.tables[ '__nodes__' ].to_dicts()
     #/def __init__
@@ -128,8 +186,7 @@ class _WiringEngine:
     def seed( self: Self, values: dict[ str, pl.DataFrame ] ) -> None:
         with self.lock:
             for k, v in values.items():
-                self.values[ k ] = v
-                self.gen[ k ] = self.gen.get( k, 0 ) + 1
+                self.logs.setdefault( k, [] ).append( Token( corr_id = self.root_id, value = v ) )
         self._scan()
     #/def seed
 
@@ -138,34 +195,67 @@ class _WiringEngine:
         with self.lock:
             if self.future.done():
                 return
-            if all( t in self.values for t in self.cell.target ):
-                self.future.set_result( tuple( self.values[ t ] for t in self.cell.target ) )
+            # Resolve on each target's first NON-null token, not merely its
+            # first token -- a null token is a legitimate in-flight signal
+            # (e.g. loop-in-progress) an internal node may pass through
+            # before the real result arrives; the Future this Cell itself
+            # returns should never resolve to "nothing yet" just because a
+            # transient null happened to reach a target name first.
+            resolved = {
+                t: next( ( tok.value for tok in self.logs.get( t, [] ) if tok.value is not None ), _UNRESOLVED )
+                for t in self.cell.target
+            }
+            if all( v is not _UNRESOLVED for v in resolved.values() ):
+                self.future.set_result( tuple( resolved[ t ] for t in self.cell.target ) )
                 return
             for row in self._nodes:
                 node_idn = row[ 'node_idn' ]
                 if node_idn in self.in_flight:
                     continue
                 src = row[ 'source' ] or []
-                if not src or not all( s in self.values for s in src ):
+                if not src:
                     continue
-                seen = self.seen.setdefault( node_idn, {} )
-                if all( seen.get( s, 0 ) >= self.gen.get( s, 0 ) for s in src ):
+
+                unread: dict[ str, list[ Token ] ] = {
+                    s: self.logs.get( s, [] )[ self.cursor.get( ( node_idn, s ), 0 ): ]
+                    for s in src
+                }
+                present = [ s for s in src if unread[ s ] ]
+                if not present:
                     continue
-                for s in src:
-                    seen[ s ] = self.gen.get( s, 0 )
+
+                join = row.get( 'join' ) or 'all'
+                if join == 'all':
+                    if len( present ) != len( src ):
+                        continue
+                    participants = src
+                elif join == 'any':
+                    participants = present
+                elif join == 'at_least_k':
+                    if len( present ) < row[ 'join_k' ]:
+                        continue
+                    participants = present
+                else:
+                    raise ValueError( f"__nodes__ row {node_idn!r} has unrecognized join={join!r}" )
+                participants = set( participants )
+
+                for s in participants:
+                    self.cursor[ ( node_idn, s ) ] = self.cursor.get( ( node_idn, s ), 0 ) + 1
+                inputs = tuple(
+                    unread[ s ][ 0 ].value if s in participants else None
+                    for s in src
+                )
+                # corr_id relayed from whichever source port (first in
+                # declared order) actually participated -- purely for
+                # tracing, see Token's docstring; never used for matching.
+                dispatch_corr_id = next( unread[ s ][ 0 ].corr_id for s in src if s in participants )
+
                 self.in_flight.add( node_idn )
-                fire_no = self.fire_count.get( node_idn, 0 )
-                self.fire_count[ node_idn ] = fire_no + 1
-                node_corr_id = self.root_id + ( f'{ node_idn }:{ fire_no }', )
-                to_fire.append( (
-                    node_idn, row,
-                    tuple( self.values[ s ] for s in src ),
-                    node_corr_id,
-                ) )
+                to_fire.append( ( node_idn, row, inputs, dispatch_corr_id ) )
             #/for row in self._nodes
 
             if not to_fire and not self.in_flight:
-                missing = [ t for t in self.cell.target if t not in self.values ]
+                missing = [ t for t in self.cell.target if resolved[ t ] is _UNRESOLVED ]
                 self.future.set_exception( RuntimeError(
                     f"Cell { self.cell.main_id!r } cannot resolve target(s) { missing!r } "
                     f"-- no registered node is ready to produce them"
@@ -173,27 +263,52 @@ class _WiringEngine:
                 return
         #/with self.lock
 
-        for node_idn, row, inputs, node_corr_id in to_fire:
-            self._dispatch( node_idn, row, inputs, node_corr_id )
+        for node_idn, row, inputs, dispatch_corr_id in to_fire:
+            self._dispatch( node_idn, row, inputs, dispatch_corr_id )
     #/def _scan
 
     def _dispatch(
-        self:         Self,
-        node_idn:     str,
-        row:          dict,
-        inputs:       tuple[ pl.DataFrame, ... ],
-        node_corr_id: tuple[ str, ... ],
+        self:               Self,
+        node_idn:           str,
+        row:                dict,
+        inputs:             tuple[ pl.DataFrame | None, ... ],
+        dispatch_corr_id:  tuple[ str, ... ],
         ) -> None:
         actor = self.cell.tableOps[ node_idn ]
+        # verbose >= 1, leaf TableOp children only ('op', not 'cell') -- a
+        # nested Cell already prints its own enter/exit trace from within
+        # its own __call__ (self.verbose_prefix, passed to it unmodified
+        # below, already carries this Cell's own main_id segment -- see
+        # Cell.__call__'s child_prefix), so printing here too would double
+        # up. A leaf op's own verbose_prefix DOES get node_idn appended
+        # (op_prefix, not self.verbose_prefix) -- unlike a nested Cell, a
+        # TableOp has no main_id of its own to append it, so this is the
+        # only place its op_idn ever enters the printed path; any message
+        # the op itself prints (via its own verbose_prefix) is then
+        # already correctly scoped to "this specific op", not just "this
+        # Cell".
+        is_leaf_op = row[ 'kind' ] == 'op'
+        op_prefix  = f"{ self.verbose_prefix }/{ node_idn }" if is_leaf_op else self.verbose_prefix
+        if self.verbose >= 1 and is_leaf_op:
+            print( f"{ op_prefix } { tuple( row[ 'source' ] or () ) }" )
+        #
         fut = _EXECUTOR.submit(
-            _call_actor, actor, inputs, node_corr_id, self.verbose, self.verbose_prefix,
+            _call_actor, actor, inputs, dispatch_corr_id, self.verbose, op_prefix,
         )
+        if self.verbose >= 1 and is_leaf_op:
+            fut.add_done_callback(
+                lambda f, op_prefix = op_prefix, row = row: print(
+                    f"/{ op_prefix } { tuple( row[ 'target' ] or () ) }"
+                )
+            )
+        #
         fut.add_done_callback(
-            lambda f, node_idn = node_idn, row = row: self._on_done( f, node_idn, row )
+            lambda f, node_idn = node_idn, row = row, dispatch_corr_id = dispatch_corr_id:
+                self._on_done( f, node_idn, row, dispatch_corr_id )
         )
     #/def _dispatch
 
-    def _on_done( self: Self, fut: Future, node_idn: str, row: dict ) -> None:
+    def _on_done( self: Self, fut: Future, node_idn: str, row: dict, dispatch_corr_id: tuple[ str, ... ] ) -> None:
         with self.lock:
             self.in_flight.discard( node_idn )
         try:
@@ -212,10 +327,13 @@ class _WiringEngine:
                     # never stored, so nothing can ever depend on it and it
                     # never contributes to resolving anything.
                     continue
-                self.values[ name ] = value
-                if value is not None:
-                    self.gen[ name ] = self.gen.get( name, 0 ) + 1
-                #/if value is not None
+                # Every value is appended, including None -- a null token
+                # is an ordinary result a downstream consumer can inspect
+                # (e.g. for loop termination), not a special engine-level
+                # case.
+                self.logs.setdefault( name, [] ).append(
+                    Token( corr_id = dispatch_corr_id, value = value )
+                )
             #/for name, value
         self._scan()
     #/def _on_done
@@ -334,29 +452,59 @@ class Cell:
         corr_id:        tuple[ str, ... ] = (),
         verbose:        int = 0,
         verbose_prefix: str = '',
-        ) -> 'Future[ tuple[ pl.DataFrame, ... ] ]':
+        ) -> Future[ tuple[ pl.DataFrame, ... ] ]:
         """
         Actor interface: run this Cell's declarative wiring graph against
         dfs, seeded under self.source's names, returning a Future that
         resolves to the values collected under self.target's names, in
         order. Never blocks -- see _WiringEngine.
 
-        corr_id, if not given (the top-level/external-call case), gets a
-        fresh root segment minted here. Every Cell invocation -- this one
-        included -- extends whatever corr_id it receives with its own
-        further segment, so this Cell's internal joins can't cross-talk
-        with a concurrent invocation of itself.
+        corr_id is what every externally-seeded input is tagged with (see
+        _WiringEngine.seed) -- if not given (the top-level/external-call
+        case), a fresh id is minted here. Otherwise it's used AS GIVEN,
+        unchanged -- a nested Cell relays whatever corr_id its parent's
+        _dispatch gave it, rather than unconditionally extending it with a
+        further segment of its own. corr_id is purely a tracing/
+        correlation aid, not load-bearing for correctness -- see
+        _WiringEngine's docstring for why pairing across a node's several
+        source ports doesn't need one. Concurrency isolation between
+        invocations of the same Cell doesn't depend on corr_id's
+        uniqueness either -- a fresh _WiringEngine (its own logs/cursor
+        dicts) is constructed every call regardless.
         """
         if len( dfs ) != len( self.source ):
             raise ValueError(
                 f"Cell { self.main_id!r } expects { len( self.source ) } input(s) "
                 f"{ self.source!r }, got { len( dfs ) }"
             )
+        #
         if not corr_id:
             corr_id = ( str( uuid7() ), )
-        my_id = corr_id + ( str( uuid7() ), )
+        #
 
-        engine = _WiringEngine( self, my_id, verbose, verbose_prefix )
+        my_id = corr_id
+
+        # verbose >= 1: enter/exit trace, path-style (verbose_prefix built
+        # up one '/main_id' segment per nesting level) -- child_prefix is
+        # what every node this Cell dispatches (leaf TableOp or nested
+        # Cell) receives as ITS OWN verbose_prefix, so the path keeps
+        # growing one level per Cell/op boundary crossed. No leading '/'
+        # at the root (verbose_prefix == '') -- only a '/' *joining* two
+        # segments, or the single '/' prefixed onto the whole path to mark
+        # an exit (see below), ever appears. Bare tuples, no 'source:'/
+        # 'target:' labels -- the enter/exit shape (no leading '/' vs
+        # leading '/') already says which one it is.
+        child_prefix = self.main_id if not verbose_prefix else f"{ verbose_prefix }/{ self.main_id }"
+        if verbose >= 1:
+            print( f"{ child_prefix } { self.source }" )
+        #
+
+        engine = _WiringEngine( self, my_id, verbose, child_prefix )
+        if verbose >= 1:
+            engine.future.add_done_callback(
+                lambda fut: print( f"/{ child_prefix } { self.target }" )
+            )
+        #
         engine.seed( dict( zip( self.source, dfs ) ) )
         return engine.future
     #/def __call__
@@ -383,7 +531,7 @@ class Cell:
             corr_id:        tuple[ str, ... ] = (),
             verbose:        int = 0,
             verbose_prefix: str = '',
-            ) -> 'Future[ tuple[ pl.DataFrame, ... ] ]':
+            ) -> Future[ tuple[ pl.DataFrame, ... ] ]:
             return _EXECUTOR.submit( _call_actor, target, dfs, corr_id, verbose, verbose_prefix )
         #/def _bound
 
@@ -468,12 +616,109 @@ class Cell:
         )
     #/def register_tableOps
 
+    def _replace_actor( self: Self, node_idn: str, actor: Actor ) -> None:
+        """
+        Swap the actor bound to an already-registered node_idn for another
+        one, in place -- unlike register_tableOps (an additive merge meant
+        for first-time registration), this also drops node_idn's existing
+        __table_op_schema__/__table_op_effects__ rows before re-deriving
+        them from the new actor's own input/output/effects, so no stale
+        rows from the old actor linger alongside the new ones.
+
+        Sunder for now -- no public replace-actor API decided yet (dict
+        swap + wiring-row survival semantics still need a caller-facing
+        contract); the wiring row itself (__nodes__: source/target/kind)
+        is untouched, since only which actor answers node_idn is changing,
+        not how it's wired.
+
+        _WiringEngine._dispatch re-reads self.cell.tableOps[node_idn] fresh
+        on every firing (no cached bind()), so this takes effect on
+        node_idn's next dispatch -- it is NOT synchronized against a
+        firing already in flight for node_idn.
+        """
+        if node_idn not in self.tableOps:
+            raise KeyError( f"{ node_idn!r } is not a registered tableOp on this Cell" )
+
+        self.tableOps[ node_idn ] = actor
+
+        self.tables[ '__table_op_schema__'  ] = self.tables[ '__table_op_schema__'  ].filter(
+            pl.col( 'op_idn' ) != node_idn
+        )
+        self.tables[ '__table_op_effects__' ] = self.tables[ '__table_op_effects__' ].filter(
+            pl.col( 'op_idn' ) != node_idn
+        )
+
+        _has_schema  = getattr( actor, 'input', None ) is not None or getattr( actor, 'output',  None ) is not None
+        _has_effects = getattr( actor, 'effects', None ) is not None
+        if _has_schema:
+            _schema_df, _effects_df, self._next_schema_node_idx = TableOpSchema(
+                inputs  = actor.input  or [],
+                outputs = actor.output or [],
+                effects = getattr( actor, 'effects', None ) or [],
+            ).to_polars( node_idn, node_idx_start = self._next_schema_node_idx )
+            self.tables[ '__table_op_schema__'  ] = pl.concat(
+                [ self.tables[ '__table_op_schema__'  ], _schema_df  ], how = 'vertical',
+            )
+            if not _effects_df.is_empty():
+                self.tables[ '__table_op_effects__' ] = pl.concat(
+                    [ self.tables[ '__table_op_effects__' ], _effects_df ], how = 'vertical',
+                )
+            #/if not _effects_df.is_empty()
+        elif _has_effects and actor.effects:
+            _, _effects_df, self._next_schema_node_idx = TableOpSchema(
+                inputs = [], outputs = [], effects = actor.effects,
+            ).to_polars( node_idn, node_idx_start = self._next_schema_node_idx )
+            self.tables[ '__table_op_effects__' ] = pl.concat(
+                [ self.tables[ '__table_op_effects__' ], _effects_df ], how = 'vertical',
+            )
+        #/if _has_schema/elif _has_effects and actor.effects
+    #/def _replace_actor
+
+    def _rewire( self: Self, node_idn: str, target: Sequence[ str ] ) -> Future[ None ]:
+        """
+        FUTURE -- not implemented yet; always raises NotImplementedError.
+
+        Change node_idn's own __nodes__ row so its RESULTS get sent to a
+        new constant set of destination names, live, without reconstructing
+        the Cell -- the "except when rewiring to another set of constant
+        destinations" carve-out on top of this engine's usual invariant
+        that an autonomous actor's output destinations are fixed (see
+        _WiringEngine's docstring: point-to-point ports, not a shared
+        blackboard). Only ever changes WHERE node_idn's results are wired
+        to (its `target`); which actor answers node_idn is a separate,
+        already-implemented concern (_replace_actor), and node_idn's own
+        `source` ports are untouched -- a rewire is a producer-side event.
+
+        Returns a Future, not None synchronously, because rewiring an
+        already-running node is not an instantaneous swap: the intended
+        (not yet built) sequence is (1) pause node_idn's own future
+        dispatches, so no new firing starts mid-rewire (2) let any firing
+        already in flight, plus anything already queued for node_idn's own
+        source ports, finish flushing through under the OLD `target` (3)
+        atomically replace node_idn's __nodes__ row's `target` with the new
+        destination names (4) resume dispatch. The returned Future resolves
+        once step 4 completes -- callers that need the swap to have fully
+        taken effect await it; callers that don't can fire-and-forget, same
+        as any other Actor call in this codebase.
+
+        No node_idn-in-self.tableOps check yet either -- deferred along
+        with everything else here until the real implementation lands.
+        """
+        raise NotImplementedError(
+            "FUTURE: Cell._rewire is a stub -- live rewiring of a node's "
+            "constant output destinations (pause -> drain -> swap -> "
+            "resume) is not implemented yet"
+        )
+    #/def _rewire
+
     def register_node(
-        self:       Self,
-        node_idn:   str,
-        source:     Sequence[ str ] = (),
-        target:     Sequence[ str ] = (),
-        parent_idn: str | None      = None,
+        self:         Self,
+        node_idn:     str,
+        source:       Sequence[ str ] = (),
+        target:       Sequence[ str ] = (),
+        parent_idn:   str | None      = None,
+        join:         str             = 'all',
+        join_k:       int | None      = None,
         ) -> None:
         """
         Declare a __nodes__ row for node_idn, an entry already registered in
@@ -483,11 +728,17 @@ class Cell:
 
         target names need not be unique across nodes -- the wiring graph
         isn't required to be a DAG (see _WiringEngine); more than one node
-        may legitimately claim the same target across different rounds.
-        This also means "_" (the reserved discard target -- see
-        _WiringEngine) needs no special-casing here: any number of nodes
-        may independently declare target=["_"] with no conflict, same as
-        any other repeated name.
+        may legitimately declare the same target, each write simply
+        appending another token to that name's queue. This also means "_"
+        (the reserved discard target -- see _WiringEngine) needs no
+        special-casing here: any number of nodes may independently declare
+        target=["_"] with no conflict, same as any other repeated name.
+
+        join/join_k: this node's firing rule over its declared source
+        ports -- see _WiringEngine._scan/tableProcesses.make_node_row for
+        the exact semantics/validation. Default ('all', None) reproduces a
+        strict AND-join -- today's only behavior before join/join_k were
+        added.
         """
         if node_idn not in self.tableOps:
             raise KeyError(
@@ -504,6 +755,8 @@ class Cell:
                     source     = source,
                     target     = target,
                     parent_idn = parent_idn,
+                    join       = join,
+                    join_k     = join_k,
                 ),
             ],
             how = 'vertical',
@@ -599,24 +852,32 @@ def build_tableOps(
     op_keys:    Sequence[ str ],
     rng:        np.random.Generator | None,
     parameters: pl.DataFrame,
+    op_types:   dict[ str, str ] | None = None,
     ) -> types.TableProcessDict:
     """
     Construct one TableOp instance per op_keys entry:
-    op_classes[op_idn](rng=rng, **kwargs), where kwargs comes from
+    op_classes[class_key](rng=rng, **kwargs), where kwargs comes from
     op_ctor_kwargs_forest(parameters).get(op_idn, {}) -- {} for any op with
     no declared parameter node, relying entirely on the class's own
     defaults (or a TypeError for a missing required kwarg, same as any
-    ordinary Python call -- no separate validation here).
+    ordinary Python call -- no separate validation here). class_key is
+    op_types.get(op_idn, op_idn) -- op_idn itself (today's exact behavior)
+    unless op_types (configTree.py's per-node op_type column, decoupling
+    "which class to build" from op_idn's own wiring/dispatch identity) maps
+    it elsewhere. kwargs stay keyed by op_idn (each node's own distinct
+    ctor kwargs), never by class_key -- two nodes sharing an op_type have
+    no reason to share ctor kwargs too.
 
     Replaces the old "a series of lambdas" pattern (an application
     hand-writing a get_ops(keys, rng) function with one branch per op_idn)
     with a plain class registry + this one generic instantiation rule.
-    op_classes[op_idn] not existing raises KeyError, same failure mode as
-    the old hook silently producing an incomplete ops dict.
+    op_classes[class_key] not existing raises KeyError, same failure mode
+    as the old hook silently producing an incomplete ops dict.
     """
     kwargs_by_op = op_ctor_kwargs_forest( parameters )
+    op_types     = op_types or {}
     return {
-        op_idn: op_classes[ op_idn ]( rng = rng, **kwargs_by_op.get( op_idn, {} ) )
+        op_idn: op_classes[ op_types.get( op_idn, op_idn ) ]( rng = rng, **kwargs_by_op.get( op_idn, {} ) )
         for op_idn in op_keys
     }
 #/def build_tableOps
@@ -657,7 +918,11 @@ def _cell_from_tree(
     cell_children        = children.filter( pl.col( 'kind' ) == 'cell'        ).to_dicts()
 
     op_keys: list[ str ] = [ row[ 'node_idn' ] for row in op_children ]
-    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters )
+    op_types: dict[ str, str ] = {
+        row[ 'node_idn' ]: row[ 'op_type' ] or row[ 'node_idn' ]
+        for row in op_children
+    }
+    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types )
 
     for row in placeholder_children:
         # configTree.py already fully resolved every atom's dtype before
@@ -687,10 +952,18 @@ def _cell_from_tree(
     )
 
     for row in op_children + placeholder_children:
-        cell.register_node( node_idn=row[ 'node_idn' ], source=row[ 'source' ], target=row[ 'target' ] )
+        cell.register_node(
+            node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
+            join     = row[ 'join' ] or 'all',
+            join_k   = row[ 'join_k' ],
+        )
     for row in cell_children:
         if row[ 'source' ] or row[ 'target' ]:
-            cell.register_node( node_idn=row[ 'node_idn' ], source=row[ 'source' ], target=row[ 'target' ] )
+            cell.register_node(
+                node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
+                join     = row[ 'join' ] or 'all',
+                join_k   = row[ 'join_k' ],
+            )
 
     return cell
 #/def _cell_from_tree
@@ -703,6 +976,9 @@ def cell_from_file(
     rng: np.random.Generator | None = None,
     verbose: int = 0,
     template_vars: dict[ str, str ] | None = None,
+    app_name: str | None = None,
+    fallback_data_roots: dict[ str, Path ] | None = None,
+    maps_index_file: Path = configTree.MAPS_INDEX_FILE_DEFAULT,
 ) -> Cell:
     """
     Construct a Cell from a config file, delegating to configTree.config_tree
@@ -732,6 +1008,11 @@ def cell_from_file(
     verbose     : forwarded to ``Cell.__init__`` at every level
     template_vars : optional ``{key}`` substitutions applied to kind='cell'
                   ``toml`` strings before resolving (e.g. ``{cells_root}``)
+    app_name/fallback_data_roots/maps_index_file : only needed if some
+                  kind='cell' [[nodes]] entry (anywhere in the transitive
+                  walk) uses ``cell_idn`` instead of ``toml`` -- resolved via
+                  bundle.resolve_map_fp()'s maps_index.toml search. Omit for
+                  a config that only ever uses ``toml``.
 
     TOML schema expected
     --------------------
@@ -758,8 +1039,11 @@ def cell_from_file(
         # kind="op": node_idn must be a key op_classes resolves; no other
         #   fields required.
 
-        # kind="cell": one block per nested Cell --
+        # kind="cell": one block per nested Cell -- exactly one of:
         #   toml     = "path/to/child.toml"   # relative to this file
+        #   cell_idn = "some-cell-idn"        # resolved via bundle.
+        #                                      # resolve_map_fp() (requires
+        #                                      # app_name to be supplied)
         #   node_idn is the key this child is registered under in the
         #   parent's tableOps; source/target are optional -- omit both to
         #   leave this child unregistered as a __nodes__ row (still
@@ -773,9 +1057,12 @@ def cell_from_file(
         #   is reached on a live execution path.
     """
     tree, parameters, _ = configTree.config_tree(
-        path          = path,
-        node_idn      = main_id,
-        template_vars = template_vars,
+        path                = path,
+        node_idn            = main_id,
+        template_vars       = template_vars,
+        app_name            = app_name,
+        fallback_data_roots = fallback_data_roots,
+        maps_index_file     = maps_index_file,
     )
     return _cell_from_tree(
         tree       = tree,

@@ -2,6 +2,7 @@ from .types import Actor
 from .bundle import (
     BundleDirs,
     cell_from_bundle,
+    cell_from_map,
     config_tree_from_bundle,
     list_installed,
     pack,
@@ -11,6 +12,7 @@ from .bundle import (
     push_to_hub,
     register_bundle,
     resolve_map_fp,
+    template_vars_for_map,
 )
 from .cell import Cell, build_tableOps, cell_from_file
 from .configTree import config_tree, toml_config_tree

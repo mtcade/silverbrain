@@ -128,7 +128,7 @@ def col_for_dtype( dtype: pl.DataType ) -> str:
     """
     s = dtype_to_str( dtype ).lower().replace( '(', '_' ).replace( ')', '' )
     return 'par_val_' + s
-
+#/def col_for_dtype
 
 # Cached names for the six common types used in parsing dispatch.
 _COL_STR    = col_for_dtype( pl.Utf8 )              # 'par_val_string'
@@ -268,7 +268,6 @@ class LeafPath:
     """One leaf of a tree-shaped parameter DataFrame (see ParameterParser.leaf_paths())."""
     content_node_idxs: list[ int ]
     choices:           list[ tuple[ int, int ] ]  # (junction_node_idx, chosen_child_node_idx), root -> leaf
-
 
 # -- ParameterParser
 

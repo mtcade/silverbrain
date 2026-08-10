@@ -45,11 +45,12 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # parameter spec rows
     'par_idx':          pl.UInt32,
 } | {
-    # __nodes__ serialization -- see squishy-sleeping-snowflake.md. A Cell's
+    # __nodes__ serialization -- A Cell's
     # own local table only ever has parent_idn = null (every row is a
     # direct child of this Cell); the same shape is reused by configTree.py
     # for a real multi-level file-reference tree, parsed before any live
     # Cell exists.
+    #
     # node_idn   — the name this child is registered under in self.tableOps;
     #              doubles as the lookup key (self.tableOps[node_idn])
     # parent_idn — parent node_idn in the same table; null = direct child
@@ -65,16 +66,43 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # source     — names this node's positional dfs inputs are read from,
     #              assigned by whoever registers it (its parent Cell); need
     #              not be unique -- a name may feed more than one node
-    #              (fan-out) and, since the wiring graph isn't required to
-    #              be a DAG, more than one node may target the same name
-    #              across different rounds (loops)
+    #              (fan-out, each consumer keeping its own read position)
+    #              and, since the wiring graph isn't required to be a DAG,
+    #              more than one node may target the same name across
+    #              different rounds (loops) -- each write just appends
+    #              another token to that name's log
     # target     — names this node's positional outputs are written under,
     #              likewise parent-assigned; a null/None value for a target
-    #              is a legitimate "no data this round" signal (loop
-    #              termination), not an error
+    #              is an ordinary token like any other (still appended to
+    #              the log) -- a consumer that cares about a null branch
+    #              (e.g. loop termination) inspects the value it received,
+    #              no separate engine-level rule
+    # join       — this node's firing rule over its declared source
+    #              names' per-consumer read cursors (point-to-point/Kahn
+    #              Process Network-style ports, see _WiringEngine): 'all'
+    #              (default, AND-join -- fires once every source has an
+    #              unread token), 'any' (fires once at least one source
+    #              has an unread token; others contribute None that
+    #              firing), 'at_least_k' (fires once join_k sources have
+    #              an unread token). Pure presence, no cross-source
+    #              identity check needed -- see _WiringEngine._scan's
+    #              docstring for why per-port FIFO ordering alone
+    #              guarantees correct pairing.
+    # join_k     — required (1 <= join_k <= len(source)) iff
+    #              join == 'at_least_k', else must be null.
     'node_idn':     pl.Utf8,
     'parent_idn':   pl.Utf8,
     'kind':         pl.Utf8,
+    'join':         pl.Utf8,
+    'join_k':       pl.Int64,
+    # configTree.py: which op_classes key to construct a kind='op' row with
+    # -- distinct from node_idn (that row's own wiring/dispatch identity),
+    # so the same class can be built by multiple anonymous nodes (node_idn
+    # omitted, auto-generated) wired only by source/target. Defaults to the
+    # row's own node_idn when omitted (today's behavior). Null on every
+    # other kind -- kind='cell'/'placeholder' resolve their own "type" via
+    # toml/cell_idn/columns instead.
+    'op_type':      pl.Utf8,
     # configTree.py: file-reference metadata for kind='cell' rows only, not
     # part of a live Cell's own __nodes__ table.
     'path':         pl.Utf8,
@@ -133,6 +161,7 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # alongside the backend-specific TableOps that read/write them.
     '__nodes__': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
+        'join', 'join_k',
     )),
 
     # -- TOML ↔ DataFrame schemas
@@ -150,7 +179,8 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # see cannonical_schema above.
     'config_tree': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'path', 'cell_source', 'cell_target', 'placeholder_columns',
+        'join', 'join_k',
+        'path', 'cell_source', 'cell_target', 'placeholder_columns', 'op_type',
     )),
 }
 

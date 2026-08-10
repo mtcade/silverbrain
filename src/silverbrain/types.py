@@ -60,21 +60,29 @@ TableProcessDict: Type = dict[ str, TableProcess | TableCheck ]
 # Either may be None, same as TableOp today, when no schema has been
 # declared.
 #
-# corr_id (squishy-sleeping-snowflake.md) is a correlation id: a tuple of
-# strings identifying which "round" of execution a call belongs to. It's
-# needed once wiring supports fan-in (a node with several named inputs
-# must know which arrivals belong together) and cycles/loops (the same
-# node can fire more than once per outer call, each firing under its own
-# id -- see Cell.__call__'s wiring engine). Every Cell invocation extends
-# corr_id with a fresh segment of its own, so its internal joins can't
-# cross-talk with a concurrent invocation of the same Cell. A TableOp
-# doesn't need it (it's atomic, no children to route between) but every
-# TableOp.__call__ takes corr_id like every other Actor, for interface
-# consistency and optional use in logging/tracing -- it's simply unused in
-# TableOp.__call__ bodies. Every Actor instance -- TableOp, Cell, and any
-# test/ad hoc callable used as a node op -- is required to accept corr_id;
-# Cell's dispatch engine (_call_actor) passes it unconditionally, with no
-# structural probing.
+# corr_id (squishy-sleeping-snowflake.md) is a tuple of strings, carried
+# alongside dfs on every message a node sends or receives. It is PURELY a
+# tracing/correlation aid, not correctness-relevant: cell.py's
+# _WiringEngine wires actors point-to-point (Kahn Process Network-style
+# named ports, each an ordered FIFO queue, not a shared overwritable
+# blackboard), so pairing tokens across a node's several source ports
+# never needs an explicit identity check -- per-port FIFO ordering alone
+# guarantees it, given actors are never re-dispatched while a prior firing
+# of themselves is still in flight (see _WiringEngine's docstring for the
+# full argument). A root corr_id is minted once, at a true top-level
+# Cell.__call__ (no corr_id given); every ordinary node/Cell firing
+# thereafter relays whatever corr_id its dispatch carried, from whichever
+# source port participated (first in declared order), unchanged -- no
+# extension, no re-minting. Concurrency isolation between invocations of
+# the same Cell does NOT depend on corr_id's uniqueness -- a fresh
+# _WiringEngine (its own per-call logs/cursors) is constructed every call
+# regardless of what corr_id it's given. A TableOp doesn't need it (it's
+# atomic, no children to route between) but every TableOp.__call__ takes
+# corr_id like every other Actor, for interface consistency and optional
+# use in logging/tracing -- it's simply unused in TableOp.__call__ bodies.
+# Every Actor instance -- TableOp, Cell, and any test/ad hoc callable used
+# as a node op -- is required to accept corr_id; Cell's dispatch engine
+# (_call_actor) passes it unconditionally, with no structural probing.
 #
 # The actor contract is asynchronous in every case: a caller must never
 # block waiting for an actor to finish. A Cell's own __call__ returns a
