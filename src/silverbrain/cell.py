@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, Sequence
 
+import inspect
 import threading
 
 import polars as pl
@@ -396,10 +397,18 @@ class Cell:
         input:      list[ tableOps.InputSchema ]  | None = None,
         output:     list[ tableOps.OutputSchema ] | None = None,
         parameters: pl.DataFrame | None            = None,
+        resources:  pl.DataFrame | None            = None,
         ) -> None:
         self.main_id:   str                   = main_id
         self.verbose:   int                   = verbose
         self.tableOps:  types.TableProcessDict = {}
+        # A resource manifest (table_index-shaped, see ReadWriteOps.py) --
+        # held as a top-level attribute of every Cell and, in general,
+        # passed to child Cells (see _cell_from_tree), the same way the
+        # __table_ops_parameters__ forest already is. Opaque to core Cell
+        # itself (which schema/columns it has is a caller concern, e.g.
+        # ReadWriteOps.py's table_index) -- just carried and threaded.
+        self.resources: pl.DataFrame | None = resources
         # This Cell's own external binding -- private to this Cell, not the
         # same as the source/target a parent assigns when registering this
         # Cell as one of ITS nodes. Replaces the old single op_idn (Static
@@ -794,9 +803,10 @@ class Cell:
         Domain tables (non-system keys): a's, then b's (b overwrites a).
         """
         merged = cls(
-            main_id = main_id or f"{ a.main_id }_{ b.main_id }",
-            source  = source if source is not None else a.source,
-            target  = target if target is not None else a.target,
+            main_id   = main_id or f"{ a.main_id }_{ b.main_id }",
+            source    = source if source is not None else a.source,
+            target    = target if target is not None else a.target,
+            resources = a.resources if a.resources is not None else b.resources,
         )
 
         ops: types.TableProcessDict = dict( a.tableOps ) | dict( b.tableOps )
@@ -853,6 +863,7 @@ def build_tableOps(
     rng:        np.random.Generator | None,
     parameters: pl.DataFrame,
     op_types:   dict[ str, str ] | None = None,
+    resources:  pl.DataFrame | None     = None,
     ) -> types.TableProcessDict:
     """
     Construct one TableOp instance per op_keys entry:
@@ -868,6 +879,15 @@ def build_tableOps(
     ctor kwargs), never by class_key -- two nodes sharing an op_type have
     no reason to share ctor kwargs too.
 
+    resources (the Cell-level resource manifest -- see Cell.resources) is
+    passed as a ctor kwarg ONLY to classes whose own __init__ declares a
+    `resources` parameter (checked via inspect.signature) -- unlike rng,
+    which every TableOp already accepts unconditionally, most existing ops
+    have no use for resources at all, so this stays opt-in rather than
+    forcing every TableOp subclass in existence to grow an unused
+    parameter (see silverbrain.ReadWriteOps.ReadOp/WriteOp/ReadWriteOp for
+    the ops that do want it).
+
     Replaces the old "a series of lambdas" pattern (an application
     hand-writing a get_ops(keys, rng) function with one branch per op_idn)
     with a plain class registry + this one generic instantiation rule.
@@ -876,10 +896,14 @@ def build_tableOps(
     """
     kwargs_by_op = op_ctor_kwargs_forest( parameters )
     op_types     = op_types or {}
-    return {
-        op_idn: op_classes[ op_types.get( op_idn, op_idn ) ]( rng = rng, **kwargs_by_op.get( op_idn, {} ) )
-        for op_idn in op_keys
-    }
+    ops: types.TableProcessDict = {}
+    for op_idn in op_keys:
+        cls    = op_classes[ op_types.get( op_idn, op_idn ) ]
+        kwargs = dict( kwargs_by_op.get( op_idn, {} ) )
+        if 'resources' in inspect.signature( cls.__init__ ).parameters:
+            kwargs.setdefault( 'resources', resources )
+        ops[ op_idn ] = cls( rng = rng, **kwargs )
+    return ops
 #/def build_tableOps
 
 
@@ -890,6 +914,7 @@ def _cell_from_tree(
     rng:        np.random.Generator | None,
     verbose:    int,
     parameters: pl.DataFrame,
+    resources:  pl.DataFrame | None = None,
     ) -> Cell:
     """
     Construct one Cell (and, recursively, its nested Cell children) from a
@@ -908,6 +933,12 @@ def _cell_from_tree(
     per-Cell slice. Currently always empty (no TOML syntax populates it
     yet); build_tableOps()/op_ctor_kwargs_forest() already handle a
     non-empty one, ahead of that syntax landing.
+
+    resources (Cell.resources -- a table_index-shaped resource manifest,
+    see ReadWriteOps.py) is threaded the exact same way: unchanged to
+    every level, every Cell (and any resources-declaring TableOp
+    build_tableOps constructs) sharing the one manifest the caller
+    supplied at the root.
     """
     own_row = tree.filter(
         ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
@@ -922,7 +953,7 @@ def _cell_from_tree(
         row[ 'node_idn' ]: row[ 'op_type' ] or row[ 'node_idn' ]
         for row in op_children
     }
-    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types )
+    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types, resources )
 
     for row in placeholder_children:
         # configTree.py already fully resolved every atom's dtype before
@@ -940,6 +971,7 @@ def _cell_from_tree(
             rng        = rng,
             verbose    = verbose,
             parameters = parameters,
+            resources  = resources,
         )
 
     cell = Cell(
@@ -949,6 +981,7 @@ def _cell_from_tree(
         source     = own_row[ 'cell_source' ] or [],
         target     = own_row[ 'cell_target' ] or [],
         parameters = parameters,
+        resources  = resources,
     )
 
     for row in op_children + placeholder_children:
@@ -978,7 +1011,8 @@ def cell_from_file(
     template_vars: dict[ str, str ] | None = None,
     app_name: str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
-    maps_index_file: Path = configTree.MAPS_INDEX_FILE_DEFAULT,
+    cells_index_file: Path = configTree.CELLS_INDEX_FILE_DEFAULT,
+    resources: pl.DataFrame | None = None,
 ) -> Cell:
     """
     Construct a Cell from a config file, delegating to configTree.config_tree
@@ -1008,11 +1042,15 @@ def cell_from_file(
     verbose     : forwarded to ``Cell.__init__`` at every level
     template_vars : optional ``{key}`` substitutions applied to kind='cell'
                   ``toml`` strings before resolving (e.g. ``{cells_root}``)
-    app_name/fallback_data_roots/maps_index_file : only needed if some
+    app_name/fallback_data_roots/cells_index_file : only needed if some
                   kind='cell' [[nodes]] entry (anywhere in the transitive
                   walk) uses ``cell_idn`` instead of ``toml`` -- resolved via
                   bundle.resolve_map_fp()'s maps_index.toml search. Omit for
                   a config that only ever uses ``toml``.
+    resources   : a table_index-shaped resource manifest (see
+                  ReadWriteOps.py), threaded unchanged to every Cell in the
+                  transitive walk and to every resources-declaring TableOp
+                  build_tableOps() constructs -- see Cell.resources.
 
     TOML schema expected
     --------------------
@@ -1062,7 +1100,7 @@ def cell_from_file(
         template_vars       = template_vars,
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
-        maps_index_file     = maps_index_file,
+        cells_index_file     = cells_index_file,
     )
     return _cell_from_tree(
         tree       = tree,
@@ -1071,5 +1109,6 @@ def cell_from_file(
         rng        = rng,
         verbose    = verbose,
         parameters = parameters,
+        resources  = resources,
     )
 #/def cell_from_file

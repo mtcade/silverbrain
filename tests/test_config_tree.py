@@ -452,8 +452,8 @@ kind     = "bogus"
 def test_cell_kind_resolves_via_cell_idn( tmp_path: Path ) -> None:
     data_root = tmp_path / 'data_root'
     ( data_root / 'cells' ).mkdir( parents=True )
-    _write( data_root / 'maps_index.toml', """\
-[[maps]]
+    _write( data_root / 'cells_index.toml', """\
+[[cells]]
 cell_idn = "child_cell"
 path     = "cells/child.toml"
 """ )

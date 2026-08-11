@@ -117,7 +117,7 @@ in the topology.
 """
 
 from . import bdd
-from .bundle import MAPS_INDEX_FILE_DEFAULT, resolve_map_fp
+from .bundle import CELLS_INDEX_FILE_DEFAULT, resolve_cell_fp
 from .exprParse import expr_to_text, parse_expr
 from .parameterParse import ParameterParser, parameter_group_to_tree
 from .schema import table_schemas
@@ -350,7 +350,7 @@ def config_tree(
     node_idx_start:      int = 0,
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
-    maps_index_file:     Path = MAPS_INDEX_FILE_DEFAULT,
+    cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
@@ -367,9 +367,9 @@ def config_tree(
     from one running counter, so the whole forest this call produces has
     globally-unique node_idx (not just unique per entry).
 
-    app_name/fallback_data_roots/maps_index_file: only needed if some
+    app_name/fallback_data_roots/cells_index_file: only needed if some
     kind='cell' [[nodes]] entry, anywhere in the transitive walk, uses
-    'cell_idn' instead of 'toml' -- resolved via bundle.resolve_map_fp()'s
+    'cell_idn' instead of 'toml' -- resolved via bundle.resolve_cell_fp()'s
     maps_index.toml search. None/omitted (the default) preserves today's
     exact behavior for every caller that only ever uses 'toml'.
 
@@ -399,7 +399,7 @@ def config_tree(
         node_idx_start      = node_idx_start,
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
-        maps_index_file     = maps_index_file,
+        cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
     )
@@ -416,7 +416,7 @@ def toml_config_tree(
     node_idx_start:      int = 0,
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
-    maps_index_file:     Path = MAPS_INDEX_FILE_DEFAULT,
+    cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
@@ -440,7 +440,7 @@ def toml_config_tree(
         node_idx_start      = node_idx_start,
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
-        maps_index_file     = maps_index_file,
+        cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
     )
@@ -457,7 +457,7 @@ def json_config_tree(
     node_idx_start:      int = 0,
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
-    maps_index_file:     Path = MAPS_INDEX_FILE_DEFAULT,
+    cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
@@ -483,7 +483,7 @@ def json_config_tree(
         node_idx_start      = node_idx_start,
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
-        maps_index_file     = maps_index_file,
+        cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
     )
@@ -501,7 +501,7 @@ def _config_tree_from_data(
     node_idx_start: int,
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
-    maps_index_file:     Path = MAPS_INDEX_FILE_DEFAULT,
+    cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
@@ -671,8 +671,8 @@ def _config_tree_from_data(
                     f"cell_idn={entry['cell_idn']!r} but no app_name was "
                     f"supplied to resolve it via maps_index.toml"
                 )
-            child_toml_path = resolve_map_fp(
-                entry[ 'cell_idn' ], app_name, fallback_data_roots, maps_index_file,
+            child_toml_path = resolve_cell_fp(
+                entry[ 'cell_idn' ], app_name, fallback_data_roots, cells_index_file,
             )
         elif has_toml:
             child_toml_path = ( path.parent / apply_template_vars( entry[ 'toml' ], tvars ) ).resolve()
@@ -693,7 +693,7 @@ def _config_tree_from_data(
             node_idx_start      = node_idx,
             app_name            = app_name,
             fallback_data_roots = fallback_data_roots,
-            maps_index_file     = maps_index_file,
+            cells_index_file     = cells_index_file,
             join                = join,
             join_k              = join_k,
         )

@@ -131,3 +131,35 @@ def test_build_tableOps_op_types_omitted_matches_today_behavior() -> None:
     ops   = build_tableOps( { 'a': _DefaultsOp }, [ 'a' ], None, empty )
     assert isinstance( ops[ 'a' ], _DefaultsOp )
 #/def test_build_tableOps_op_types_omitted_matches_today_behavior
+
+
+# -- resources: injected only into ops whose __init__ declares it
+
+
+class _ResourcesAwareOp:
+    def __init__( self, rng = None, resources = None ) -> None:
+        self.rng       = rng
+        self.resources = resources
+#/class _ResourcesAwareOp
+
+
+def test_build_tableOps_injects_resources_only_into_declaring_ops() -> None:
+    p     = _params_parser()
+    empty = pl.DataFrame( schema = p.schema )
+    sentinel = pl.DataFrame( { 'table_idn': [ 'x' ] } )
+    ops = build_tableOps(
+        { 'aware': _ResourcesAwareOp, 'unaware': _DefaultsOp },
+        [ 'aware', 'unaware' ], None, empty,
+        resources = sentinel,
+    )
+    assert ops[ 'aware' ].resources is sentinel
+    assert not hasattr( ops[ 'unaware' ], 'resources' )
+#/def test_build_tableOps_injects_resources_only_into_declaring_ops
+
+
+def test_build_tableOps_resources_omitted_defaults_to_none() -> None:
+    p     = _params_parser()
+    empty = pl.DataFrame( schema = p.schema )
+    ops   = build_tableOps( { 'aware': _ResourcesAwareOp }, [ 'aware' ], None, empty )
+    assert ops[ 'aware' ].resources is None
+#/def test_build_tableOps_resources_omitted_defaults_to_none

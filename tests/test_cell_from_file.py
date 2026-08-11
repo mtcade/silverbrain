@@ -94,6 +94,29 @@ def test_nested_child_executes_through_parent_call( tmp_path: Path ) -> None:
     assert result[ 0 ][ 'v' ].to_list() == [ 2, 4, 6 ]
 
 
+def test_resources_threads_unchanged_to_nested_child( tmp_path: Path ) -> None:
+    """Cell.resources (a table_index-shaped manifest, see ReadWriteOps.py)
+    is a top-level attribute of every Cell -- passed to cell_from_file(),
+    it reaches every Cell in the transitive kind='cell' walk unchanged,
+    the same way the __table_ops_parameters__ forest already does."""
+    _write( tmp_path / 'child.toml', _CHILD_TOML )
+    _write( tmp_path / 'parent.toml', _parent_toml() )
+
+    manifest = pl.DataFrame( { 'table_idn': [ 'x' ] } )
+    parent = cell_from_file( tmp_path / 'parent.toml', _OPS, main_id='parent', resources=manifest )
+    assert parent.resources is manifest
+    assert parent.tableOps[ 'kid' ].resources is manifest
+
+
+def test_resources_defaults_to_none( tmp_path: Path ) -> None:
+    _write( tmp_path / 'child.toml', _CHILD_TOML )
+    _write( tmp_path / 'parent.toml', _parent_toml() )
+
+    parent = cell_from_file( tmp_path / 'parent.toml', _OPS, main_id='parent' )
+    assert parent.resources is None
+    assert parent.tableOps[ 'kid' ].resources is None
+
+
 def test_bind_resolves_nested_child_directly( tmp_path: Path ) -> None:
     """bind() on the parent returns a Future-returning callable that runs the nested child Cell."""
     _write( tmp_path / 'child.toml', _CHILD_TOML )

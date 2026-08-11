@@ -106,6 +106,20 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # configTree.py: file-reference metadata for kind='cell' rows only, not
     # part of a live Cell's own __nodes__ table.
     'path':         pl.Utf8,
+    # table_index (below): identifies where one named table lives, across
+    # any backend ReadWriteOps.py's ReadOp/WriteOp/ReadWriteOp know how to
+    # resolve. 'kind' selects which of these remaining, mostly-nullable
+    # columns are meaningful -- 'local' only uses 'path'; 'sqlite' uses
+    # 'db_path'/'table_name'; 'postgres' uses 'connection_string'/
+    # 'table_name'/'schema_name'; 'json_ptree' (silverflow's
+    # ReadParametersOp only) uses 'path'. Moved here from silverflow's own
+    # cannonical_schema once table_idn resolution became core
+    # infrastructure (ReadWriteOps.py) rather than a silverflow-specific
+    # convention.
+    'db_path':           pl.Utf8,
+    'table_name':        pl.Utf8,
+    'connection_string': pl.Utf8,
+    'schema_name':       pl.Utf8,
     # configTree.py: kind='placeholder' rows' declared interface -- a
     # bdd.Expr serialized via exprParse.expr_to_text (may reference
     # ColVar; every Atom always carries an explicit dtype in this stored
@@ -156,9 +170,12 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     '__tables_schema__': cannonical_schema_for_keys((
         'table_idn', 'column_names', 'column_types',
     )),
-    # Backend storage table schemas (__backend_index__, __parquet_backend__,
-    # __sqlite_backend__, __postgres_backend__) live in silverflow.schema
-    # alongside the backend-specific TableOps that read/write them.
+    # See cannonical_schema's own 'db_path'/'table_name'/'connection_string'/
+    # 'schema_name' comment above -- ReadWriteOps.py's TableIndexEntry
+    # mirrors this exact column set with Python-native types.
+    'table_index': cannonical_schema_for_keys((
+        'table_idn', 'kind', 'path', 'db_path', 'table_name', 'connection_string', 'schema_name',
+    )),
     '__nodes__': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
         'join', 'join_k',
