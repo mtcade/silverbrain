@@ -7,7 +7,9 @@ from . import configTree, exprParse, tableOps, tableProcesses, types
 from .types import Actor
 from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
+from .ReadWriteOps import merge_resources
 from .schema import table_schemas, table_schemas_to_df
+from .sunder import sunder_table_factories
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -163,6 +165,21 @@ class _WiringEngine:
     can depend on them and they never contribute to resolving a target.
     This is node-level only (register_node's target=) -- a Cell's own
     external source/target contract is unaffected.
+
+    Sunder tables (see sunder.py) are auto-supplied at construction, before
+    any node ever fires -- but ONLY for a name nothing else could ever
+    supply: a declared source name that (a) names a registered sunder
+    factory, (b) is absent from this Cell's own self.source (so no caller
+    could ever seed it), AND (c) is never the target of any node in this
+    same Cell (so no sibling node could ever produce it either) gets one
+    freshly-built token appended to its log up front. This is what lets
+    e.g. `_trigger` reach a deeply-nested node without every enclosing Cell
+    re-declaring it in its own `[cell] source = [...]` just to relay it
+    downward -- while still always preferring an explicit value over the
+    synthetic one: if a parent DOES pass a real value for that name (via
+    self.source, or by wiring some node's target to it), auto-supply never
+    fires for it at all, so there's no synthetic token racing a real one
+    into the same FIFO log and no risk of the real one being shadowed.
     """
 
     def __init__(
@@ -182,6 +199,35 @@ class _WiringEngine:
         self.cursor: dict[ tuple[ str, str ], int ]    = {}
         self.in_flight:  set[ str ]                    = set()
         self._nodes = cell.tables[ '__nodes__' ].to_dicts()
+
+        # -- Sunder table auto-supply (see sunder.py's module docstring).
+        # Explicit always wins over magic: auto-supply only ever fires for
+        # a name NOTHING in this Cell could ever explicitly supply --
+        # neither this Cell's own external contract (self.source, seeded
+        # by Cell.__call__'s seed(), which zips dfs against exactly that
+        # tuple) nor any sibling node's target within this same Cell
+        # (an explicit intra-cell pass-through). If either route could
+        # produce the name, auto-supply skips it entirely, so a genuine
+        # parent-supplied value is never raced against -- let alone
+        # shadowed by -- a synthetic one landing first in the same FIFO
+        # log. Only once both routes are ruled out does this Cell build
+        # and seed the sunder table itself, once, right here -- before
+        # seed() or _scan() ever runs -- so every node (and every fan-out
+        # consumer of the same name within this Cell) reads the same
+        # single token, exactly as if a parent had passed it in.
+        needed_sources = {
+            s for row in self._nodes for s in ( row.get( 'source' ) or [] )
+        }
+        explicitly_supplied = set( cell.source ) | {
+            t for row in self._nodes for t in ( row.get( 'target' ) or [] )
+        }
+        for name in needed_sources:
+            if name in sunder_table_factories and name not in explicitly_supplied:
+                self.logs.setdefault( name, [] ).append(
+                    Token( corr_id = root_id, value = sunder_table_factories[ name ]() )
+                )
+            #/if name in sunder_table_factories and name not in explicitly_supplied
+        #/for name in needed_sources
     #/def __init__
 
     def seed( self: Self, values: dict[ str, pl.DataFrame ] ) -> None:
@@ -403,11 +449,15 @@ class Cell:
         self.verbose:   int                   = verbose
         self.tableOps:  types.TableProcessDict = {}
         # A resource manifest (table_index-shaped, see ReadWriteOps.py) --
-        # held as a top-level attribute of every Cell and, in general,
-        # passed to child Cells (see _cell_from_tree), the same way the
-        # __table_ops_parameters__ forest already is. Opaque to core Cell
-        # itself (which schema/columns it has is a caller concern, e.g.
-        # ReadWriteOps.py's table_index) -- just carried and threaded.
+        # held as a top-level attribute of every Cell. This is already the
+        # fully-resolved OUTPUT of this Cell's own construction-time
+        # caller-wins merge of its declared [resources] defaults and
+        # whatever override its instantiating parent explicitly supplied
+        # (see _cell_from_tree/configTree.py's [resources]/[nodes.resources]
+        # and ReadWriteOps.merge_resources) -- NOT itself forwarded to any
+        # nested child Cell automatically. Opaque to core Cell itself
+        # (which schema/columns it has is a caller concern, e.g.
+        # ReadWriteOps.py's table_index) -- just carried, not interpreted.
         self.resources: pl.DataFrame | None = resources
         # This Cell's own external binding -- private to this Cell, not the
         # same as the source/target a parent assigns when registering this
@@ -800,6 +850,14 @@ class Cell:
             a forest, not keyed by any single column shared across
             independently-sourced trees; see configTree.py's module
             docstring).
+        resources: a's if present, else b's -- a simple presence-wins pick,
+            not another caller-wins override pass. a/b are already
+            fully-constructed Cells, so each .resources is already the
+            resolved OUTPUT of its own construction-time merge (see
+            Cell.__init__) -- there's no "instantiating parent" relationship
+            between merge's a/b the way there is between a Cell and
+            whoever built it, so a second override pass wouldn't have a
+            principled winner to pick beyond this.
         Domain tables (non-system keys): a's, then b's (b overwrites a).
         """
         merged = cls(
@@ -879,8 +937,8 @@ def build_tableOps(
     ctor kwargs), never by class_key -- two nodes sharing an op_type have
     no reason to share ctor kwargs too.
 
-    resources (the Cell-level resource manifest -- see Cell.resources) is
-    passed as a ctor kwarg ONLY to classes whose own __init__ declares a
+    resources (this Cell's own resolved resource manifest -- see
+    Cell.resources) is passed as a ctor kwarg ONLY to classes whose own __init__ declares a
     `resources` parameter (checked via inspect.signature) -- unlike rng,
     which every TableOp already accepts unconditionally, most existing ops
     have no use for resources at all, so this stays opt-in rather than
@@ -914,7 +972,7 @@ def _cell_from_tree(
     rng:        np.random.Generator | None,
     verbose:    int,
     parameters: pl.DataFrame,
-    resources:  pl.DataFrame | None = None,
+    declared_resources: dict[ str, dict[ str, pl.DataFrame | None ] ] | None = None,
     ) -> Cell:
     """
     Construct one Cell (and, recursively, its nested Cell children) from a
@@ -934,11 +992,17 @@ def _cell_from_tree(
     yet); build_tableOps()/op_ctor_kwargs_forest() already handle a
     non-empty one, ahead of that syntax landing.
 
-    resources (Cell.resources -- a table_index-shaped resource manifest,
-    see ReadWriteOps.py) is threaded the exact same way: unchanged to
-    every level, every Cell (and any resources-declaring TableOp
-    build_tableOps constructs) sharing the one manifest the caller
-    supplied at the root.
+    declared_resources (configTree.py's resources_map -- see its
+    [resources]/[nodes.resources] docs) is threaded UNCHANGED to every
+    level, exactly like parameters -- but, unlike parameters, each level
+    only ever reads its OWN node_idn's two slots ('own': this Cell's own
+    declared [resources] defaults; 'override': whatever its instantiating
+    parent explicitly bound for it via [nodes.resources]) and resolves them
+    via merge_resources (caller/override wins on a clashing table_idn).
+    This Cell's OWN resolved Cell.resources is never itself forwarded to
+    any child -- a nested Cell only ever sees resources through its own
+    declared defaults plus its own parent's explicit override slot in
+    declared_resources; there is no automatic inheritance beyond that.
     """
     own_row = tree.filter(
         ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
@@ -948,12 +1012,15 @@ def _cell_from_tree(
     placeholder_children = children.filter( pl.col( 'kind' ) == 'placeholder' ).to_dicts()
     cell_children        = children.filter( pl.col( 'kind' ) == 'cell'        ).to_dicts()
 
+    _decl = ( declared_resources or {} ).get( node_idn, {} )
+    effective_resources = merge_resources( _decl.get( 'own' ), _decl.get( 'override' ) )
+
     op_keys: list[ str ] = [ row[ 'node_idn' ] for row in op_children ]
     op_types: dict[ str, str ] = {
         row[ 'node_idn' ]: row[ 'op_type' ] or row[ 'node_idn' ]
         for row in op_children
     }
-    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types, resources )
+    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types, effective_resources )
 
     for row in placeholder_children:
         # configTree.py already fully resolved every atom's dtype before
@@ -965,13 +1032,17 @@ def _cell_from_tree(
 
     for row in cell_children:
         ops[ row[ 'node_idn' ] ] = _cell_from_tree(
-            tree       = tree,
-            node_idn   = row[ 'node_idn' ],
-            op_classes = op_classes,
-            rng        = rng,
-            verbose    = verbose,
-            parameters = parameters,
-            resources  = resources,
+            tree               = tree,
+            node_idn           = row[ 'node_idn' ],
+            op_classes         = op_classes,
+            rng                = rng,
+            verbose            = verbose,
+            parameters         = parameters,
+            # Unchanged, not effective_resources -- a child only ever sees
+            # resources through its OWN 'own'/'override' slots in this same
+            # dict, never through what this level resolved for itself. This
+            # is what enforces "no automatic inheritance" (see docstring).
+            declared_resources = declared_resources,
         )
 
     cell = Cell(
@@ -981,7 +1052,7 @@ def _cell_from_tree(
         source     = own_row[ 'cell_source' ] or [],
         target     = own_row[ 'cell_target' ] or [],
         parameters = parameters,
-        resources  = resources,
+        resources  = effective_resources,
     )
 
     for row in op_children + placeholder_children:
@@ -1048,9 +1119,16 @@ def cell_from_file(
                   bundle.resolve_map_fp()'s maps_index.toml search. Omit for
                   a config that only ever uses ``toml``.
     resources   : a table_index-shaped resource manifest (see
-                  ReadWriteOps.py), threaded unchanged to every Cell in the
-                  transitive walk and to every resources-declaring TableOp
-                  build_tableOps() constructs -- see Cell.resources.
+                  ReadWriteOps.py) acting as the ROOT Cell's own
+                  caller-override -- merged (caller-wins) against the root
+                  cell's own declared [resources] TOML defaults, exactly
+                  the same role a parent's [nodes.resources] block plays
+                  for a nested kind='cell' instantiation (this Python
+                  kwarg IS that override, for the outermost/no-parent
+                  case). NOT forwarded to any nested child automatically --
+                  a child only ever sees resources via its own [resources]
+                  defaults plus its own parent's explicit
+                  [nodes.resources] override.
 
     TOML schema expected
     --------------------
@@ -1093,8 +1171,23 @@ def cell_from_file(
         #   input/output, raises if actually called); swap
         #   cell.tableOps[node_idn] for a real TableOp/Cell before this node
         #   is reached on a live execution path.
+
+    [resources]                  # this cell's own declared resources
+        _json = "path/to/resources.json"   # relative to this file -- or,
+                                            # instead (never both):
+    [[resources.items]]
+        table_idn = "..."
+        kind      = "local"      # optional, defaults "local"
+        path      = "..."        # or db_path/table_name/connection_string/
+                                  # schema_name, whichever 'kind' needs
+
+        # A kind='cell' [[nodes]] entry may carry its own [nodes.resources]
+        # (same _json/items grammar) -- the caller-override this specific
+        # instantiation explicitly binds for that child; wins over the
+        # child's own declared defaults on a clashing table_idn. See
+        # configTree.py's module docstring for the full semantics.
     """
-    tree, parameters, _ = configTree.config_tree(
+    tree, parameters, _, declared_resources = configTree.config_tree(
         path                = path,
         node_idn            = main_id,
         template_vars       = template_vars,
@@ -1102,13 +1195,19 @@ def cell_from_file(
         fallback_data_roots = fallback_data_roots,
         cells_index_file     = cells_index_file,
     )
+    if resources is not None:
+        declared_resources = dict( declared_resources )
+        declared_resources[ main_id ] = {
+            **declared_resources.get( main_id, {} ),
+            'override': resources,
+        }
     return _cell_from_tree(
-        tree       = tree,
-        node_idn   = main_id,
-        op_classes = op_classes,
-        rng        = rng,
-        verbose    = verbose,
-        parameters = parameters,
-        resources  = resources,
+        tree               = tree,
+        node_idn           = main_id,
+        op_classes         = op_classes,
+        rng                = rng,
+        verbose            = verbose,
+        parameters         = parameters,
+        declared_resources = declared_resources,
     )
 #/def cell_from_file

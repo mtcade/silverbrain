@@ -53,7 +53,7 @@ kind     = "op"
 source   = ["inp"]
 target   = ["out"]
 """ )
-    tree, params, next_node_idx = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, params, next_node_idx, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
 
     assert next_node_idx == 0  # no [[parameters]] entries -> counter untouched
@@ -107,7 +107,7 @@ source   = ["top_in"]
 target   = ["top_out"]
 """ )
 
-    tree, params, _ = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    tree, params, _, _ = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
     rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
 
     assert set( rows.keys() ) == { 'top', 'kid', 'grandkid', 'leaf_op' }
@@ -126,7 +126,7 @@ target   = ["top_out"]
 
 def test_config_tree_dispatches_toml_to_toml_parser( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', "[cell]\n" )
-    tree, params, _ = config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, params, _, _ = config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert tree[ 'node_idn' ].to_list() == [ 'root' ]
     assert params.is_empty()
 
@@ -169,7 +169,7 @@ node_idn  = "reader"
 threshold = 0.5
 label     = "x"
 """ )
-    _, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    _, params, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
 
 
@@ -182,7 +182,7 @@ def test_parameters_external_toml_reference( tmp_path: Path ) -> None:
 node_idn = "reader"
 _toml    = "reader_params.toml"
 """ )
-    _, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    _, params, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
 
 
@@ -195,7 +195,7 @@ def test_parameters_external_json_reference( tmp_path: Path ) -> None:
 node_idn = "reader"
 _json    = "reader_params.json"
 """ )
-    _, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    _, params, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
 
 
@@ -254,7 +254,7 @@ node_idn = "kid"
 kind     = "cell"
 toml     = "child.toml"
 """ )
-    _, params, next_node_idx = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    _, params, next_node_idx, _ = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
     assert op_ctor_kwargs_forest( params ) == {
         'reader': { 'threshold': 0.5 },
         'writer': { 'label': 'out' },
@@ -273,7 +273,7 @@ def test_parameters_node_idx_start_is_threaded_and_returned( tmp_path: Path ) ->
 node_idn  = "reader"
 threshold = 0.5
 """ )
-    tree, params, next_node_idx = toml_config_tree(
+    tree, params, next_node_idx, _ = toml_config_tree(
         tmp_path / 'leaf.toml', node_idn='root', node_idx_start = 100,
     )
     assert next_node_idx == 101  # one flat group -> one node_idx consumed
@@ -306,7 +306,7 @@ node_idn = "kid"
 kind     = "cell"
 toml     = "child.toml"
 """ )
-    _, params, next_node_idx = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    _, params, next_node_idx, _ = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
     reader_idx = _node_idx_for_op( params, 'reader' )
     writer_idx = _node_idx_for_op( params, 'writer' )
     assert reader_idx == 0
@@ -325,11 +325,203 @@ def test_parameters_template_vars_apply_to_external_reference( tmp_path: Path ) 
 node_idn = "reader"
 _toml    = "{params_root}/reader_params.toml"
 """ )
-    _, params, _ = toml_config_tree(
+    _, params, _, _ = toml_config_tree(
         tmp_path / 'leaf.toml', node_idn='root',
         template_vars = { 'params_root': 'params_root' },
     )
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
+
+
+# -- [resources] / [nodes.resources]: own defaults vs. per-instantiation
+# override, collected into resources_map (node_idn -> {'own', 'override'}),
+# NOT flattened into one frame the way [[parameters]] is -- see
+# configTree.py's module docstring.
+
+
+def test_resources_own_defaults_inline_items( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[resources.items]]
+table_idn = "foo"
+path      = "/data/foo.parquet"
+""" )
+    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    own = resources_map[ 'root' ][ 'own' ]
+    assert own.row( 0, named = True )[ 'table_idn' ] == 'foo'
+    assert own.row( 0, named = True )[ 'path' ] == '/data/foo.parquet'
+    assert resources_map[ 'root' ].get( 'override' ) is None
+
+
+def test_resources_own_defaults_external_json_reference( tmp_path: Path ) -> None:
+    _write( tmp_path / 'resources.json', '{"items": [{"table_idn": "foo", "path": "/data/foo.parquet"}]}' )
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[resources]
+_json = "resources.json"
+""" )
+    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    own = resources_map[ 'root' ][ 'own' ]
+    assert own.row( 0, named = True )[ 'table_idn' ] == 'foo'
+
+
+def test_resources_no_block_yields_no_own_entry( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', "[cell]\n" )
+    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    assert resources_map[ 'root' ][ 'own' ] is None
+
+
+def test_resources_both_json_and_items_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[resources]
+_json = "resources.json"
+
+[[resources.items]]
+table_idn = "foo"
+path      = "/data/foo.parquet"
+""" )
+    with pytest.raises( ValueError, match="both '_json' and 'items'" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_resources_unrecognized_key_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[resources]
+bogus = "x"
+""" )
+    with pytest.raises( ValueError, match="unrecognized key" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_resources_template_vars_apply_to_external_reference( tmp_path: Path ) -> None:
+    resources_dir = tmp_path / 'resources_root'
+    resources_dir.mkdir()
+    _write( resources_dir / 'resources.json', '{"items": [{"table_idn": "foo", "path": "/data/foo.parquet"}]}' )
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[resources]
+_json = "{resources_root}/resources.json"
+""" )
+    _, _, _, resources_map = toml_config_tree(
+        tmp_path / 'leaf.toml', node_idn='root',
+        template_vars = { 'resources_root': 'resources_root' },
+    )
+    assert resources_map[ 'root' ][ 'own' ].row( 0, named = True )[ 'table_idn' ] == 'foo'
+
+
+def test_resources_inline_items_template_vars_substituted( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[resources.items]]
+table_idn = "foo"
+path      = "{bundle_root}/foo.parquet"
+""" )
+    _, _, _, resources_map = toml_config_tree(
+        tmp_path / 'leaf.toml', node_idn='root',
+        template_vars = { 'bundle_root': '/bundles/train_0' },
+    )
+    assert resources_map[ 'root' ][ 'own' ].row( 0, named = True )[ 'path' ] == '/bundles/train_0/foo.parquet'
+
+
+def test_nodes_resources_override_collected_into_dict( tmp_path: Path ) -> None:
+    _write( tmp_path / 'child.toml', """\
+[cell]
+
+[[resources.items]]
+table_idn = "foo"
+path      = "/child/default/foo.parquet"
+""" )
+    _write( tmp_path / 'top.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+[nodes.resources]
+[[nodes.resources.items]]
+table_idn = "foo"
+path      = "/top/override/foo.parquet"
+""" )
+    _, _, _, resources_map = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    # 'own' (child's own file's default) and 'override' (parent's binding
+    # for that instantiation) are distinct slots under the SAME node_idn.
+    assert resources_map[ 'kid' ][ 'own' ].row( 0, named = True )[ 'path' ] == '/child/default/foo.parquet'
+    assert resources_map[ 'kid' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/top/override/foo.parquet'
+
+
+def test_nodes_resources_on_op_kind_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "reader"
+kind     = "op"
+[nodes.resources]
+[[nodes.resources.items]]
+table_idn = "foo"
+path      = "/x"
+""" )
+    with pytest.raises( ValueError, match="declares 'resources' but kind='op'" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_nodes_resources_on_placeholder_kind_raises( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "ph"
+kind     = "placeholder"
+[nodes.resources]
+[[nodes.resources.items]]
+table_idn = "foo"
+path      = "/x"
+""" )
+    with pytest.raises( ValueError, match="declares 'resources' but kind='placeholder'" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_resources_map_merges_up_through_multi_level_nesting( tmp_path: Path ) -> None:
+    """Two sibling kind='cell' nodes instantiating the SAME child template
+    (child.toml), each with a distinct [nodes.resources] override for the
+    same table_idn -- proves resources_map keeps them independent (the core
+    scenario motivating per-instantiation binding over threaded/child-wins
+    resources)."""
+    _write( tmp_path / 'child.toml', "[cell]\n" )
+    _write( tmp_path / 'top.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid_a"
+kind     = "cell"
+toml     = "child.toml"
+[nodes.resources]
+[[nodes.resources.items]]
+table_idn = "shared_name"
+path      = "/a/data.parquet"
+
+[[nodes]]
+node_idn = "kid_b"
+kind     = "cell"
+toml     = "child.toml"
+[nodes.resources]
+[[nodes.resources.items]]
+table_idn = "shared_name"
+path      = "/b/data.parquet"
+""" )
+    _, _, _, resources_map = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    assert resources_map[ 'kid_a' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/a/data.parquet'
+    assert resources_map[ 'kid_b' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/b/data.parquet'
+    # Neither child declared its own [resources] -- 'own' stays None, not
+    # cross-contaminated with the other sibling's override.
+    assert resources_map[ 'kid_a' ][ 'own' ] is None
+    assert resources_map[ 'kid_b' ][ 'own' ] is None
 
 
 # -- kind="placeholder"
@@ -346,7 +538,7 @@ source   = ["inp"]
 target   = ["out"]
 columns  = { a = "Int64", b = "Utf8" }
 """ )
-    tree, params, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, params, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
 
     assert row[ 'kind' ]       == 'placeholder'
@@ -366,7 +558,7 @@ def test_placeholder_node_defaults_to_empty_columns( tmp_path: Path ) -> None:
 node_idn = "future"
 kind     = "placeholder"
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
     m = BDDManager()
     from silverbrain.bdd import FALSE
@@ -384,7 +576,7 @@ node_idn = "future"
 kind     = "placeholder"
 columns  = { op_idn = "?" }
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
 
     from silverbrain.schema import cannonical_schema
@@ -405,7 +597,7 @@ node_idn = "future"
 kind     = "placeholder"
 columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
 
     m = BDDManager()
@@ -428,7 +620,7 @@ node_idn = "a_cell"
 kind     = "cell"
 toml     = "child.toml"
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
     assert rows[ 'an_op' ][ 'placeholder_columns' ] is None
     assert rows[ 'a_cell' ][ 'placeholder_columns' ] is None
@@ -466,7 +658,7 @@ node_idn = "kid"
 kind     = "cell"
 cell_idn = "child_cell"
 """ )
-    tree, _, _ = toml_config_tree(
+    tree, _, _, _ = toml_config_tree(
         tmp_path / 'parent.toml', node_idn='root',
         app_name='nonexistent_test_app',
         fallback_data_roots={ 'data_root': data_root },
@@ -525,7 +717,7 @@ op_type  = "make_constant"
 source   = ["trig"]
 target   = ["out"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     op_rows = tree.filter( pl.col( 'kind' ) == 'op' ).to_dicts()
     assert len( op_rows ) == 1
     assert op_rows[ 0 ][ 'node_idn' ].startswith( 'make_constant__' )
@@ -538,7 +730,7 @@ def test_op_type_defaults_to_node_idn_when_omitted( tmp_path: Path ) -> None:
 node_idn = "reader"
 kind     = "op"
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'reader' ).row( 0, named = True )
     assert row[ 'op_type' ] == 'reader'
 
@@ -557,7 +749,7 @@ op_type = "make_constant"
 source  = ["trig"]
 target  = ["b"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     op_rows = tree.filter( pl.col( 'kind' ) == 'op' ).to_dicts()
     assert len( op_rows ) == 2
     node_idns = { row[ 'node_idn' ] for row in op_rows }
@@ -590,7 +782,7 @@ kind     = "op"
 source   = ["a"]
 target   = ["out"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'plain' ).row( 0, named = True )
     assert row[ 'join' ]   == 'all'
     assert row[ 'join_k' ] is None
@@ -606,7 +798,7 @@ join     = "any"
 source   = ["a", "b"]
 target   = ["out"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'merger' ).row( 0, named = True )
     assert row[ 'join' ]   == 'any'
     assert row[ 'join_k' ] is None
@@ -622,7 +814,7 @@ join_k   = 2
 source   = ["a", "b", "c"]
 target   = ["out"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'quorum' ).row( 0, named = True )
     assert row[ 'join' ]   == 'at_least_k'
     assert row[ 'join_k' ] == 2
@@ -682,6 +874,6 @@ join     = "any"
 source   = ["a", "b"]
 target   = ["out"]
 """ )
-    tree, _, _ = toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'parent.toml', node_idn='root' )
     row = tree.filter( ( pl.col( 'node_idn' ) == 'kid' ) & ( pl.col( 'kind' ) == 'cell' ) ).row( 0, named = True )
     assert row[ 'join' ] == 'any'

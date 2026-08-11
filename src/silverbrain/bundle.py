@@ -284,16 +284,21 @@ def cell_from_bundle(
     Load the top-level Cell for a registered bundle_name: resolve_bundle()
     finds its {bundle_root, cell_idn} via bundle_index.toml, then
     resolve_cell_fp() finds that cell_idn's actual file via cells_index.toml
-    (platformdirs, then fallback_data_roots) -- bundle_root/manifest
+    (platformdirs, then fallback_data_roots) -- bundle_root/resources
     resolution happens exactly once, here, at the top; every nested
     kind='cell' [[nodes]] reference (library cells, sub-components) reuses
     these same template_vars unchanged (see configTree.py) -- they're
     never re-resolved per nested cell_idn, by design (a nested cell is
     never itself "a bundle"). resources (a table_index-shaped resource
-    manifest, see ReadWriteOps.py) is forwarded unchanged to cell_from_file
-    -- callers typically load it via ReadWriteOps.load_manifest() against
-    this same bundle's resolved bundle_root/manifest.json before calling
-    this.
+    manifest, see ReadWriteOps.py) is forwarded to cell_from_file as the
+    ROOT cell's own caller-override -- merged there (caller-wins) against
+    the root cell's own declared [resources] TOML defaults; NOT
+    automatically visible to any nested kind='cell' child unless that
+    child's own instantiation site declares a [nodes.resources] override
+    in TOML (see cell.py's cell_from_file/configTree.py's
+    [resources]/[nodes.resources]). Callers typically load it via
+    ReadWriteOps.load_resources() against this same bundle's resolved
+    bundle_root/resources.json before calling this.
     """
     from .cell import cell_from_file
 
@@ -331,7 +336,7 @@ class BundleDirs:
                         # once at pull-from-hub time to seed bundle_index/
                         # cells_index -- not consulted at resolution time
             cells/              — bundle-specific cell files (optional)
-            settings/           — parameter JSON files, manifest.json
+            settings/           — parameter JSON files, resources.json
             data/               — parquet outputs
             notebooks/          — Marimo .py notebooks
     """

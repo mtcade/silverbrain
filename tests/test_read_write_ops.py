@@ -5,8 +5,8 @@
 
 """
 Tests for silverbrain.ReadWriteOps: TableIndexEntry/resolve_table_idn,
-load_manifest, and the ReadOp/WriteOp/ReadWriteOp common-constructor,
-per-kind-dispatch generic table ops.
+load_resources/merge_resources, and the ReadOp/WriteOp/ReadWriteOp
+common-constructor, per-kind-dispatch generic table ops.
 """
 
 from pathlib import Path
@@ -19,7 +19,8 @@ from silverbrain.ReadWriteOps import (
     ReadWriteOp,
     TableIndexEntry,
     WriteOp,
-    load_manifest,
+    load_resources,
+    merge_resources,
     resolve_table_idn,
     table_schemas,
 )
@@ -47,20 +48,83 @@ def test_resolve_table_idn_missing_raises() -> None:
         resolve_table_idn( resources, 'missing' )
 
 
-def test_load_manifest_applies_template_vars( tmp_path: Path ) -> None:
-    fp = tmp_path / 'manifest.json'
-    fp.write_text( '{"a": {"kind": "local", "path": "{bundle_root}/x.parquet"}}' )
-    df = load_manifest( fp, template_vars = { 'bundle_root': '/bundles/train_0' } )
+def test_resolve_table_idn_none_raises_valueerror_not_attributeerror() -> None:
+    """resources=None (nothing ever declared/supplied at all) is the same
+    failure as an empty/non-matching frame from a caller's perspective --
+    must raise the same documented ValueError, not crash on None.filter()."""
+    with pytest.raises( ValueError, match="table_idn='a'" ):
+        resolve_table_idn( None, 'a' )
+
+
+def test_load_resources_applies_template_vars( tmp_path: Path ) -> None:
+    fp = tmp_path / 'resources.json'
+    fp.write_text( '{"items": [{"table_idn": "a", "kind": "local", "path": "{bundle_root}/x.parquet"}]}' )
+    df = load_resources( fp, template_vars = { 'bundle_root': '/bundles/train_0' } )
     row = df.row( 0, named = True )
     assert row[ 'table_idn' ] == 'a'
     assert row[ 'path' ] == '/bundles/train_0/x.parquet'
 
 
-def test_load_manifest_json_ptree_kind( tmp_path: Path ) -> None:
-    fp = tmp_path / 'manifest.json'
-    fp.write_text( '{"params": {"kind": "json_ptree", "path": "/x.json"}}' )
-    df = load_manifest( fp )
+def test_load_resources_json_ptree_kind( tmp_path: Path ) -> None:
+    fp = tmp_path / 'resources.json'
+    fp.write_text( '{"items": [{"table_idn": "params", "kind": "json_ptree", "path": "/x.json"}]}' )
+    df = load_resources( fp )
     assert df.row( 0, named = True )[ 'kind' ] == 'json_ptree'
+
+
+def test_load_resources_rejects_bare_top_level_array( tmp_path: Path ) -> None:
+    """The old {table_idn: entry} dict shape and a bare top-level array are
+    both gone -- a resources.json must be a JSON object with an 'items' key
+    (Kubernetes-List/GeoJSON-style wrapping, see module docstring)."""
+    fp = tmp_path / 'resources.json'
+    fp.write_text( '[{"table_idn": "a", "kind": "local", "path": "/x"}]' )
+    with pytest.raises( ValueError, match="'items'" ):
+        load_resources( fp )
+
+
+def test_load_resources_empty_items_returns_empty_frame( tmp_path: Path ) -> None:
+    fp = tmp_path / 'resources.json'
+    fp.write_text( '{"items": []}' )
+    df = load_resources( fp )
+    assert df.is_empty()
+    assert df.schema == pl.DataFrame( schema = table_schemas[ 'table_index' ] ).schema
+
+
+def test_table_ref_row_missing_table_idn_raises() -> None:
+    from silverbrain.ReadWriteOps import _table_ref_row
+    with pytest.raises( ValueError, match="table_idn" ):
+        _table_ref_row( { 'kind': 'local', 'path': '/x' } )
+
+
+def test_merge_resources_both_none_is_none() -> None:
+    assert merge_resources( None, None ) is None
+
+
+def test_merge_resources_own_only() -> None:
+    own = _resources( { 'table_idn': 'a', 'kind': 'local', 'path': '/x' } )
+    result = merge_resources( own, None )
+    assert result.to_dicts() == own.to_dicts()
+
+
+def test_merge_resources_override_only() -> None:
+    override = _resources( { 'table_idn': 'a', 'kind': 'local', 'path': '/y' } )
+    result = merge_resources( None, override )
+    assert result.to_dicts() == override.to_dicts()
+
+
+def test_merge_resources_override_wins_on_clash() -> None:
+    own      = _resources( { 'table_idn': 'a', 'kind': 'local', 'path': '/own' } )
+    override = _resources( { 'table_idn': 'a', 'kind': 'local', 'path': '/override' } )
+    result = merge_resources( own, override )
+    assert result.shape[ 0 ] == 1
+    assert result.row( 0, named = True )[ 'path' ] == '/override'
+
+
+def test_merge_resources_no_clash_keeps_both_rows() -> None:
+    own      = _resources( { 'table_idn': 'a', 'kind': 'local', 'path': '/a' } )
+    override = _resources( { 'table_idn': 'b', 'kind': 'local', 'path': '/b' } )
+    result = merge_resources( own, override )
+    assert set( result[ 'table_idn' ].to_list() ) == { 'a', 'b' }
 
 
 def test_read_op_rejects_json_ptree_kind() -> None:

@@ -94,18 +94,21 @@ def test_nested_child_executes_through_parent_call( tmp_path: Path ) -> None:
     assert result[ 0 ][ 'v' ].to_list() == [ 2, 4, 6 ]
 
 
-def test_resources_threads_unchanged_to_nested_child( tmp_path: Path ) -> None:
-    """Cell.resources (a table_index-shaped manifest, see ReadWriteOps.py)
-    is a top-level attribute of every Cell -- passed to cell_from_file(),
-    it reaches every Cell in the transitive kind='cell' walk unchanged,
-    the same way the __table_ops_parameters__ forest already does."""
+def test_resources_root_override_does_not_reach_nested_child_without_explicit_binding( tmp_path: Path ) -> None:
+    """Cell.resources is no longer threaded unchanged down the whole tree.
+    A resources= kwarg passed to cell_from_file() only ever becomes the
+    ROOT cell's own caller-override (merged against the root's own
+    declared [resources] TOML defaults, empty here) -- it does NOT
+    automatically reach a nested kind='cell' child. Neither parent.toml
+    nor child.toml declares any [resources]/[nodes.resources] block here,
+    so the child's resources stay None even though the root's don't."""
     _write( tmp_path / 'child.toml', _CHILD_TOML )
     _write( tmp_path / 'parent.toml', _parent_toml() )
 
-    manifest = pl.DataFrame( { 'table_idn': [ 'x' ] } )
-    parent = cell_from_file( tmp_path / 'parent.toml', _OPS, main_id='parent', resources=manifest )
-    assert parent.resources is manifest
-    assert parent.tableOps[ 'kid' ].resources is manifest
+    resources = pl.DataFrame( { 'table_idn': [ 'x' ] } )
+    parent = cell_from_file( tmp_path / 'parent.toml', _OPS, main_id='parent', resources=resources )
+    assert parent.resources.to_dicts() == resources.to_dicts()
+    assert parent.tableOps[ 'kid' ].resources is None
 
 
 def test_resources_defaults_to_none( tmp_path: Path ) -> None:

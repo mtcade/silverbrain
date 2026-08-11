@@ -7,7 +7,8 @@
 Parses config files into a flat, initialization-ready node tree -- pure
 parsing, no live Cell construction
 
-The output is a (nodes, parameters, next_node_idx) triple:
+The output is a (nodes, parameters, next_node_idx, resources_map) 4-tuple
+(see [resources] / [nodes.resources] below for resources_map):
 
 - nodes ('config_tree' schema, schema.py): a node_idn/parent_idn pair per
   node, spanning however many files a config transitively references via
@@ -114,12 +115,54 @@ is loaded to a plain dict -- anything else raises. External [[parameters]]
 references are dispatched separately (by their own .toml/.json suffix, via
 _load_param_group) since they carry a raw ParamGroupDict, not another node
 in the topology.
+
+[resources] / [nodes.resources] -- a cell's own declared resources
+defaults, and (on a kind='cell' [[nodes]] entry) the resources its
+instantiating parent explicitly binds for that one child instantiation.
+Unlike [[parameters]], this is NOT flattened into one tree-wide frame --
+two sibling kind='cell' nodes instantiating the same template must be able
+to resolve the same table_idn to different concrete resources, so
+resources stay scoped per node_idn. The output grows a 4th element,
+resources_map: dict[node_idn, dict['own' | 'override', pl.DataFrame | None]]
+-- 'own' is set once, by the node's own file's [resources] block; 'override'
+is set once, by the parent's [nodes.resources] block on that node's entry.
+cell.py's _cell_from_tree resolves each Cell's effective resources from
+just its own node_idn's two slots (caller-wins merge, see
+ReadWriteOps.merge_resources) and passes resources_map UNCHANGED into every
+recursive child call -- there is no automatic inheritance beyond a node's
+own two slots; a parent that wants a child to see something the parent
+itself received must re-declare it in that child's [nodes.resources].
+
+    [resources]
+    _json = "path/to/resources.json"   # resolved relative to this file,
+                                        # same {bundle_root}-style tvars
+                                        # substituted into the ref string
+                                        # first, exactly like [[parameters]]'
+                                        # _toml/_json
+    # ... or, instead, an inline list (never both):
+    [[resources.items]]
+    table_idn = "..."
+    kind      = "local"   # optional, defaults "local"
+    path      = "..."     # or db_path/table_name/connection_string/schema_name,
+                           # whichever 'kind' requires -- same shape as one
+                           # resources.json list item
+
+A [[nodes]] entry with kind='cell' may carry its own [nodes.resources]
+(TOML's usual dotted-table-attaches-to-the-last-array-element convention,
+same as [nodes.parameters] already uses) with the identical _json/items
+grammar -- this is the "caller override" for that specific instantiation.
+kind='op'/kind='placeholder' entries reject a 'resources' key outright
+(resources only make sense for a nested Cell instantiation; an op-level
+node's own ops already receive whatever THIS Cell's resolved resources
+DataFrame is via build_tableOps's existing opt-in inspect.signature
+injection -- no per-op override exists or is needed).
 """
 
 from . import bdd
 from .bundle import CELLS_INDEX_FILE_DEFAULT, resolve_cell_fp
 from .exprParse import expr_to_text, parse_expr
 from .parameterParse import ParameterParser, parameter_group_to_tree
+from .ReadWriteOps import _table_ref_row, load_resources
 from .schema import table_schemas
 from .utilities import apply_template_vars
 
@@ -340,6 +383,54 @@ def _parameters_entry_group(
 #/def _parameters_entry_group
 
 
+def _resources_entry_group(
+    block:     dict[ str, Any ] | None,
+    base_path: Path,
+    tvars:     dict[ str, str ],
+    ) -> pl.DataFrame | None:
+    """
+    Resolve one [resources] or [nodes.resources] TOML/JSON block to a
+    table_index DataFrame (or None if block is None -- no such block
+    declared at all). Either an external '_json' reference (resolved
+    relative to base_path, {key} tvars substituted into the ref string
+    first, then delegated straight to load_resources() -- the exact same
+    {'items': [...]} shape a resources.json file itself has) or an inline
+    'items' list (each item a resources.json list-item dict, tvars
+    substituted into its literal values), never both -- same
+    external-reference-XOR-inline-keys grammar _parameters_entry_group
+    already enforces for [[parameters]].
+    """
+    if block is None:
+        return None
+    block    = dict( block )
+    json_ref = block.pop( '_json', None )
+    items    = block.pop( 'items', None )
+
+    if json_ref is not None and items is not None:
+        raise ValueError(
+            "[resources]/[nodes.resources] declares both '_json' and "
+            "'items' -- only one is allowed"
+        )
+    if block:
+        raise ValueError(
+            f"[resources]/[nodes.resources] has unrecognized key(s) "
+            f"{ sorted( block )!r } -- only '_json' or 'items' are allowed"
+        )
+
+    if json_ref is not None:
+        return load_resources(
+            ( base_path / apply_template_vars( json_ref, tvars ) ).resolve(),
+            template_vars = tvars,
+        )
+    if items is not None:
+        rows = [ _table_ref_row( _apply_template_vars_to_value( item, tvars ) ) for item in items ]
+        if rows:
+            return pl.DataFrame( rows, schema = table_schemas[ 'table_index' ] )
+        return pl.DataFrame( schema = table_schemas[ 'table_index' ] )
+    return None
+#/def _resources_entry_group
+
+
 def config_tree(
     path:                str | Path,
     node_idn:            str,
@@ -353,10 +444,10 @@ def config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a config file and its transitive child-file references into
-    (nodes, parameters, next_node_idx) dataframes, dispatching to a
+    (nodes, parameters, next_node_idx, resources_map), dispatching to a
     format-specific parser by path's suffix. '.toml' and '.json' are both
     implemented (toml_config_tree/json_config_tree); anything else raises.
 
@@ -419,10 +510,10 @@ def toml_config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a cell TOML file and its transitive kind='cell' [[nodes]] file references
-    into (nodes, parameters, next_node_idx) dataframes. See
+    into (nodes, parameters, next_node_idx, resources_map). See
     _config_tree_from_data() for the format-agnostic parsing logic shared
     with json_config_tree().
     """
@@ -460,14 +551,15 @@ def json_config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a cell JSON file and its transitive kind='cell' [[nodes]] file
-    references into (nodes, parameters, next_node_idx) dataframes -- the
+    references into (nodes, parameters, next_node_idx, resources_map) -- the
     JSON equivalent of toml_config_tree(): same {'cell': {...}, 'nodes':
-    [...], 'parameters': [...]} shape TOML's [cell]/[[nodes]]/[[parameters]]
-    tables parse to, just spelled as JSON. See _config_tree_from_data() for
-    the shared parsing logic.
+    [...], 'parameters': [...], 'resources': {...}} shape TOML's
+    [cell]/[[nodes]]/[[parameters]]/[resources] tables parse to, just
+    spelled as JSON. See _config_tree_from_data() for the shared parsing
+    logic.
     """
     path = Path( path ).resolve()
     with open( path, 'r' ) as f:
@@ -504,12 +596,22 @@ def _config_tree_from_data(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int ]:
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Format-agnostic body shared by toml_config_tree()/json_config_tree():
     given an already-parsed {'cell': {...}, 'nodes': [...], 'parameters':
-    [...]} dict plus the resolved path it came from, build this file's
-    (nodes, parameters, next_node_idx).
+    [...], 'resources': {...}} dict plus the resolved path it came from,
+    build this file's (nodes, parameters, next_node_idx, resources_map).
+
+    resources_map is a node_idn-keyed dict with up to two slots each:
+    'own' (this node's own file's top-level [resources] block -- set once,
+    right below, by the call whose own node_idn IS this node) and
+    'override' (a kind='cell' [[nodes]] entry's [nodes.resources] block --
+    set once, by the PARENT, just before recursing into that child). It is
+    NOT flattened like parameters -- two sibling kind='cell' entries
+    instantiating the same template must resolve the same table_idn
+    differently, so each node_idn's fragment stays independent. See the
+    module docstring's [resources]/[nodes.resources] section.
 
     node_idn/parent_idn/source/target describe how *this* file was
     referenced by its parent (root call: parent_idn=None, source/target
@@ -541,6 +643,11 @@ def _config_tree_from_data(
     ) ]
     param_rows: list[ pl.DataFrame ] = [ _empty_parameters() ]
     node_idx = node_idx_start
+
+    own_resources_df = _resources_entry_group( data.get( 'resources' ), path.parent, tvars )
+    resources_map: dict[ str, dict[ str, pl.DataFrame | None ] ] = {
+        node_idn: { 'own': own_resources_df },
+    }
 
     # Two passes over [[nodes]], not one: op/placeholder rows are appended
     # immediately, but kind='cell' entries are only *collected* here and
@@ -579,6 +686,13 @@ def _config_tree_from_data(
         kind = entry[ 'kind' ]
 
         if kind == 'op':
+            if 'resources' in entry:
+                raise ValueError(
+                    f"[[nodes]] entry {entry_node_idn!r} declares 'resources' but "
+                    f"kind='op' -- resources only make sense for a nested Cell "
+                    f"instantiation (kind='cell'); an op's own resolved resources "
+                    f"come from its enclosing Cell, not a per-op override"
+                )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
             node_rows.append( _config_tree_row(
                 node_idn     = entry_node_idn,
@@ -614,6 +728,12 @@ def _config_tree_from_data(
                     f"PlaceholderOp(columns=...), never through the "
                     f"__table_ops_parameters__ forest, so inline parameters here "
                     f"would silently never be read"
+                )
+            if 'resources' in entry:
+                raise ValueError(
+                    f"[[nodes]] entry {entry_node_idn!r} declares 'resources' but "
+                    f"kind='placeholder' -- resources only make sense for a nested "
+                    f"Cell instantiation (kind='cell')"
                 )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
             node_rows.append( _config_tree_row(
@@ -682,8 +802,16 @@ def _config_tree_from_data(
                 f"'toml' nor 'cell_idn' -- one is required"
             )
 
+        # This entry's own [nodes.resources] -- the resources THIS parent
+        # explicitly binds for that one child instantiation ('override').
+        # Parsed and stashed here, before recursing, since it belongs to
+        # entry_node_idn's slot regardless of what the child's own file
+        # declares for itself ('own', set by the recursive call below).
+        override_df = _resources_entry_group( entry.get( 'resources' ), path.parent, tvars )
+        resources_map.setdefault( entry_node_idn, {} )[ 'override' ] = override_df
+
         join, join_k = _entry_join_fields( entry, entry_node_idn )
-        child_nodes, child_params, node_idx = config_tree(
+        child_nodes, child_params, node_idx, child_resources_map = config_tree(
             path                = child_toml_path,
             node_idn            = entry_node_idn,
             parent_idn          = node_idn,
@@ -699,6 +827,21 @@ def _config_tree_from_data(
         )
         node_rows.append( child_nodes )
         param_rows.append( child_params )
+        # Merge the child's own resources_map fragment up -- NOT flattened
+        # into one frame (unlike param_rows): each node_idn keeps its own
+        # small {'own': ..., 'override': ...} dict, so a same-named
+        # table_idn declared by two different (e.g. sibling, same-template)
+        # node_idns never cross-contaminates. Safe only because 'own' is
+        # ever written by the node's own recursive call and 'override' only
+        # ever by that node's parent (immediately above) -- never both by
+        # the same side -- so .update() here never clobbers a value already
+        # written by the other side. Relies on every kind='cell' node_idn
+        # being unique across the WHOLE transitive tree, not just this
+        # file's own [[nodes]] siblings -- a pre-existing assumption
+        # cell.py's _cell_from_tree already leans on (tree.filter(node_idn
+        # == ...).row(0)), not a new one introduced here.
+        for k, v in child_resources_map.items():
+            resources_map.setdefault( k, {} ).update( v )
 
     return (
         pl.concat( node_rows,  how = 'vertical' ),
@@ -709,5 +852,6 @@ def _config_tree_from_data(
         # rather than requiring identical schemas.
         pl.concat( param_rows, how = 'diagonal_relaxed' ),
         node_idx,
+        resources_map,
     )
 #/def _config_tree_from_data

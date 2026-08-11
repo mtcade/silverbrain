@@ -6,16 +6,19 @@
 """
 Resource resolution + generic read/write/read-write TableOps, keyed by
 table_idn against a `resources` table_index DataFrame (see cell.py's
-Cell.resources -- held as a top-level attribute of every Cell and threaded
-to every child Cell/TableOp construction, the same way the
-__table_ops_parameters__ forest already is).
+Cell.resources -- each Cell's own construction-time resolution of its
+declared `[resources]` defaults merged, caller-wins, against whatever its
+instantiating parent explicitly bound for it -- see configTree.py's
+`[resources]`/`[nodes.resources]` and cell.py's `_cell_from_tree`. Not
+threaded automatically to every child the way __table_ops_parameters__ is;
+each Cell resolves its own).
 
-A `resources` manifest is a table_index DataFrame (schema.py's
-table_schemas['table_index']): one row per named resource, keyed by
-table_idn, naming where it lives (`kind` selects which of the remaining
-mostly-null columns matter -- see schema.py's own comment on those
-columns). `load_manifest()` parses a manifest.json file (the same
-{table_idn: entry} shape _table_ref_row already understands) into this
+A `resources` table_index DataFrame (schema.py's table_schemas['table_index'])
+is one row per named resource, keyed by table_idn, naming where it lives
+(`kind` selects which of the remaining mostly-null columns matter -- see
+schema.py's own comment on those columns). `load_resources()` parses a
+resources.json file -- a JSON *list* of dicts, each carrying its own
+'table_idn' key plus whatever columns its 'kind' requires -- into this
 DataFrame.
 
 ReadOp/WriteOp/ReadWriteOp are the public, generic TableOps: each takes
@@ -75,18 +78,44 @@ class TableIndexEntry:
 #/class TableIndexEntry
 
 
-def resolve_table_idn( resources: pl.DataFrame, table_idn: str ) -> TableIndexEntry:
+def resolve_table_idn( resources: pl.DataFrame | None, table_idn: str ) -> TableIndexEntry:
     """Look up table_idn in resources (a table_index DataFrame), raising
     if it isn't present -- construction-time resolution, so a missing
-    table_idn fails immediately at Cell-build time, not on first use."""
-    rows = resources.filter( pl.col( 'table_idn' ) == table_idn )
-    if rows.is_empty():
-        raise ValueError( f"table_idn={table_idn!r} not found in resources manifest" )
+    table_idn fails immediately at Cell-build time, not on first use.
+    resources=None (nothing ever declared/supplied -- e.g. a Cell with no
+    [resources] defaults and no caller-override at all, see
+    Cell.resources/merge_resources) is treated the same as an empty
+    frame -- "nothing was ever given" and "what was given doesn't include
+    this table_idn" are the same failure from a caller's perspective, and
+    both deserve the same clean ValueError, not an AttributeError from
+    None.filter(...)."""
+    rows = resources.filter( pl.col( 'table_idn' ) == table_idn ) if resources is not None else None
+    if rows is None or rows.is_empty():
+        raise ValueError( f"table_idn={table_idn!r} not found in resources" )
     return TableIndexEntry.from_row( rows.row( 0, named = True ) )
 #/def resolve_table_idn
 
 
-# -- table_index parsing (manifest.json / any {table_idn: entry} JSON file)
+def merge_resources(
+    own:      pl.DataFrame | None,
+    override: pl.DataFrame | None,
+    ) -> pl.DataFrame | None:
+    """Caller-wins merge of two table_index DataFrames: 'own' (a Cell's own
+    declared [resources] defaults) and 'override' (whatever its
+    instantiating parent explicitly bound for it -- see configTree.py's
+    [resources]/[nodes.resources] and cell.py's _cell_from_tree). On a
+    clashing table_idn, override's row wins -- same
+    pl.concat(...).unique(keep='last') idiom Cell.merge already uses for
+    __nodes__. None iff both inputs are None (nothing declared, nothing
+    supplied -- Cell.resources stays None, same as today's default)."""
+    frames = [ f for f in ( own, override ) if f is not None ]
+    if not frames:
+        return None
+    return pl.concat( frames, how = 'vertical' ).unique( subset = [ 'table_idn' ], keep = 'last' )
+#/def merge_resources
+
+
+# -- table_index parsing (resources.json / any [table_idn: entry, ...] JSON list)
 
 # Which table_index columns are required for each 'kind' -- checked eagerly
 # in _table_ref_row so a malformed table_index source file fails at the
@@ -101,17 +130,19 @@ _TABLE_INDEX_REQUIRED_COLUMNS: dict[ str, tuple[ str, ... ] ] = {
     'json_ptree': ( 'path', ),
 }
 
-def _table_ref_row( table_idn: str, entry: str | dict[ str, Any ] ) -> dict[ str, Any ]:
-    """A bare string entry is shorthand for {'kind': 'local', 'path':
-    entry}. Otherwise entry must be a dict; 'kind' defaults to 'local' if
-    omitted (the common case, and the only kind a bare path string could
-    mean)."""
-    if isinstance( entry, str ):
-        entry = { 'kind': 'local', 'path': entry }
+def _table_ref_row( entry: dict[ str, Any ] ) -> dict[ str, Any ]:
+    """entry is one resources.json/[[resources.items]] list item -- a dict
+    carrying its own 'table_idn' key plus whatever columns its 'kind'
+    needs. 'kind' defaults to 'local' if omitted (the common case)."""
     if not isinstance( entry, dict ):
         raise TypeError(
-            f"table_index entry for {table_idn!r} must be a string (local "
-            f"path shorthand) or a dict, got {entry!r}"
+            f"resources item must be a dict, got {entry!r}"
+        )
+    entry = dict( entry )
+    table_idn = entry.pop( 'table_idn', None )
+    if not isinstance( table_idn, str ):
+        raise ValueError(
+            f"resources item is missing a string 'table_idn' key, got {entry!r}"
         )
     kind = entry.get( 'kind', 'local' )
     if kind not in _TABLE_INDEX_REQUIRED_COLUMNS:
@@ -134,28 +165,38 @@ def _table_ref_row( table_idn: str, entry: str | dict[ str, Any ] ) -> dict[ str
     }
 #/def _table_ref_row
 
-def load_manifest( fp: str | Path, template_vars: dict[ str, str ] | None = None ) -> pl.DataFrame:
-    """Parse a manifest.json-shaped file ({table_idn: entry_or_path_string})
-    into a table_index DataFrame. template_vars (e.g. {'bundle_root': ...})
-    is applied to each entry's 'path'/'db_path' first, same convention
-    configTree.py already uses for TOML-declared paths -- lets a manifest
-    reference {bundle_root}/... without knowing the bundle's actual
-    location."""
+def load_resources( fp: str | Path, template_vars: dict[ str, str ] | None = None ) -> pl.DataFrame:
+    """Parse a resources.json-shaped file (a JSON object {'items': [...]},
+    never a bare top-level array -- see module docstring/configTree.py's
+    [resources] section for why: a named-key wrapper lets the document
+    root grow other keys later without a breaking shape change, same
+    convention as e.g. a Kubernetes List's 'items' or a GeoJSON
+    FeatureCollection's 'features') into a table_index DataFrame.
+    template_vars (e.g. {'bundle_root': ...}) is applied to each item's
+    'path'/'db_path' first, same convention configTree.py already uses for
+    TOML-declared paths -- lets a resources file reference {bundle_root}/...
+    without knowing the bundle's actual location. This is also what
+    configTree.py's `[resources] _json = "..."`/`[nodes.resources] _json =
+    "..."` delegates straight to -- the external-reference form and the
+    on-disk file are the exact same shape."""
     tvars = template_vars or {}
     with open( fp, 'r' ) as f:
         data: dict[ str, Any ] = json.load( f )
-    def _substitute( entry: str | dict[ str, Any ] ) -> str | dict[ str, Any ]:
-        if isinstance( entry, str ):
-            return apply_template_vars( entry, tvars )
+    if not isinstance( data, dict ) or 'items' not in data:
+        raise ValueError(
+            f"resources file { fp!r } must be a JSON object with an "
+            f"'items' key holding the list of resource entries, got { data!r }"
+        )
+    def _substitute( entry: dict[ str, Any ] ) -> dict[ str, Any ]:
         return {
             k: ( apply_template_vars( v, tvars ) if k in ( 'path', 'db_path' ) and isinstance( v, str ) else v )
             for k, v in entry.items()
         }
-    rows = [ _table_ref_row( table_idn, _substitute( entry ) ) for table_idn, entry in data.items() ]
+    rows = [ _table_ref_row( _substitute( entry ) ) for entry in data[ 'items' ] ]
     if rows:
         return pl.DataFrame( rows, schema = table_schemas[ 'table_index' ] )
     return pl.DataFrame( schema = table_schemas[ 'table_index' ] )
-#/def load_manifest
+#/def load_resources
 
 
 # -- Backend primitives (parquet/sqlite), persistent-connection variants

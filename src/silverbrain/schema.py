@@ -44,6 +44,11 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'backend_id_column': pl.Utf8,
     # parameter spec rows
     'par_idx':          pl.UInt32,
+    # _trigger (sunder.py): run_id is fresh per invocation (uuid7,
+    # matching cell.py's own corr_id/uuid7 convention); triggered_at is
+    # that run's wall-clock start time.
+    'run_id':           pl.Utf8,
+    'triggered_at':     pl.Datetime( time_zone = 'UTC' ),
 } | {
     # __nodes__ serialization -- A Cell's
     # own local table only ever has parent_idn = null (every row is a
@@ -198,6 +203,13 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
         'join', 'join_k',
         'path', 'cell_source', 'cell_target', 'placeholder_columns', 'op_type',
+    )),
+
+    # _trigger: the sunder table (see sunder.py) a Cell auto-supplies to
+    # any node that declares it as a source without being seeded it
+    # externally -- see cell.py's _WiringEngine.
+    '_trigger': cannonical_schema_for_keys((
+        'run_id', 'triggered_at',
     )),
 }
 
