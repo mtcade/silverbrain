@@ -10,7 +10,7 @@
 
 from . import bdd, types
 from .polarsDataTypeStrings import dtype_to_str, str_to_dtype
-from .schema import Effect, InputSchema, OutputSchema, TableOpSchema
+from .schema import Effect, InputSchema, OutputSchema, TableOpSchema, table_schemas
 
 import polars as pl
 import numpy as np
@@ -706,6 +706,57 @@ class MemoryOp( TableOp ):
             return ( self._table, )
     #/def __call__
 #/class MemoryOp
+
+class EmptyTableOp( TableOp ):
+    """
+    Ignores its input and always returns a 0-row DataFrame with the
+    schema named by `table_schema` (a schema.table_schemas key) -- for
+    bootstrapping a self-referencing loop's first iteration (see
+    _WiringEngine's docstring / README.md's ### Loops section: a node
+    needs *some* initial token on a name a downstream loop-controller
+    reads, before that name's real producer -- the loop body -- ever
+    fires).
+
+    NOTE -- resolves against *core* silverbrain.schema.table_schemas
+    specifically, not whichever table_schemas is furthest extended for
+    the actual deployment (e.g. duckpond's own, which extends
+    silverflow's, which extends this core one, and might one day add
+    columns of its own to a schema this op needs). There's no clean way
+    to fix that from inside silverbrain-arrow itself (this class lives in
+    core, one layer below where any such extension would be defined) --
+    likely needs either the caller to inject its own table_schemas dict
+    at construction time, or a thin per-deployment subclass that
+    overrides which table_schemas it resolves against. Left as a known
+    limitation, not solved here.
+    """
+    def __init__(
+        self: Self,
+        table_schema: str,
+        rng: np.random.Generator | None = None,
+        ) -> None:
+        if table_schema not in table_schemas:
+            raise ValueError(
+                f"EmptyTableOp: table_schema={table_schema!r} not found in "
+                f"table_schemas; expected one of {tuple(table_schemas)}"
+            )
+        self._resolved_schema = table_schemas[ table_schema ]
+        super().__init__(
+            rng    = rng,
+            input  = [ InputSchema.from_columns( {}, extra = 'open' ) ],
+            output = [ OutputSchema( expr = bdd.Union( bdd.ColVar( f'_empty_table_out_{uuid4().hex}' ) ) ) ],
+        )
+    #/def __init__
+
+    def __call__(
+        self: Self,
+        dfs: tuple[ pl.DataFrame, ... ],
+        corr_id: tuple[ str, ... ] = (),
+        verbose: int = 0,
+        verbose_prefix: str = '',
+        ) -> tuple[ pl.DataFrame ]:
+        return ( pl.DataFrame( schema = self._resolved_schema ), )
+    #/def __call__
+#/class EmptyTableOp
 
 # -- Placeholder Table Ops (interface known, implementation not bound yet)
 

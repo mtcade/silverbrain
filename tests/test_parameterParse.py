@@ -12,6 +12,7 @@ from silverbrain.parameterParse import (
     op_ctor_kwargs_forest,
     parameter_group_to_tree,
 )
+from silverbrain.schema import table_schemas
 
 
 def _make_parser() -> ParameterParser:
@@ -664,3 +665,12 @@ def test_parameter_group_to_tree_supports_values_search_dtype_inference() -> Non
     with pytest.raises( ValueError, match = 'only fixed values are supported' ):
         op_ctor_kwargs_forest( tree )  # parses fine; rejected only at extraction
 #/def test_parameter_group_to_tree_supports_values_search_dtype_inference
+
+
+# -- schema.table_schemas['parameter_tree'] consolidation (schema.py is
+# now the single source of truth par_group/par_type/.../node_idx/
+# parent_idx/par_val_* naming was previously hand-duplicated here)
+
+def test_fresh_parser_schema_matches_table_schemas_parameter_tree() -> None:
+    assert ParameterParser().schema == table_schemas[ 'parameter_tree' ]
+#/def test_fresh_parser_schema_matches_table_schemas_parameter_tree

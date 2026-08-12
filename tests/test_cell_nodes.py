@@ -14,6 +14,7 @@ tableOps entry participate in this wiring.
 """
 
 import threading
+import time
 
 import polars as pl
 import pytest
@@ -355,6 +356,96 @@ def test_at_least_k_requires_join_k_in_valid_range() -> None:
         c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join='at_least_k' )  # missing join_k
     with pytest.raises( ValueError ):
         c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join_k=1 )  # join_k without at_least_k
+
+
+# -- discard_on_null (default True, only consulted under join='all')
+#
+# _WiringEngine._scan stops looking for any further work at all the
+# instant the Cell's own target resolves ("if self.future.done(): return"
+# -- deliberately, not a bug: once the caller has what they asked for,
+# nothing guarantees any OTHER still-pending node gets to finish first).
+# controller sleeps a little each round so 'sink' (trivial/instant) never
+# lags behind it -- by the time controller produces the terminating null
+# token, sink has always already drained every real token ahead of it, so
+# sink's own readiness for that null round lands in the SAME _scan() pass
+# that resolves 'done' (both get dispatched together, before the engine
+# stops looking), rather than racing to be scanned at all.
+
+
+def _null_terminating_controller( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+    """0, 1, 2 on 'n' (self-loop), then None on 'n' + the final value on
+    'escape' -- same shape as _loop_controller_op, just also feeding a
+    'sink' node (registered separately per test, source=['n']) so
+    discard_on_null's effect on THAT node can be observed independently
+    of the loop's own already-covered termination behavior."""
+    time.sleep( 0.02 )
+    n = dfs[ 0 ][ 'n' ][ 0 ]
+    if n < 2:
+        return ( pl.DataFrame( { 'n': [ n + 1 ] } ), None )
+    return ( None, dfs[ 0 ] )
+
+
+def test_discard_on_null_default_skips_the_op_on_a_null_round() -> None:
+    calls: list = []
+
+    def _sink( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        calls.append( dfs[ 0 ] if dfs[ 0 ] is None else dfs[ 0 ][ 'n' ][ 0 ] )
+        return ( dfs[ 0 ], )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'controller': _null_terminating_controller, 'passthrough': _passthrough_op, 'sink': _sink },
+        source=[ 'n' ], target=[ 'done' ],
+    )
+    c.register_node( 'controller',  source=[ 'n' ],      target=[ 'n', 'escape' ] )
+    c.register_node( 'passthrough', source=[ 'escape' ], target=[ 'done' ] )
+    c.register_node( 'sink',        source=[ 'n' ],      target=[ '_' ] )  # discard_on_null defaults True
+
+    result = c( ( pl.DataFrame( { 'n': [ 0 ] } ), ) ).result( timeout=5 )
+    assert result[ 0 ][ 'n' ].to_list() == [ 2 ]
+    time.sleep( 0.1 )  # let sink's already-submitted null-round dispatch (if any) settle
+    # sink saw every real value (0, 1, 2) but was never actually invoked
+    # for the terminating null round -- discarded, not called-with-None.
+    assert calls == [ 0, 1, 2 ]
+
+
+def test_discard_on_null_false_still_invokes_the_op_with_a_null_input() -> None:
+    calls: list = []
+
+    def _sink( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        calls.append( dfs[ 0 ] if dfs[ 0 ] is None else dfs[ 0 ][ 'n' ][ 0 ] )
+        return ( dfs[ 0 ], )
+
+    c = Cell(
+        main_id='c',
+        ops={ 'controller': _null_terminating_controller, 'passthrough': _passthrough_op, 'sink': _sink },
+        source=[ 'n' ], target=[ 'done' ],
+    )
+    c.register_node( 'controller',  source=[ 'n' ],      target=[ 'n', 'escape' ] )
+    c.register_node( 'passthrough', source=[ 'escape' ], target=[ 'done' ] )
+    c.register_node( 'sink',        source=[ 'n' ],      target=[ '_' ], discard_on_null=False )
+
+    c( ( pl.DataFrame( { 'n': [ 0 ] } ), ) ).result( timeout=5 )
+    time.sleep( 0.1 )  # let sink's already-submitted null-round dispatch settle
+    assert None in calls
+
+
+def test_discard_on_null_default_does_not_affect_join_any() -> None:
+    """join='any' already positionally fills a non-participating source
+    with None for unrelated reasons (see _scan) -- discard_on_null must
+    stay inert there, or this would never fire at all."""
+    calls: list = []
+    c = Cell(
+        main_id='c',
+        ops={ 'merge_like': _record_op( calls ) },
+        source=[ 'inp' ], target=[ 'out' ],
+    )
+    c.register_node( 'merge_like', source=[ 'inp', 'never_written' ], target=[ 'out' ], join='any' )
+
+    df_in = pl.DataFrame( { 'v': [ 1 ] } )
+    result = c( ( df_in, ) ).result( timeout=5 )
+    assert result[ 0 ][ 'v' ].to_list() == [ 1 ]
+    assert calls == [ [ 1 ] ]
 
 
 def test_corr_id_relays_unchanged_through_a_chain() -> None:

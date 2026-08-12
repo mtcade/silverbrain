@@ -191,3 +191,46 @@ def test_postgres_kind_raises_not_implemented() -> None:
     resources = _resources( { 'table_idn': 'a', 'kind': 'postgres', 'connection_string': 'x', 'table_name': 't' } )
     with pytest.raises( NotImplementedError ):
         ReadOp( table_idn = 'a', resources = resources )
+
+
+def test_sqlite_list_column_round_trips_as_jsonb( tmp_path: Path ) -> None:
+    db_path = str( tmp_path / 'data.sqlite' )
+    resources = _resources( { 'table_idn': 'a', 'kind': 'sqlite', 'db_path': db_path, 'table_name': 't' } )
+    df = pl.DataFrame( { 'x': [ 1, 2 ], 'tags': [ [ 'a', 'b' ], [ 'c' ] ] } )
+    WriteOp( table_idn = 'a', resources = resources, mode = 'replace' )( ( df, ) )
+
+    import sqlite3
+    conn = sqlite3.connect( db_path )
+    try:
+        decl_type = conn.execute( 'PRAGMA table_info("t")' ).fetchall()
+        types_by_name = { row[1]: row[2] for row in decl_type }
+        assert types_by_name[ 'tags' ] == 'BLOB'
+        # jsonb() storage is not equal to the plain JSON text -- confirms
+        # it's actually stored as binary jsonb, not TEXT-with-a-BLOB-label.
+        raw = conn.execute( 'SELECT tags FROM "t" LIMIT 1' ).fetchone()[ 0 ]
+        assert raw != '["a", "b"]'
+    finally:
+        conn.close()
+
+    result = ReadOp( table_idn = 'a', resources = resources )( () )[ 0 ]
+    # Read path unwraps jsonb() back to JSON text (via json()), same shape
+    # a TEXT-stored column always came back as -- reconstructing pl.List
+    # from that text is a separate, pre-existing gap either way.
+    assert result[ 'tags' ].to_list() == [ '["a","b"]', '["c"]' ]
+
+
+def test_sqlite_db_kind_requires_only_db_path() -> None:
+    row = _table_ref_row_kind_check( { 'table_idn': 'a', 'kind': 'sqlite_db', 'db_path': '/x.db' } )
+    assert row[ 'kind' ] == 'sqlite_db'
+    assert row[ 'db_path' ] == '/x.db'
+
+
+def test_sqlite_db_kind_rejects_read_op() -> None:
+    resources = _resources( { 'table_idn': 'a', 'kind': 'sqlite_db', 'db_path': '/x.db' } )
+    with pytest.raises( ValueError, match="kind='sqlite_db'" ):
+        ReadOp( table_idn = 'a', resources = resources )
+
+
+def _table_ref_row_kind_check( entry: dict ) -> dict:
+    from silverbrain.ReadWriteOps import _table_ref_row
+    return _table_ref_row( entry )

@@ -67,68 +67,43 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Type
 from typing_extensions import TypedDict, NotRequired, Self
 
-from .schema import cannonical_schema as _cannonical_schema
+from .schema import (
+    cannonical_schema as _cannonical_schema,
+    col_for_dtype,
+    _IDENTIFIER_COLS,
+    _TREE_IDENTIFIER_COLS,
+    _CANDIDATE_LIST_COLS,
+)
 from .utilities import TableBuilder
-from .polarsDataTypeStrings import dtype_to_str
 
 
 # -- Column naming
+#
+# _IDENTIFIER_COLS/_TREE_IDENTIFIER_COLS/_CANDIDATE_LIST_COLS/
+# col_for_dtype() all now live in schema.py -- the single source of truth
+# for column names/dtypes (including node_idx/parent_idx, which used to
+# be hand-duplicated here). Imported, not redefined.
 
 _PAR_IDX_DTYPE:    pl.DataType = _cannonical_schema['par_idx']
+_NODE_IDX_DTYPE:   pl.DataType = _cannonical_schema['node_idx']
+_PARENT_IDX_DTYPE: pl.DataType = _cannonical_schema['parent_idx']
 
-_IDENTIFIER_COLS: dict[ str, pl.DataType ] = {
-    'par_group':   pl.Utf8,
-    'par_type':    pl.Utf8,
-    'par_idx':     _PAR_IDX_DTYPE,
-    'par_name':    pl.Utf8,
-    'par_feature': pl.Utf8,
-}
-
-# node_idx/parent_idx are purely internal to ParameterParser's tree schema now
-# (no longer part of cannonical_schema — see parameterParse refactor plan).
-_NODE_IDX_DTYPE:   pl.DataType = pl.UInt32
-_PARENT_IDX_DTYPE: pl.DataType = pl.UInt32
-
-_TREE_IDENTIFIER_COLS: dict[ str, pl.DataType ] = {
-    'par_group':   pl.Utf8,
-    'par_type':    pl.Utf8,
-    'par_name':    pl.Utf8,
-    'par_feature': pl.Utf8,
-    'node_idx':    _NODE_IDX_DTYPE,
-    'parent_idx':  _PARENT_IDX_DTYPE,
-}
-
-# Frozen dtypes for the deprecated oracle below — hardcoded rather than read from
-# cannonical_schema, since node_idx/parent_idx are removed from cannonical_schema
-# once the tree/flat split lands (see parameterParse refactor plan).
+# Frozen dtypes for the deprecated oracle below -- hardcoded independently
+# of cannonical_schema (not imported, even though the values happen to
+# match today) so this oracle never shifts just because the live schema
+# does -- that's the whole point of a regression oracle.
 _NODE_IDX_DTYPE_DEPRECATED:   pl.DataType = pl.UInt32
 _PARENT_IDX_DTYPE_DEPRECATED: pl.DataType = pl.UInt32
 
 _IDENTIFIER_COLS_DEPRECATED: dict[ str, pl.DataType ] = {
     'par_group':   pl.Utf8,
     'par_type':    pl.Utf8,
-    'par_idx':     _PAR_IDX_DTYPE,
+    'par_idx':     pl.UInt32,
     'par_name':    pl.Utf8,
     'par_feature': pl.Utf8,
     'node_idx':    _NODE_IDX_DTYPE_DEPRECATED,
     'parent_idx':  _PARENT_IDX_DTYPE_DEPRECATED,
 }
-
-
-def col_for_dtype( dtype: pl.DataType ) -> str:
-    """
-    Derive a par_val_* column name from a polars DataType.
-
-    pl.Int64            → 'par_val_int64'
-    pl.Float64          → 'par_val_float64'
-    pl.Utf8             → 'par_val_string'
-    pl.List(pl.Int64)   → 'par_val_list_int64'
-    pl.List(pl.Float64) → 'par_val_list_float64'
-    pl.List(pl.Utf8)    → 'par_val_list_string'
-    """
-    s = dtype_to_str( dtype ).lower().replace( '(', '_' ).replace( ')', '' )
-    return 'par_val_' + s
-#/def col_for_dtype
 
 # Cached names for the six common types used in parsing dispatch.
 _COL_STR    = col_for_dtype( pl.Utf8 )              # 'par_val_string'
@@ -138,15 +113,6 @@ _COL_STRL   = col_for_dtype( pl.List( pl.Utf8 ) )    # 'par_val_list_string'
 _COL_INTL   = col_for_dtype( pl.List( pl.Int64 ) )   # 'par_val_list_int64'
 _COL_FLOATL = col_for_dtype( pl.List( pl.Float64 ) ) # 'par_val_list_float64'
 _COL_BOOL   = col_for_dtype( pl.Boolean )            # 'par_val_boolean'
-
-# Fixed candidate-list columns for values_random/values_search on
-# scalar-registered params (the only dtypes PrimitiveValue covers).
-# Unconditionally present in schema/schema_flat -- see ParameterParser.
-_CANDIDATE_LIST_COLS: dict[ str, pl.DataType ] = {
-    _COL_STRL:   pl.List( pl.Utf8 ),
-    _COL_INTL:   pl.List( pl.Int64 ),
-    _COL_FLOATL: pl.List( pl.Float64 ),
-}
 
 
 def _coerce_values_for_dtype(

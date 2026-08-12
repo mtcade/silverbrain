@@ -150,12 +150,22 @@ class _WiringEngine:
     A Cell's own target resolves on each name's first NON-null token, not
     merely its first token -- an internal null token (e.g. a loop's
     in-progress signal on one branch while the real result is still being
-    computed on another) is never mistaken for "the Cell is done." A node
-    that reads its own prior output as a source (a self-referencing loop)
-    must itself guard against being re-invoked with a null input once it
-    has emitted its own termination signal -- nothing here silently stops
-    dispatching it just because a value happens to be null (see Token's
-    docstring: null is an ordinary value, not a special engine-level case).
+    computed on another) is never mistaken for "the Cell is done."
+
+    discard_on_null (__nodes__ row, default True, only consulted when
+    join='all'): the ordinary/default behavior is that once a `join='all'`
+    node's dispatched inputs would include a None, the engine itself stops
+    invoking it -- tokens are still consumed (cursor advances) but no
+    actor call happens and no target token is written, so a self-
+    referencing loop naturally stops re-firing once it starts producing a
+    null on its own feedback source, with nothing extra required of the
+    node's own implementation. Set discard_on_null=False on a node that
+    wants to keep receiving and handling a null input itself instead (the
+    only behavior available before this flag existed -- null is still an
+    ordinary value otherwise, not a special engine-level case, see
+    Token's docstring). Inert for 'any'/'at_least_k' joins, where a
+    non-participating source already positionally contributes None for
+    unrelated reasons.
 
     "_" is a reserved discard target: a node's target list may name a
     result slot "_" to mean "run this (side effects included) but never
@@ -292,6 +302,16 @@ class _WiringEngine:
                     unread[ s ][ 0 ].value if s in participants else None
                     for s in src
                 )
+
+                # discard_on_null (default True, only meaningful under
+                # join='all' -- see class docstring): tokens above are
+                # already consumed: this round is discarded, not
+                # deferred. No actor call, no output token.
+                discard_on_null = row.get( 'discard_on_null' )
+                discard_on_null = True if discard_on_null is None else discard_on_null
+                if join == 'all' and discard_on_null and any( v is None for v in inputs ):
+                    continue
+
                 # corr_id relayed from whichever source port (first in
                 # declared order) actually participated -- purely for
                 # tracing, see Token's docstring; never used for matching.
@@ -771,13 +791,14 @@ class Cell:
     #/def _rewire
 
     def register_node(
-        self:         Self,
-        node_idn:     str,
-        source:       Sequence[ str ] = (),
-        target:       Sequence[ str ] = (),
-        parent_idn:   str | None      = None,
-        join:         str             = 'all',
-        join_k:       int | None      = None,
+        self:              Self,
+        node_idn:          str,
+        source:            Sequence[ str ] = (),
+        target:            Sequence[ str ] = (),
+        parent_idn:        str | None      = None,
+        join:              str             = 'all',
+        join_k:            int | None      = None,
+        discard_on_null:   bool            = True,
         ) -> None:
         """
         Declare a __nodes__ row for node_idn, an entry already registered in
@@ -798,6 +819,14 @@ class Cell:
         the exact semantics/validation. Default ('all', None) reproduces a
         strict AND-join -- today's only behavior before join/join_k were
         added.
+
+        discard_on_null (default True, only consulted when join='all'):
+        when this node would otherwise fire but at least one dispatched
+        input is None, the engine consumes the tokens without ever
+        invoking the actor or writing a target token. Set False on a node
+        that wants to keep receiving and handling a null input itself
+        (e.g. a self-referencing loop controller with its own null
+        guard) -- see _WiringEngine._scan.
         """
         if node_idn not in self.tableOps:
             raise KeyError(
@@ -809,13 +838,14 @@ class Cell:
             [
                 self.tables[ '__nodes__' ],
                 tableProcesses.make_node_row(
-                    node_idn   = node_idn,
-                    kind       = kind,
-                    source     = source,
-                    target     = target,
-                    parent_idn = parent_idn,
-                    join       = join,
-                    join_k     = join_k,
+                    node_idn         = node_idn,
+                    kind             = kind,
+                    source           = source,
+                    target           = target,
+                    parent_idn       = parent_idn,
+                    join             = join,
+                    join_k           = join_k,
+                    discard_on_null  = discard_on_null,
                 ),
             ],
             how = 'vertical',
@@ -1057,16 +1087,22 @@ def _cell_from_tree(
 
     for row in op_children + placeholder_children:
         cell.register_node(
-            node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
-            join     = row[ 'join' ] or 'all',
-            join_k   = row[ 'join_k' ],
+            node_idn         = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
+            join             = row[ 'join' ] or 'all',
+            join_k           = row[ 'join_k' ],
+            # discard_on_null defaults True -- coalesce a null row value
+            # (never actually written today, since every writer already
+            # supplies a concrete bool) the same way join's own 'all'
+            # fallback does, rather than passing None through.
+            discard_on_null  = True if row[ 'discard_on_null' ] is None else row[ 'discard_on_null' ],
         )
     for row in cell_children:
         if row[ 'source' ] or row[ 'target' ]:
             cell.register_node(
-                node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
-                join     = row[ 'join' ] or 'all',
-                join_k   = row[ 'join_k' ],
+                node_idn         = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
+                join             = row[ 'join' ] or 'all',
+                join_k           = row[ 'join_k' ],
+                discard_on_null  = True if row[ 'discard_on_null' ] is None else row[ 'discard_on_null' ],
             )
 
     return cell

@@ -37,6 +37,9 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
                                # _WiringEngine._scan
     join_k       = 2          # required iff join = "at_least_k" (1 <= join_k
                                # <= len(source)), else omitted
+    discard_on_null = true    # optional, default true; only consulted when
+                               # join = "all" -- see schema.py's __nodes__
+                               # column docs / cell.py's _WiringEngine._scan
 
     # kind="op" additionally requires nothing else -- node_idn must be a
     # key op_classes resolves (its ctor kwargs, if any, come from
@@ -188,6 +191,7 @@ def _config_tree_row(
     op_type:             str | None             = None,
     join:                str | None             = None,
     join_k:              int | None             = None,
+    discard_on_null:     bool | None            = None,
     ) -> pl.DataFrame:
     return pl.DataFrame(
         {
@@ -203,6 +207,7 @@ def _config_tree_row(
             'op_type':              [ op_type ],
             'join':                 [ join ],
             'join_k':               [ join_k ],
+            'discard_on_null':      [ discard_on_null ],
         },
         schema = table_schemas[ 'config_tree' ],
     )
@@ -285,6 +290,15 @@ def _entry_join_fields( entry: dict[ str, Any ], entry_node_idn: str ) -> tuple[
         )
     return join, join_k
 #/def _entry_join_fields
+
+
+def _entry_discard_on_null_field( entry: dict[ str, Any ] ) -> bool:
+    """Extract a [[nodes]] entry's discard_on_null -- shared by the
+    op/placeholder/cell branches below, same as _entry_join_fields.
+    Default True. No join-compatibility validation needed -- it's simply
+    inert when join != 'all' (see schema.py's __nodes__ column docs)."""
+    return bool( entry.get( 'discard_on_null', True ) )
+#/def _entry_discard_on_null_field
 
 
 def _empty_parameters() -> pl.DataFrame:
@@ -444,6 +458,7 @@ def config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
+    discard_on_null:     bool = True,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a config file and its transitive child-file references into
@@ -493,6 +508,7 @@ def config_tree(
         cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
+        discard_on_null     = discard_on_null,
     )
 #/def config_tree
 
@@ -510,6 +526,7 @@ def toml_config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
+    discard_on_null:     bool = True,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a cell TOML file and its transitive kind='cell' [[nodes]] file references
@@ -534,6 +551,7 @@ def toml_config_tree(
         cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
+        discard_on_null     = discard_on_null,
     )
 #/def toml_config_tree
 
@@ -551,6 +569,7 @@ def json_config_tree(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
+    discard_on_null:     bool = True,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Parse a cell JSON file and its transitive kind='cell' [[nodes]] file
@@ -578,6 +597,7 @@ def json_config_tree(
         cells_index_file     = cells_index_file,
         join                = join,
         join_k              = join_k,
+        discard_on_null     = discard_on_null,
     )
 #/def json_config_tree
 
@@ -596,6 +616,7 @@ def _config_tree_from_data(
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
     join:                str  = 'all',
     join_k:              int | None = None,
+    discard_on_null:     bool = True,
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
     """
     Format-agnostic body shared by toml_config_tree()/json_config_tree():
@@ -636,10 +657,11 @@ def _config_tree_from_data(
         source       = source,
         target       = target,
         path         = str( path ),
-        cell_source  = cell_header.get( 'source' ),
-        cell_target  = cell_header.get( 'target' ),
-        join         = join,
-        join_k       = join_k,
+        cell_source      = cell_header.get( 'source' ),
+        cell_target      = cell_header.get( 'target' ),
+        join             = join,
+        join_k           = join_k,
+        discard_on_null  = discard_on_null,
     ) ]
     param_rows: list[ pl.DataFrame ] = [ _empty_parameters() ]
     node_idx = node_idx_start
@@ -694,16 +716,18 @@ def _config_tree_from_data(
                     f"come from its enclosing Cell, not a per-op override"
                 )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
+            discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
-                node_idn     = entry_node_idn,
-                parent_idn   = node_idn,
-                kind         = 'op',
-                source       = entry.get( 'source', [] ),
-                target       = entry.get( 'target', [] ),
-                path         = None,
-                op_type      = entry.get( 'op_type', entry_node_idn ),
-                join         = join,
-                join_k       = join_k,
+                node_idn         = entry_node_idn,
+                parent_idn       = node_idn,
+                kind             = 'op',
+                source           = entry.get( 'source', [] ),
+                target           = entry.get( 'target', [] ),
+                path             = None,
+                op_type          = entry.get( 'op_type', entry_node_idn ),
+                join             = join,
+                join_k           = join_k,
+                discard_on_null  = discard_on_null_entry,
             ) )
             if 'parameters' in entry:
                 # Same (inline keys) | (exactly one external '_toml'/'_json'
@@ -736,16 +760,18 @@ def _config_tree_from_data(
                     f"Cell instantiation (kind='cell')"
                 )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
+            discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
-                node_idn            = entry_node_idn,
-                parent_idn          = node_idn,
-                kind                = 'placeholder',
-                source              = entry.get( 'source', [] ),
-                target              = entry.get( 'target', [] ),
-                path                = None,
-                placeholder_columns = expr_to_text( _placeholder_expr( entry.get( 'columns', {} ) ) ),
-                join                = join,
-                join_k              = join_k,
+                node_idn             = entry_node_idn,
+                parent_idn           = node_idn,
+                kind                 = 'placeholder',
+                source               = entry.get( 'source', [] ),
+                target               = entry.get( 'target', [] ),
+                path                 = None,
+                placeholder_columns  = expr_to_text( _placeholder_expr( entry.get( 'columns', {} ) ) ),
+                join                 = join,
+                join_k               = join_k,
+                discard_on_null      = discard_on_null_entry,
             ) )
         elif kind == 'cell':
             if 'parameters' in entry:
@@ -811,6 +837,7 @@ def _config_tree_from_data(
         resources_map.setdefault( entry_node_idn, {} )[ 'override' ] = override_df
 
         join, join_k = _entry_join_fields( entry, entry_node_idn )
+        discard_on_null_entry = _entry_discard_on_null_field( entry )
         child_nodes, child_params, node_idx, child_resources_map = config_tree(
             path                = child_toml_path,
             node_idn            = entry_node_idn,
@@ -824,6 +851,7 @@ def _config_tree_from_data(
             cells_index_file     = cells_index_file,
             join                = join,
             join_k              = join_k,
+            discard_on_null     = discard_on_null_entry,
         )
         node_rows.append( child_nodes )
         param_rows.append( child_params )

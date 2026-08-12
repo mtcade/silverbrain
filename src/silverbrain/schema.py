@@ -15,6 +15,26 @@ import polars as pl
 from . import bdd
 from .polarsDataTypeStrings import dtype_to_str
 
+
+def col_for_dtype( dtype: pl.DataType ) -> str:
+    """
+    Derive a par_val_* column name from a polars DataType -- the single
+    source of truth for this naming convention (parameterParse.py imports
+    this rather than redefining it; silverflow.tableOps does too, via
+    silverflow.schema's re-export).
+
+    pl.Int64            → 'par_val_int64'
+    pl.Float64          → 'par_val_float64'
+    pl.Utf8             → 'par_val_string'
+    pl.List(pl.Int64)   → 'par_val_list_int64'
+    pl.List(pl.Float64) → 'par_val_list_float64'
+    pl.List(pl.Utf8)    → 'par_val_list_string'
+    """
+    s = dtype_to_str( dtype ).lower().replace( '(', '_' ).replace( ')', '' )
+    return 'par_val_' + s
+#/def col_for_dtype
+
+
 cannonical_schema: dict[ str, pl.DataType ] = {
     'op_idn':           pl.Utf8,
     'source':           pl.List( pl.Utf8 ),
@@ -42,8 +62,18 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'format':            pl.Utf8,
     'backend_input':     pl.Int32,
     'backend_id_column': pl.Utf8,
-    # parameter spec rows
+    # parameter spec rows (parameterParse.py's ParameterParser) -- par_idx
+    # is the flat/cross-producted view's row-group id; node_idx/parent_idx
+    # are the tree view's permanent-id/parent-link pair (both views share
+    # everything else: par_group/par_type/par_name/par_feature + the
+    # par_val_* value columns, added below via col_for_dtype).
     'par_idx':          pl.UInt32,
+    'par_group':        pl.Utf8,
+    'par_type':         pl.Utf8,
+    'par_name':         pl.Utf8,
+    'par_feature':      pl.Utf8,
+    'node_idx':         pl.UInt32,
+    'parent_idx':       pl.UInt32,
     # _trigger (sunder.py): run_id is fresh per invocation (uuid7,
     # matching cell.py's own corr_id/uuid7 convention); triggered_at is
     # that run's wall-clock start time.
@@ -95,11 +125,24 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     #              guarantees correct pairing.
     # join_k     — required (1 <= join_k <= len(source)) iff
     #              join == 'at_least_k', else must be null.
-    'node_idn':     pl.Utf8,
-    'parent_idn':   pl.Utf8,
-    'kind':         pl.Utf8,
-    'join':         pl.Utf8,
-    'join_k':       pl.Int64,
+    # discard_on_null — default true; only consulted when join == 'all'
+    #              (silently inert for 'any'/'at_least_k', where a
+    #              non-participating source already positionally
+    #              contributes None for unrelated reasons -- see
+    #              _WiringEngine._scan). When true and this node would
+    #              otherwise fire but at least one of its dispatched
+    #              inputs is None, the engine consumes the tokens
+    #              (cursor still advances) but never invokes the actor
+    #              and never writes a target token -- "discard this
+    #              round" instead of calling the op with a null input.
+    #              Set false on a node that wants to keep receiving and
+    #              handling a null input itself.
+    'node_idn':        pl.Utf8,
+    'parent_idn':      pl.Utf8,
+    'kind':            pl.Utf8,
+    'join':            pl.Utf8,
+    'join_k':          pl.Int64,
+    'discard_on_null': pl.Boolean,
     # configTree.py: which op_classes key to construct a kind='op' row with
     # -- distinct from node_idn (that row's own wiring/dispatch identity),
     # so the same class can be built by multiple anonymous nodes (node_idn
@@ -142,6 +185,35 @@ def cannonical_schema_for_keys(
     return { key: cannonical_schema[key] for key in keys }
 #/cannonical_schema_for_keys
 
+# The standard par_val_* value columns (parameterParse.py's
+# ParameterParser.schema/schema_flat always carry these three
+# values_search/values_random candidate-list columns unconditionally,
+# plus whichever scalar par_val_* columns its own registered dtypes
+# need -- these four scalar ones cover every dtype PrimitiveValue/bool
+# actually uses). Added to cannonical_schema via col_for_dtype so the
+# column-naming convention has exactly one definition.
+cannonical_schema |= {
+    col_for_dtype( pl.Utf8 ):               pl.Utf8,
+    col_for_dtype( pl.Int64 ):               pl.Int64,
+    col_for_dtype( pl.Float64 ):             pl.Float64,
+    col_for_dtype( pl.Boolean ):             pl.Boolean,
+    col_for_dtype( pl.List( pl.Utf8 ) ):     pl.List( pl.Utf8 ),
+    col_for_dtype( pl.List( pl.Int64 ) ):    pl.List( pl.Int64 ),
+    col_for_dtype( pl.List( pl.Float64 ) ):  pl.List( pl.Float64 ),
+}
+
+# parameterParse.py's two row shapes -- both single source of truth here
+# now, parameterParse.py imports rather than redefines them.
+_IDENTIFIER_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
+    'par_group', 'par_type', 'par_idx', 'par_name', 'par_feature',
+) )
+_TREE_IDENTIFIER_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
+    'par_group', 'par_type', 'par_name', 'par_feature', 'node_idx', 'parent_idx',
+) )
+_CANDIDATE_LIST_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
+    col_for_dtype( pl.List( pl.Utf8 ) ), col_for_dtype( pl.List( pl.Int64 ) ), col_for_dtype( pl.List( pl.Float64 ) ),
+) )
+
 def table_schemas_to_df(
     ts: dict[ str, dict[ str, pl.DataType ] ],
 ) -> pl.DataFrame:
@@ -183,8 +255,16 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     )),
     '__nodes__': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'join', 'join_k',
+        'join', 'join_k', 'discard_on_null',
     )),
+
+    # parameterParse.py's ParameterParser().schema, structural/identifier-
+    # only (no scalar par_val_* columns -- those depend on whatever
+    # dtypes get registered per settings file) -- e.g.
+    # silverflow.tableOps.EmptyTableOp's table_schema="parameter_tree",
+    # to bootstrap a loop needing an initial, always-valid 0-row token
+    # shaped like a real parameter tree.
+    'parameter_tree': _TREE_IDENTIFIER_COLS | _CANDIDATE_LIST_COLS,
 
     # -- TOML ↔ DataFrame schemas
 
@@ -201,7 +281,7 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # see cannonical_schema above.
     'config_tree': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'join', 'join_k',
+        'join', 'join_k', 'discard_on_null',
         'path', 'cell_source', 'cell_target', 'placeholder_columns', 'op_type',
     )),
 

@@ -26,15 +26,20 @@ from typing import Sequence
 
 
 def make_node_row(
-    node_idn:   str,
-    kind:       str,
-    source:     Sequence[ str ] = (),
-    target:     Sequence[ str ] = (),
-    parent_idn: str | None      = None,
-    join:       str             = 'all',
-    join_k:     int | None      = None,
+    node_idn:         str,
+    kind:              str,
+    source:            Sequence[ str ] = (),
+    target:            Sequence[ str ] = (),
+    parent_idn:        str | None      = None,
+    join:              str             = 'all',
+    join_k:            int | None      = None,
+    discard_on_null:   bool            = True,
     ) -> pl.DataFrame:
-    """Build a single-row DataFrame with the '__nodes__' schema."""
+    """Build a single-row DataFrame with the '__nodes__' schema.
+    discard_on_null (default True) is only ever consulted by
+    _WiringEngine._scan when join == 'all' -- no validation needed here
+    for other join values, it's simply inert for them (see schema.py's
+    __nodes__ column docs)."""
     if kind not in ( 'op', 'cell' ):
         raise ValueError( f"kind must be 'op' or 'cell', got {kind!r}" )
     if join not in ( 'all', 'any', 'at_least_k' ):
@@ -49,13 +54,14 @@ def make_node_row(
         raise ValueError( f"join_k is only meaningful when join='at_least_k', got join={join!r} join_k={join_k!r}" )
     return pl.DataFrame(
         {
-            'node_idn':   [ node_idn ],
-            'parent_idn': [ parent_idn ],
-            'kind':       [ kind ],
-            'source':     [ list( source ) ],
-            'target':     [ list( target ) ],
-            'join':       [ join ],
-            'join_k':     [ join_k ],
+            'node_idn':         [ node_idn ],
+            'parent_idn':       [ parent_idn ],
+            'kind':             [ kind ],
+            'source':           [ list( source ) ],
+            'target':           [ list( target ) ],
+            'join':             [ join ],
+            'join_k':           [ join_k ],
+            'discard_on_null':  [ discard_on_null ],
         },
         schema = table_schemas[ '__nodes__' ],
     )

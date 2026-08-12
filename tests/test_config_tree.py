@@ -786,6 +786,21 @@ target   = ["out"]
     row = tree.filter( pl.col( 'node_idn' ) == 'plain' ).row( 0, named = True )
     assert row[ 'join' ]   == 'all'
     assert row[ 'join_k' ] is None
+    assert row[ 'discard_on_null' ] is True
+
+
+def test_discard_on_null_false_threads_through( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[[nodes]]
+node_idn = "plain"
+kind     = "op"
+source   = ["a"]
+target   = ["out"]
+discard_on_null = false
+""" )
+    tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    row = tree.filter( pl.col( 'node_idn' ) == 'plain' ).row( 0, named = True )
+    assert row[ 'discard_on_null' ] is False
 
 
 def test_join_any_threads_through( tmp_path: Path ) -> None:

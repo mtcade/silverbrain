@@ -122,10 +122,19 @@ def merge_resources(
 # read, not later/silently when some consumer reaches for a null it didn't
 # expect. 'json_ptree' (a parameter-tree-shaped JSON file -- silverflow's
 # ReadParametersOp only, never ReadOp/WriteOp/ReadWriteOp here) needs just
-# 'path', same as 'local'.
+# 'path', same as 'local'. 'sqlite_db' needs just 'db_path', no
+# 'table_name' -- unlike 'sqlite' (one named table, read/written wholesale
+# by ReadOp/WriteOp/ReadWriteOp via _SQLiteImpl), 'sqlite_db' means "here's
+# a whole file, an external library (e.g. Optuna's RDBStorage) owns
+# everything inside it" -- resolve_table_idn resolves the path the same
+# way, but _IMPLS deliberately has no entry for it, so ReadOp/WriteOp/
+# ReadWriteOp construction fails fast if pointed at one; only a TableOp
+# written to manage that library's own connection should ever use this
+# kind (e.g. silverflow.tableOps.TPESampler).
 _TABLE_INDEX_REQUIRED_COLUMNS: dict[ str, tuple[ str, ... ] ] = {
     'local':      ( 'path', ),
     'sqlite':     ( 'db_path', 'table_name' ),
+    'sqlite_db':  ( 'db_path', ),
     'postgres':   ( 'connection_string', 'table_name' ),
     'json_ptree': ( 'path', ),
 }
@@ -242,7 +251,17 @@ def _write_parquet( df: pl.DataFrame, fp: str, if_exists: str ) -> None:
 def _write_sqlite_conn( conn: sqlite3.Connection, table_name: str, if_exists: str, df: pl.DataFrame ) -> None:
     """Same logic as a one-shot _write_sqlite, operating on an
     already-open connection (see _SQLiteImpl -- opened once at
-    construction, reused across every call)."""
+    construction, reused across every call).
+
+    List/Struct/Array columns are stored as SQLite's native JSONB (a BLOB
+    column, populated via the jsonb() SQL function) rather than plain TEXT
+    -- more compact, and queryable with json_extract()/->/->> without a
+    text round-trip. json_cols is captured BEFORE _prepare_df_for_sqlite
+    converts those columns to Utf8 (JSON text, still needed -- jsonb()
+    converts text to its binary form, there's no separate Python-side
+    JSONB encoder), since df.schema no longer reflects List/Struct/Array
+    afterward."""
+    json_cols = { col for col, dtype in df.schema.items() if isinstance( dtype, ( pl.List, pl.Array, pl.Struct ) ) }
     df = _prepare_df_for_sqlite( df )
     cursor = conn.cursor()
     exists = cursor.execute(
@@ -256,22 +275,33 @@ def _write_sqlite_conn( conn: sqlite3.Connection, table_name: str, if_exists: st
             exists = False
     if not exists:
         col_defs = ', '.join(
-            f'"{col}" {_pl_dtype_to_sqlite_type( dtype )}'
+            f'"{col}" {"BLOB" if col in json_cols else _pl_dtype_to_sqlite_type( dtype )}'
             for col, dtype in df.schema.items()
         )
         cursor.execute( f'CREATE TABLE "{table_name}" ({col_defs})' )
     col_list     = ', '.join( f'"{col}"' for col in df.columns )
-    placeholders = ', '.join( '?' for _ in df.columns )
+    value_exprs  = ', '.join( 'jsonb(?)' if col in json_cols else '?' for col in df.columns )
     cursor.executemany(
-        f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
+        f'INSERT INTO "{table_name}" ({col_list}) VALUES ({value_exprs})',
         df.rows(),
     )
     conn.commit()
 #/def _write_sqlite_conn
 
 def _read_sqlite_conn( conn: sqlite3.Connection, table_name: str ) -> pl.DataFrame:
+    """SELECT * with JSONB columns (declared type 'BLOB' -- see
+    _write_sqlite_conn) unwrapped via the json() SQL function, so they
+    come back as JSON text the same shape a TEXT-stored column always did
+    (reconstructing List/Struct/Array from that text is a separate,
+    pre-existing gap -- neither TEXT nor JSONB storage does it here)."""
     cursor = conn.cursor()
-    cursor.execute( f'SELECT * FROM "{table_name}"' )
+    cursor.execute( f'PRAGMA table_info("{table_name}")' )
+    col_types = { row[1]: row[2] for row in cursor.fetchall() }  # name -> declared sqlite type, in table order
+    select_list = ', '.join(
+        f'json("{col}") AS "{col}"' if decl_type == 'BLOB' else f'"{col}"'
+        for col, decl_type in col_types.items()
+    )
+    cursor.execute( f'SELECT {select_list} FROM "{table_name}"' )
     rows = cursor.fetchall()
     col_names = [ desc[0] for desc in cursor.description ]
     if not rows:

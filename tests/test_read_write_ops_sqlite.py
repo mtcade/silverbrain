@@ -8,6 +8,8 @@
 #//  hyperparameter_0 (silverknockoff)'s results.
 #
 
+import json
+
 import polars as pl
 
 from silverbrain.ReadWriteOps import _read_sqlite, _write_sqlite
@@ -79,11 +81,14 @@ def test_list_column_round_trips_as_json( tmp_path ) -> None:
     A regression test for a real bug: map_elements passes List-column element
     values as pl.Series, not plain Python lists -- json.dumps(pl.Series(...))
     used to raise TypeError on the very first sqlite write of any List column
-    (e.g. hyperparameter_0's 'X.categories_per_var').
+    (e.g. hyperparameter_0's 'X.categories_per_var'). Stored as JSONB now (see
+    _write_sqlite_conn) -- read back via the json() SQL function, which
+    re-serializes compactly (no spaces after ','), so compare parsed content
+    rather than the exact string.
     """
     db_path = str( tmp_path / 'results.db' )
     df = pl.DataFrame( { 'nums': [ [ 1, 2, 3 ] ] } )
     _write_sqlite( df, db_path=db_path, table_name='t', if_exists='append' )
     out = _read_sqlite( db_path, 't' )
-    assert out[ 'nums' ][ 0 ] == '[1, 2, 3]'
+    assert json.loads( out[ 'nums' ][ 0 ] ) == [ 1, 2, 3 ]
 #/def test_list_column_round_trips_as_json
