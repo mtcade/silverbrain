@@ -34,10 +34,10 @@ def verify_toml( path: Path ) -> list[ VerifyIssue ]:
       names, which may legitimately repeat; see
       squishy-sleeping-snowflake.md).
     - Each [[nodes]] entry has a node_idn and a recognized kind
-      ('op'/'cell'/'placeholder').
+      ('op'/'cell'/'variable').
     - Each kind='cell' entry has a 'toml' path that exists; its own TOML is
       recursively verified.
-    - Each kind='placeholder' entry has a 'columns' table.
+    - Each kind='variable' entry has a 'columns' table.
     """
     path   = Path( path ).resolve()
     issues: list[ VerifyIssue ] = []
@@ -72,17 +72,17 @@ def _check_cell(
         else:
             seen.add( node_idn )
 
-        if kind not in ( 'op', 'cell', 'placeholder' ):
+        if kind not in ( 'op', 'cell', 'variable' ):
             issues.append( VerifyIssue(
                 path, f"[[nodes]] entry {node_idn!r} has unknown kind {kind!r} -- "
-                      f"expected 'op', 'cell', or 'placeholder'"
+                      f"expected 'op', 'cell', or 'variable'"
             ) )
             continue
 
-        if kind == 'placeholder':
+        if kind == 'variable':
             if not entry.get( 'columns' ):
                 issues.append( VerifyIssue(
-                    path, f"[[nodes]] entry {node_idn!r} (kind='placeholder') missing 'columns'"
+                    path, f"[[nodes]] entry {node_idn!r} (kind='variable') missing 'columns'"
                 ) )
             continue
 

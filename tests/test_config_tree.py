@@ -17,7 +17,10 @@ import polars as pl
 import pytest
 
 from silverbrain.bdd import Atom, BDDManager, ColVar, Union
-from silverbrain.configTree import config_tree, toml_config_tree
+from silverbrain.configTree import (
+    config_tree, toml_config_tree,
+    resolve_actor_declarations, resolve_resource_declarations,
+)
 from silverbrain.exprParse import parse_expr
 from silverbrain.parameterParse import TABLE_OPS_PARAMETERS_GROUP, ParameterParser, op_ctor_kwargs_forest
 
@@ -332,107 +335,56 @@ _toml    = "{params_root}/reader_params.toml"
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
 
 
-# -- [resources] / [nodes.resources]: own defaults vs. per-instantiation
-# override, collected into resources_map (node_idn -> {'own', 'override'}),
-# NOT flattened into one frame the way [[parameters]] is -- see
-# configTree.py's module docstring.
+# -- variables.resources / variables.actors: path-addressed declarations,
+# root-wins, resolved once over the whole tree by
+# resolve_resource_declarations()/resolve_actor_declarations() -- see
+# configTree.py's module docstring. Every row toml_config_tree() itself
+# returns (declarations, unresolved) carries 'abs_path'/'declarer_depth';
+# these tests check both the raw declaration rows AND, where relevant, the
+# resolved dict.
 
 
 def test_resources_own_defaults_inline_items( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
-[[resources.items]]
+[[variables.resources]]
 table_idn = "foo"
 path      = "/data/foo.parquet"
 """ )
-    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-    own = resources_map[ 'root' ][ 'own' ]
-    assert own.row( 0, named = True )[ 'table_idn' ] == 'foo'
-    assert own.row( 0, named = True )[ 'path' ] == '/data/foo.parquet'
-    assert resources_map[ 'root' ].get( 'override' ) is None
+    _, _, _, declarations = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    assert resolved[ 'root' ].row( 0, named = True )[ 'table_idn' ] == 'foo'
+    assert resolved[ 'root' ].row( 0, named = True )[ 'path' ] == '/data/foo.parquet'
 
 
-def test_resources_own_defaults_external_json_reference( tmp_path: Path ) -> None:
-    _write( tmp_path / 'resources.json', '{"items": [{"table_idn": "foo", "path": "/data/foo.parquet"}]}' )
-    _write( tmp_path / 'leaf.toml', """\
-[cell]
-
-[resources]
-_json = "resources.json"
-""" )
-    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-    own = resources_map[ 'root' ][ 'own' ]
-    assert own.row( 0, named = True )[ 'table_idn' ] == 'foo'
-
-
-def test_resources_no_block_yields_no_own_entry( tmp_path: Path ) -> None:
+def test_resources_no_block_yields_no_entry( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', "[cell]\n" )
-    _, _, _, resources_map = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-    assert resources_map[ 'root' ][ 'own' ] is None
-
-
-def test_resources_both_json_and_items_raises( tmp_path: Path ) -> None:
-    _write( tmp_path / 'leaf.toml', """\
-[cell]
-
-[resources]
-_json = "resources.json"
-
-[[resources.items]]
-table_idn = "foo"
-path      = "/data/foo.parquet"
-""" )
-    with pytest.raises( ValueError, match="both '_json' and 'items'" ):
-        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-
-
-def test_resources_unrecognized_key_raises( tmp_path: Path ) -> None:
-    _write( tmp_path / 'leaf.toml', """\
-[resources]
-bogus = "x"
-""" )
-    with pytest.raises( ValueError, match="unrecognized key" ):
-        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-
-
-def test_resources_template_vars_apply_to_external_reference( tmp_path: Path ) -> None:
-    resources_dir = tmp_path / 'resources_root'
-    resources_dir.mkdir()
-    _write( resources_dir / 'resources.json', '{"items": [{"table_idn": "foo", "path": "/data/foo.parquet"}]}' )
-    _write( tmp_path / 'leaf.toml', """\
-[cell]
-
-[resources]
-_json = "{resources_root}/resources.json"
-""" )
-    _, _, _, resources_map = toml_config_tree(
-        tmp_path / 'leaf.toml', node_idn='root',
-        template_vars = { 'resources_root': 'resources_root' },
-    )
-    assert resources_map[ 'root' ][ 'own' ].row( 0, named = True )[ 'table_idn' ] == 'foo'
+    _, _, _, declarations = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    assert resolve_resource_declarations( declarations[ 'resources' ] ) == {}
 
 
 def test_resources_inline_items_template_vars_substituted( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
-[[resources.items]]
+[[variables.resources]]
 table_idn = "foo"
 path      = "{bundle_root}/foo.parquet"
 """ )
-    _, _, _, resources_map = toml_config_tree(
+    _, _, _, declarations = toml_config_tree(
         tmp_path / 'leaf.toml', node_idn='root',
         template_vars = { 'bundle_root': '/bundles/train_0' },
     )
-    assert resources_map[ 'root' ][ 'own' ].row( 0, named = True )[ 'path' ] == '/bundles/train_0/foo.parquet'
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    assert resolved[ 'root' ].row( 0, named = True )[ 'path' ] == '/bundles/train_0/foo.parquet'
 
 
-def test_nodes_resources_override_collected_into_dict( tmp_path: Path ) -> None:
+def test_variables_resources_target_addresses_direct_child( tmp_path: Path ) -> None:
     _write( tmp_path / 'child.toml', """\
 [cell]
 
-[[resources.items]]
+[[variables.resources]]
 table_idn = "foo"
 path      = "/child/default/foo.parquet"
 """ )
@@ -443,56 +395,89 @@ path      = "/child/default/foo.parquet"
 node_idn = "kid"
 kind     = "cell"
 toml     = "child.toml"
-[nodes.resources]
-[[nodes.resources.items]]
+
+[[variables.resources]]
+target    = "kid"
 table_idn = "foo"
 path      = "/top/override/foo.parquet"
 """ )
-    _, _, _, resources_map = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
-    # 'own' (child's own file's default) and 'override' (parent's binding
-    # for that instantiation) are distinct slots under the SAME node_idn.
-    assert resources_map[ 'kid' ][ 'own' ].row( 0, named = True )[ 'path' ] == '/child/default/foo.parquet'
-    assert resources_map[ 'kid' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/top/override/foo.parquet'
+    _, _, _, declarations = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    # top's declaration (declarer_depth=0, the root) beats kid's own
+    # (declarer_depth=1, deeper) -- root-wins.
+    assert resolved[ 'top.kid' ].row( 0, named = True )[ 'path' ] == '/top/override/foo.parquet'
 
 
-def test_nodes_resources_on_op_kind_raises( tmp_path: Path ) -> None:
-    _write( tmp_path / 'leaf.toml', """\
+def test_variables_resources_reaches_multiple_levels_deep_without_forwarding( tmp_path: Path ) -> None:
+    """The core new capability: an ancestor several kind='cell' hops above a
+    node can bind straight to it -- NO intermediate file has to re-declare
+    or forward anything, unlike the old one-hop [nodes.resources]."""
+    _write( tmp_path / 'grandchild.toml', "[cell]\n" )
+    _write( tmp_path / 'child.toml', """\
 [cell]
 
 [[nodes]]
-node_idn = "reader"
-kind     = "op"
-[nodes.resources]
-[[nodes.resources.items]]
-table_idn = "foo"
-path      = "/x"
+node_idn = "grandkid"
+kind     = "cell"
+toml     = "grandchild.toml"
 """ )
-    with pytest.raises( ValueError, match="declares 'resources' but kind='op'" ):
-        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
-
-
-def test_nodes_resources_on_placeholder_kind_raises( tmp_path: Path ) -> None:
-    _write( tmp_path / 'leaf.toml', """\
+    _write( tmp_path / 'top.toml', """\
 [cell]
 
 [[nodes]]
-node_idn = "ph"
-kind     = "placeholder"
-[nodes.resources]
-[[nodes.resources.items]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+
+[[variables.resources]]
+target    = "kid.grandkid"
 table_idn = "foo"
-path      = "/x"
+path      = "/top/reaches/deep.parquet"
 """ )
-    with pytest.raises( ValueError, match="declares 'resources' but kind='placeholder'" ):
-        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    assert resolved[ 'top.kid.grandkid' ].row( 0, named = True )[ 'path' ] == '/top/reaches/deep.parquet'
+    # child.toml never mentioned resources at all -- nothing to forward.
+    assert 'top.kid' not in resolved
 
 
-def test_resources_map_merges_up_through_multi_level_nesting( tmp_path: Path ) -> None:
-    """Two sibling kind='cell' nodes instantiating the SAME child template
-    (child.toml), each with a distinct [nodes.resources] override for the
-    same table_idn -- proves resources_map keeps them independent (the core
-    scenario motivating per-instantiation binding over threaded/child-wins
-    resources)."""
+def test_variables_resources_root_wins_over_intermediate_default( tmp_path: Path ) -> None:
+    """An intermediate cell's own declaration for a descendant is only a
+    reusable fallback -- a more senior ancestor's declaration for the same
+    target always wins, even though the intermediate is "closer"."""
+    _write( tmp_path / 'grandchild.toml', "[cell]\n" )
+    _write( tmp_path / 'child.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "grandkid"
+kind     = "cell"
+toml     = "grandchild.toml"
+
+[[variables.resources]]
+target    = "grandkid"
+table_idn = "foo"
+path      = "/child/default.parquet"
+""" )
+    _write( tmp_path / 'top.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+
+[[variables.resources]]
+target    = "kid.grandkid"
+table_idn = "foo"
+path      = "/top/wins.parquet"
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    assert resolved[ 'top.kid.grandkid' ].row( 0, named = True )[ 'path' ] == '/top/wins.parquet'
+
+
+def test_variables_resources_sibling_instantiations_of_same_template_stay_independent( tmp_path: Path ) -> None:
     _write( tmp_path / 'child.toml', "[cell]\n" )
     _write( tmp_path / 'top.toml', """\
 [cell]
@@ -501,39 +486,236 @@ def test_resources_map_merges_up_through_multi_level_nesting( tmp_path: Path ) -
 node_idn = "kid_a"
 kind     = "cell"
 toml     = "child.toml"
-[nodes.resources]
-[[nodes.resources.items]]
-table_idn = "shared_name"
-path      = "/a/data.parquet"
 
 [[nodes]]
 node_idn = "kid_b"
 kind     = "cell"
 toml     = "child.toml"
-[nodes.resources]
-[[nodes.resources.items]]
+
+[[variables.resources]]
+target    = "kid_a"
+table_idn = "shared_name"
+path      = "/a/data.parquet"
+
+[[variables.resources]]
+target    = "kid_b"
 table_idn = "shared_name"
 path      = "/b/data.parquet"
 """ )
-    _, _, _, resources_map = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
-    assert resources_map[ 'kid_a' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/a/data.parquet'
-    assert resources_map[ 'kid_b' ][ 'override' ].row( 0, named = True )[ 'path' ] == '/b/data.parquet'
-    # Neither child declared its own [resources] -- 'own' stays None, not
-    # cross-contaminated with the other sibling's override.
-    assert resources_map[ 'kid_a' ][ 'own' ] is None
-    assert resources_map[ 'kid_b' ][ 'own' ] is None
+    _, _, _, declarations = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    assert resolved[ 'top.kid_a' ].row( 0, named = True )[ 'path' ] == '/a/data.parquet'
+    assert resolved[ 'top.kid_b' ].row( 0, named = True )[ 'path' ] == '/b/data.parquet'
 
 
-# -- kind="placeholder"
+def test_variables_resources_multiple_table_idns_per_target_all_survive( tmp_path: Path ) -> None:
+    """Resolution is per (target, table_idn), not whole-manifest replacement
+    -- a target's resource manifest can hold more than one table, and an
+    ancestor override of ONE table_idn doesn't drop the target's others."""
+    _write( tmp_path / 'child.toml', """\
+[cell]
+
+[[variables.resources]]
+table_idn = "foo"
+path      = "/child/foo.parquet"
+
+[[variables.resources]]
+table_idn = "bar"
+path      = "/child/bar.parquet"
+""" )
+    _write( tmp_path / 'top.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "kid"
+kind     = "cell"
+toml     = "child.toml"
+
+[[variables.resources]]
+target    = "kid"
+table_idn = "foo"
+path      = "/top/foo.parquet"
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'top.toml', node_idn='top' )
+    resolved = resolve_resource_declarations( declarations[ 'resources' ] )
+    by_table_idn = { row[ 'table_idn' ]: row[ 'path' ] for row in resolved[ 'top.kid' ].to_dicts() }
+    assert by_table_idn == { 'foo': '/top/foo.parquet', 'bar': '/child/bar.parquet' }
 
 
-def test_placeholder_node_carries_columns_as_expr_text( tmp_path: Path ) -> None:
+# -- variables.actors: same path-addressing/root-wins mechanism, binding a
+# real op_type (+ ctor kwargs) to a variable's abs_path instead of a
+# resource manifest entry.
+
+
+def test_variables_actors_binds_direct_variable( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "picker"
+kind     = "variable"
+columns  = { a = "Int64" }
+
+[[variables.actors]]
+target  = "picker"
+op_type = "RandomPicker"
+[variables.actors.parameters]
+seed = 7
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    resolved = resolve_actor_declarations( declarations[ 'actors' ] )
+    assert resolved[ 'root.picker' ][ 'op_type' ] == 'RandomPicker'
+    assert resolved[ 'root.picker' ][ 'kwargs' ] == { 'seed': 7 }
+    assert resolved[ 'root.picker' ][ 'declaring_path' ] == 'root'
+
+
+def test_variables_actors_reaches_multiple_levels_deep_without_forwarding( tmp_path: Path ) -> None:
+    _write( tmp_path / 'search.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "parameter_pick_next"
+kind     = "variable"
+columns  = { a = "Int64" }
+""" )
+    _write( tmp_path / 'wrapper.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "search"
+kind     = "cell"
+toml     = "search.toml"
+""" )
+    _write( tmp_path / 'train.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "wrapper"
+kind     = "cell"
+toml     = "wrapper.toml"
+
+[[variables.actors]]
+target  = "wrapper.search.parameter_pick_next"
+op_type = "ParameterPickTPE"
+[variables.actors.parameters]
+n_startup_trials = 10
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'train.toml', node_idn='train_0' )
+    resolved = resolve_actor_declarations( declarations[ 'actors' ] )
+    key = 'train_0.wrapper.search.parameter_pick_next'
+    assert resolved[ key ][ 'op_type' ] == 'ParameterPickTPE'
+    assert resolved[ key ][ 'kwargs' ] == { 'n_startup_trials': 10 }
+
+
+def test_variables_actors_root_wins_over_intermediate_default( tmp_path: Path ) -> None:
+    _write( tmp_path / 'search.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "parameter_pick_next"
+kind     = "variable"
+columns  = { a = "Int64" }
+""" )
+    _write( tmp_path / 'wrapper.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "search"
+kind     = "cell"
+toml     = "search.toml"
+
+[[variables.actors]]
+target  = "search.parameter_pick_next"
+op_type = "ParameterPickRandom"
+""" )
+    _write( tmp_path / 'train.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "wrapper"
+kind     = "cell"
+toml     = "wrapper.toml"
+
+[[variables.actors]]
+target  = "wrapper.search.parameter_pick_next"
+op_type = "ParameterPickTPE"
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'train.toml', node_idn='train_0' )
+    resolved = resolve_actor_declarations( declarations[ 'actors' ] )
+    assert resolved[ 'train_0.wrapper.search.parameter_pick_next' ][ 'op_type' ] == 'ParameterPickTPE'
+
+
+def test_variables_actors_requires_exactly_one_of_op_type_or_toml( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "picker"
+kind     = "variable"
+columns  = { a = "Int64" }
+
+[[variables.actors]]
+target = "picker"
+""" )
+    with pytest.raises( ValueError, match="exactly one of 'op_type' or 'toml'" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+def test_variables_actors_toml_graft_declaration_resolves_to_absolute_path( tmp_path: Path ) -> None:
+    """toml_config_tree()/resolve_actor_declarations() only parse and
+    resolve the declaration itself -- 'toml' is resolved to an absolute
+    path (relative to the declaring file, same {key} tvars convention a
+    kind='cell' [[nodes]] entry's own 'toml' gets), but nothing is spliced
+    yet (that's configTree.splice_actor_grafts(), exercised end to end via
+    cell_from_file in test_cell_actors.py)."""
+    _write( tmp_path / 'some_sampler.toml', "[cell]\n" )
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "picker"
+kind     = "variable"
+columns  = { a = "Int64" }
+
+[[variables.actors]]
+target = "picker"
+toml   = "some_sampler.toml"
+""" )
+    _, _, _, declarations = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+    resolved = resolve_actor_declarations( declarations[ 'actors' ] )
+    assert resolved[ 'root.picker' ][ 'kind' ] == 'cell'
+    assert resolved[ 'root.picker' ][ 'toml' ] == str( ( tmp_path / 'some_sampler.toml' ).resolve() )
+
+
+def test_variables_actors_toml_graft_rejects_extra_keys( tmp_path: Path ) -> None:
+    _write( tmp_path / 'leaf.toml', """\
+[cell]
+
+[[nodes]]
+node_idn = "picker"
+kind     = "variable"
+columns  = { a = "Int64" }
+
+[[variables.actors]]
+target = "picker"
+toml   = "some_sampler.toml"
+[variables.actors.parameters]
+bogus = 1
+""" )
+    with pytest.raises( ValueError, match="unrecognized key" ):
+        toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
+
+
+# -- kind     = "variable"
+
+
+def test_variable_node_carries_columns_as_expr_text( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 source   = ["inp"]
 target   = ["out"]
 columns  = { a = "Int64", b = "Utf8" }
@@ -541,31 +723,31 @@ columns  = { a = "Int64", b = "Utf8" }
     tree, params, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
 
-    assert row[ 'kind' ]       == 'placeholder'
+    assert row[ 'kind' ]       == 'variable'
     assert row[ 'source' ]     == [ 'inp' ]
     assert row[ 'target' ]     == [ 'out' ]
 
     m = BDDManager()
-    expr = parse_expr( row[ 'placeholder_columns' ] )
+    expr = parse_expr( row[ 'variable_columns' ] )
     assert expr.to_bdd( m ) is Union( Atom( 'a', pl.Int64 ), Atom( 'b', pl.Utf8 ) ).to_bdd( m )
 
 
-def test_placeholder_node_defaults_to_empty_columns( tmp_path: Path ) -> None:
+def test_variable_node_defaults_to_empty_columns( tmp_path: Path ) -> None:
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 """ )
     tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
     m = BDDManager()
     from silverbrain.bdd import FALSE
-    assert parse_expr( row[ 'placeholder_columns' ] ).to_bdd( m ) is FALSE
+    assert parse_expr( row[ 'variable_columns' ] ).to_bdd( m ) is FALSE
 
 
-def test_placeholder_node_dict_form_infers_via_sentinel( tmp_path: Path ) -> None:
+def test_variable_node_dict_form_infers_via_sentinel( tmp_path: Path ) -> None:
     """A dict value of "?" means "infer from schema.cannonical_schema" --
     same sentinel spelling exprParse.py's text grammar uses."""
     _write( tmp_path / 'leaf.toml', """\
@@ -573,7 +755,7 @@ def test_placeholder_node_dict_form_infers_via_sentinel( tmp_path: Path ) -> Non
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 columns  = { op_idn = "?" }
 """ )
     tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
@@ -581,32 +763,32 @@ columns  = { op_idn = "?" }
 
     from silverbrain.schema import cannonical_schema
     m = BDDManager()
-    expr = parse_expr( row[ 'placeholder_columns' ] )
+    expr = parse_expr( row[ 'variable_columns' ] )
     assert expr.to_bdd( m ) is Atom( 'op_idn', cannonical_schema[ 'op_idn' ] ).to_bdd( m )
 
 
-def test_placeholder_node_text_form_with_colvar( tmp_path: Path ) -> None:
+def test_variable_node_text_form_with_colvar( tmp_path: Path ) -> None:
     """The new ColVar-capable interface form -- the main use case: a saved
-    map with a placeholder whose interface references a column variable,
-    to be resolved later once the placeholder is filled in."""
+    map with a variable node whose interface references a column variable,
+    to be resolved later once the node is filled in."""
     _write( tmp_path / 'leaf.toml', """\
 [cell]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
 """ )
     tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     row = tree.filter( pl.col( 'node_idn' ) == 'future' ).row( 0, named = True )
 
     m = BDDManager()
-    expr = parse_expr( row[ 'placeholder_columns' ] )
+    expr = parse_expr( row[ 'variable_columns' ] )
     expected = Union( ColVar( 'C' ), Atom( 'nu_col_0', pl.Int64 ) )
     assert expr.to_bdd( m ) is expected.to_bdd( m )
 
 
-def test_op_and_cell_nodes_have_null_placeholder_columns( tmp_path: Path ) -> None:
+def test_op_and_cell_nodes_have_null_variable_columns( tmp_path: Path ) -> None:
     _write( tmp_path / 'child.toml', "[cell]\n" )
     _write( tmp_path / 'leaf.toml', """\
 [cell]
@@ -622,8 +804,8 @@ toml     = "child.toml"
 """ )
     tree, _, _, _ = toml_config_tree( tmp_path / 'leaf.toml', node_idn='root' )
     rows = { r[ 'node_idn' ]: r for r in tree.to_dicts() }
-    assert rows[ 'an_op' ][ 'placeholder_columns' ] is None
-    assert rows[ 'a_cell' ][ 'placeholder_columns' ] is None
+    assert rows[ 'an_op' ][ 'variable_columns' ] is None
+    assert rows[ 'a_cell' ][ 'variable_columns' ] is None
 
 
 def test_unknown_kind_raises( tmp_path: Path ) -> None:

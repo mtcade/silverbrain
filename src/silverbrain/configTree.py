@@ -7,15 +7,19 @@
 Parses config files into a flat, initialization-ready node tree -- pure
 parsing, no live Cell construction
 
-The output is a (nodes, parameters, next_node_idx, resources_map) 4-tuple
-(see [resources] / [nodes.resources] below for resources_map):
+The output is a (nodes, parameters, next_node_idx, declarations) 4-tuple
+(see "variables.resources / variables.actors" below for declarations):
 
 - nodes ('config_tree' schema, schema.py): a node_idn/parent_idn pair per
   node, spanning however many files a config transitively references via
   kind='cell' [[nodes]] entries. This is the same node_idn/parent_idn
   convention Cell's own __nodes__ table uses (schema.py), just with real
   multi-level parent_idn chains, since a config's file-reference tree can
-  be arbitrarily deep before any live Cell exists.
+  be arbitrarily deep before any live Cell exists. Every row also carries
+  its own 'abs_path' -- the dotted chain of node_idns from the ROOT of this
+  whole config_tree() call down to this node (e.g. "wrapper.search.
+  parameter_pick_next") -- see "variables.resources / variables.actors"
+  below for what this is used for.
 
 [[nodes]] -- one block per node this file directly owns, distinguished
 by kind (any leaf TableOp/nested Cell/child can, in principle, be swapped
@@ -25,7 +29,7 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
 
     [[nodes]]
     node_idn = "..."          # must be unique among this file's own nodes
-    kind     = "op"           # "op" | "cell" | "placeholder"
+    kind     = "op"           # "op" | "cell" | "variable"
     source   = [...]          # this node's positional inputs, read from
                                # this Cell's own namespace
     target   = [...]          # this node's positional outputs, written
@@ -48,7 +52,7 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
     # kind="cell" additionally requires:
     #   toml = "path/to/child.toml"   # relative to this file
 
-    # kind="placeholder" additionally requires:
+    # kind="variable" additionally requires:
     #   columns = { col_name = "DtypeStr", ... }   # e.g. { a = "Int64" }
     #     -- or, for a ColVar-capable interface (exprParse.py's grammar):
     #   columns = "Union(ColVar('C'), 'nu_col_0')"
@@ -57,9 +61,9 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
     # schema.cannonical_schema" -- see exprParse.py's module docstring.
     # Declares the node's interface (an arity-1 input/output pair) with no
     # implementation bound yet -- built into a tableOps.PlaceholderOp,
-    # which raises if ever actually called. Swap
-    # cell.tableOps[node_idn] for a real TableOp/Cell before this node is
-    # reached on a live execution path.
+    # which raises if ever actually called, UNLESS a variables.actors
+    # declaration (see below) binds a real implementation to this node's
+    # abs_path.
 - parameters (ParameterParser's tree schema, parameterParse.py): a forest
   of TableOp construction-parameter trees. Every parameterized op's rows
   share one fixed par_group, parameterParse.TABLE_OPS_PARAMETERS_GROUP
@@ -86,7 +90,7 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
   root call doesn't need to, since nothing consumes it past that one call.
 
 [[parameters]] -- one block per parameterized [[nodes]] entry in *this*
-file (kind='op' or kind='cell' -- a placeholder's interface is declared
+file (kind='op' or kind='cell' -- a variable's interface is declared
 inline on its own [[nodes]] entry instead, see below):
 
     [[parameters]]
@@ -119,54 +123,73 @@ references are dispatched separately (by their own .toml/.json suffix, via
 _load_param_group) since they carry a raw ParamGroupDict, not another node
 in the topology.
 
-[resources] / [nodes.resources] -- a cell's own declared resources
-defaults, and (on a kind='cell' [[nodes]] entry) the resources its
-instantiating parent explicitly binds for that one child instantiation.
-Unlike [[parameters]], this is NOT flattened into one tree-wide frame --
-two sibling kind='cell' nodes instantiating the same template must be able
-to resolve the same table_idn to different concrete resources, so
-resources stay scoped per node_idn. The output grows a 4th element,
-resources_map: dict[node_idn, dict['own' | 'override', pl.DataFrame | None]]
--- 'own' is set once, by the node's own file's [resources] block; 'override'
-is set once, by the parent's [nodes.resources] block on that node's entry.
-cell.py's _cell_from_tree resolves each Cell's effective resources from
-just its own node_idn's two slots (caller-wins merge, see
-ReadWriteOps.merge_resources) and passes resources_map UNCHANGED into every
-recursive child call -- there is no automatic inheritance beyond a node's
-own two slots; a parent that wants a child to see something the parent
-itself received must re-declare it in that child's [nodes.resources].
+variables.resources / variables.actors -- path-addressed declarations, the
+mechanism behind BOTH a cell's own resource manifest AND (a variable's)
+bound implementation. Each `[[variables.<channel>]]` entry is declared by
+SOME node in the tree (any file, not just a direct parent) and names a
+`target` -- a dotted node path RELATIVE TO THE DECLARING NODE ITSELF (e.g.
+"search.parameter_pick_next"; omit or use "." to target the declaring node
+itself). Resolved to an absolute path by prefixing the declaring node's own
+abs_path. A declarer can therefore only ever reach INTO ITS OWN SUBTREE --
+never sideways to a sibling's internals, never upward -- but may reach
+arbitrarily deep, not just its direct children (unlike the old one-hop
+[resources]/[nodes.resources] this replaces).
 
-    [resources]
-    _json = "path/to/resources.json"   # resolved relative to this file,
-                                        # same {bundle_root}-style tvars
-                                        # substituted into the ref string
-                                        # first, exactly like [[parameters]]'
-                                        # _toml/_json
-    # ... or, instead, an inline list (never both):
-    [[resources.items]]
+    [[variables.resources]]
+    target    = "search"        # optional, defaults to "." (self)
     table_idn = "..."
-    kind      = "local"   # optional, defaults "local"
-    path      = "..."     # or db_path/table_name/connection_string/schema_name,
-                           # whichever 'kind' requires -- same shape as one
-                           # resources.json list item
+    kind      = "local"         # optional, defaults "local"
+    path      = "..."           # or db_path/table_name/connection_string/
+                                 # schema_name, whichever 'kind' needs
 
-A [[nodes]] entry with kind='cell' may carry its own [nodes.resources]
-(TOML's usual dotted-table-attaches-to-the-last-array-element convention,
-same as [nodes.parameters] already uses) with the identical _json/items
-grammar -- this is the "caller override" for that specific instantiation.
-kind='op'/kind='placeholder' entries reject a 'resources' key outright
-(resources only make sense for a nested Cell instantiation; an op-level
-node's own ops already receive whatever THIS Cell's resolved resources
-DataFrame is via build_tableOps's existing opt-in inspect.signature
-injection -- no per-op override exists or is needed).
+    [[variables.actors]]
+    target  = "search.parameter_pick_next"
+    op_type = "..."              # a key into op_classes, exactly like a
+                                  # kind='op' [[nodes]] entry's own op_type
+    [variables.actors.parameters]
+    some_kwarg = 1                # ctor kwargs for op_type, if any
+
+Every declaration also carries declarer_depth -- how many kind='cell' hops
+this DECLARING node sits below the root of the whole config_tree() call
+(root = 0). Resolution (resolve_resource_declarations/
+resolve_actor_declarations, below) picks, per target abs_path (and, for
+resources, per table_idn within that path -- a target's resource manifest
+can hold more than one table), the declaration with the SMALLEST
+declarer_depth -- i.e. the ancestor closest to the root always wins over
+any declaration made further down the tree (including a node's own default
+for itself, which has declarer_depth == that node's own depth, the largest
+possible value on its chain). This is the deliberate opposite of a normal
+override cascade: the outermost assembler is meant to be the final
+compositional authority over anything it transitively instantiates, and an
+intermediate cell's own declaration (even one written FOR one of its own
+descendants, as a reusable default) is only ever a fallback. Two
+declarations for the same target can never tie -- every declarer of a
+given target is, by construction, an ancestor of that target (relative-
+only addressing), so all declarers of one target form a single linear
+chain with a total order by depth.
+
+Not flattened across DIFFERENT targets the way [[parameters]] is: two
+sibling kind='cell' entries instantiating the same template must be able
+to resolve the same table_idn (or the same variable node_idn) to
+different concrete bindings -- since abs_path is built from each
+INSTANCE's own node_idn chain (locally unique per parent, enforced by
+seen_node_idns below), not the template's node_idns, two sibling
+instantiations' abs_paths never collide even when they're built from the
+exact same child file.
+
+resolve_resource_declarations()/resolve_actor_declarations() do the actual
+per-target resolution, once, after a whole config_tree() call returns --
+cell.py's _cell_from_tree then just looks each node up by its own abs_path
+column, already fully resolved, no further merging needed at construction
+time.
 """
 
 from . import bdd
 from .bundle import CELLS_INDEX_FILE_DEFAULT, resolve_cell_fp
 from .exprParse import expr_to_text, parse_expr
 from .parameterParse import ParameterParser, parameter_group_to_tree
-from .ReadWriteOps import _table_ref_row, load_resources
-from .schema import table_schemas
+from .ReadWriteOps import _table_ref_row
+from .schema import cannonical_schema_for_keys, table_schemas
 from .utilities import apply_template_vars
 
 import json
@@ -178,6 +201,246 @@ from typing import Any, Sequence
 from uuid import uuid4
 
 
+# -- variables.resources / variables.actors declaration-row schemas (see
+# module docstring). Transient/local shapes -- not registered in
+# schema.py's table_schemas, since nothing outside this module's own parse
+# -> resolve pipeline ever sees a row in this exact shape (resolution
+# strips 'abs_path'/'declarer_depth' back off before handing a per-target
+# result to cell.py).
+
+_RESOURCE_DECL_SCHEMA: dict[ str, pl.DataType ] = (
+    table_schemas[ 'table_index' ]
+    | cannonical_schema_for_keys( ( 'abs_path', 'declarer_depth' ) )
+)
+_ACTOR_DECL_SCHEMA: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
+    'abs_path', 'declarer_depth', 'kind', 'op_type', 'path', 'kwargs_json', 'declaring_path',
+) )
+
+
+def _empty_resource_decls() -> pl.DataFrame:
+    return pl.DataFrame( schema = _RESOURCE_DECL_SCHEMA )
+#/def _empty_resource_decls
+
+
+def _empty_actor_decls() -> pl.DataFrame:
+    return pl.DataFrame( schema = _ACTOR_DECL_SCHEMA )
+#/def _empty_actor_decls
+
+
+def _empty_declarations() -> dict[ str, pl.DataFrame ]:
+    return { 'resources': _empty_resource_decls(), 'actors': _empty_actor_decls() }
+#/def _empty_declarations
+
+
+def resolve_resource_declarations( decls: pl.DataFrame ) -> dict[ str, pl.DataFrame ]:
+    """
+    Resolve a flat variables.resources declarations frame (abs_path,
+    declarer_depth, plus table_index columns) into {abs_path: resolved
+    table_index DataFrame}. Root-wins, generalizing the old
+    ReadWriteOps.merge_resources 'caller overrides on a clashing table_idn'
+    idiom to arbitrary depth: sort by declarer_depth descending (deepest/
+    most-local declarations first, root last), then
+    unique(subset=[abs_path,table_idn], keep='last') -- the shallowest
+    (closest to root) declaration for a given (target, table_idn) pair
+    survives. A target with no declarations at all simply has no key in
+    the result (equivalent to Cell.resources staying None, same as today).
+    """
+    if decls.is_empty():
+        return {}
+    deduped = (
+        decls
+        .sort( 'declarer_depth', descending = True, maintain_order = True )
+        .unique( subset = [ 'abs_path', 'table_idn' ], keep = 'last', maintain_order = True )
+    )
+    resolved: dict[ str, pl.DataFrame ] = {}
+    for abs_path in deduped[ 'abs_path' ].unique( maintain_order = True ):
+        resolved[ abs_path ] = (
+            deduped
+            .filter( pl.col( 'abs_path' ) == abs_path )
+            .drop( [ 'abs_path', 'declarer_depth' ] )
+        )
+    return resolved
+#/def resolve_resource_declarations
+
+
+def resolve_actor_declarations( decls: pl.DataFrame ) -> dict[ str, dict[ str, Any ] ]:
+    """
+    Resolve a flat variables.actors declarations frame the same way --
+    root-wins, one winner per abs_path (a variable has exactly one bound
+    implementation, unlike a resource manifest's per-table_idn rows).
+    Result: {abs_path: {'kind': 'op'|'cell', 'declaring_path': ..., ...}} --
+    'declaring_path' is provenance (which node's [[variables.actors]] entry
+    actually won), carried through to __actor_bindings__ (schema.py) for
+    inspection. kind='op' additionally carries 'op_type'/'kwargs' (an
+    op_classes key + its ctor kwargs); kind='cell' additionally carries
+    'toml' (the graft's already-resolved, absolute child file path -- see
+    splice_actor_grafts(), which is what actually consumes a kind='cell'
+    binding; _cell_from_tree only ever sees kind='op' bindings, since a
+    graft is fully spliced into the tree itself before construction).
+    """
+    if decls.is_empty():
+        return {}
+    deduped = (
+        decls
+        .sort( 'declarer_depth', descending = True, maintain_order = True )
+        .unique( subset = [ 'abs_path' ], keep = 'last', maintain_order = True )
+    )
+    resolved: dict[ str, dict[ str, Any ] ] = {}
+    for row in deduped.to_dicts():
+        binding: dict[ str, Any ] = {
+            'kind':           row[ 'kind' ],
+            'declaring_path': row[ 'declaring_path' ],
+        }
+        if row[ 'kind' ] == 'cell':
+            binding[ 'toml' ] = row[ 'path' ]
+        else:
+            binding[ 'op_type' ] = row[ 'op_type' ]
+            binding[ 'kwargs' ]  = json.loads( row[ 'kwargs_json' ] )
+        resolved[ row[ 'abs_path' ] ] = binding
+    return resolved
+#/def resolve_actor_declarations
+
+
+# Hard cap on splice_actor_grafts()'s resolve/splice rounds -- exists only
+# to turn a pathological config (e.g. a graft file that, transitively,
+# re-declares a graft binding for the very variable it was just spliced
+# in to answer) into a clear error instead of an infinite loop. No real
+# config should ever need more than a few rounds (one per level of graft
+# nesting actually present).
+_MAX_GRAFT_SPLICE_ROUNDS = 50
+
+
+def splice_actor_grafts(
+    tree:                pl.DataFrame,
+    parameters:          pl.DataFrame,
+    node_idx:            int,
+    declarations:        dict[ str, pl.DataFrame ],
+    template_vars:       dict[ str, str ] | None      = None,
+    app_name:            str | None                   = None,
+    fallback_data_roots: dict[ str, Path ] | None      = None,
+    cells_index_file:     Path                        = CELLS_INDEX_FILE_DEFAULT,
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ], dict[ str, dict[ str, Any ] ] ]:
+    """
+    Resolve declarations and splice in every variables.actors binding whose
+    kind='cell' (a graft -- see module docstring's variables.actors
+    section), repeatedly, until a fixed point: a grafted subtree can itself
+    contain further variables with their own variables.actors/
+    variables.resources declarations (its own defaults, or a still-pending
+    ancestor declaration reaching further in through it), so one resolve
+    pass isn't always enough. Called once by cell_from_file(), after
+    config_tree() has produced the whole (pre-graft) tree/parameters/
+    declarations -- NOT threaded through _cell_from_tree, since by the
+    time construction starts every graft is already a plain kind='cell'
+    row in `tree`, indistinguishable from one hand-authored in TOML.
+
+    Splicing a target abs_path: find its (currently kind='variable')
+    row, parse the graft's toml (config_tree(), same recursive machinery
+    an ordinary kind='cell' [[nodes]] entry uses) with that row's OWN
+    node_idn/parent_idn/source/target/join/discard_on_null carried over
+    unchanged (only WHICH implementation answers this node_idn is
+    changing, not how it's wired -- same principle as cell.py's
+    Cell._replace_actor) and ancestor_path set so the grafted subtree's
+    own abs_path comes out identical to the variable's -- then replace
+    the variable row with the graft's own root row (now kind='cell')
+    plus every row underneath it, and fold the graft's own parameters/
+    declarations into the running totals for the next round.
+
+    Returns (tree, parameters, node_idx, resolved_resources,
+    resolved_actors) -- fully resolved and fully spliced; resolved_actors
+    still contains an entry for every spliced kind='cell' target too (not
+    consumed by _cell_from_tree, which only ever looks up variable rows
+    -- none remain at that abs_path after splicing -- but kept for
+    cell.py's __actor_bindings__ provenance row).
+    """
+    tvars = template_vars or {}
+    for _ in range( _MAX_GRAFT_SPLICE_ROUNDS ):
+        resolved_actors = resolve_actor_declarations( declarations[ 'actors' ] )
+        pending = {
+            abs_path: binding for abs_path, binding in resolved_actors.items()
+            if binding[ 'kind' ] == 'cell'
+            and not tree.filter(
+                ( pl.col( 'abs_path' ) == abs_path ) & ( pl.col( 'kind' ) == 'cell' )
+            ).height
+        }
+        if not pending:
+            break
+        for abs_path, binding in pending.items():
+            target_rows = tree.filter(
+                ( pl.col( 'abs_path' ) == abs_path ) & ( pl.col( 'kind' ) == 'variable' )
+            )
+            if target_rows.is_empty():
+                raise ValueError(
+                    f"variables.actors graft binding targeting {abs_path!r} "
+                    f"(declared by {binding[ 'declaring_path' ]!r}) does not "
+                    f"resolve to any kind='variable' node"
+                )
+            target_row = target_rows.row( 0, named = True )
+            ancestor_path = tuple( abs_path.split( '.' )[ :-1 ] )
+            graft_nodes, graft_params, node_idx, graft_decls = config_tree(
+                path                = binding[ 'toml' ],
+                node_idn            = target_row[ 'node_idn' ],
+                parent_idn          = target_row[ 'parent_idn' ],
+                source              = target_row[ 'source' ] or (),
+                target              = target_row[ 'target' ] or (),
+                template_vars       = tvars,
+                node_idx_start      = node_idx,
+                app_name            = app_name,
+                fallback_data_roots = fallback_data_roots,
+                cells_index_file     = cells_index_file,
+                join                = target_row[ 'join' ] or 'all',
+                join_k              = target_row[ 'join_k' ],
+                discard_on_null     = True if target_row[ 'discard_on_null' ] is None else target_row[ 'discard_on_null' ],
+                ancestor_path       = ancestor_path,
+            )
+            tree = pl.concat(
+                [
+                    tree.filter( ~( ( pl.col( 'abs_path' ) == abs_path ) & ( pl.col( 'kind' ) == 'variable' ) ) ),
+                    graft_nodes,
+                ],
+                how = 'vertical',
+            )
+            parameters = pl.concat( [ parameters, graft_params ], how = 'diagonal_relaxed' )
+            declarations = {
+                'resources': pl.concat( [ declarations[ 'resources' ], graft_decls[ 'resources' ] ], how = 'vertical' ),
+                'actors':    pl.concat( [ declarations[ 'actors' ],    graft_decls[ 'actors' ]    ], how = 'vertical' ),
+            }
+    else:
+        raise ValueError(
+            f"variables.actors graft splicing did not converge after "
+            f"{_MAX_GRAFT_SPLICE_ROUNDS} rounds -- check for a cyclic graft "
+            f"reference (a grafted cell whose own variables.actors "
+            f"re-targets the variable it was just spliced in to answer)"
+        )
+
+    # A kind='cell' node_idn (which every spliced graft's own root row now
+    # is) must be globally unique across the whole tree -- the same
+    # pre-existing assumption _cell_from_tree already leans on for
+    # hand-authored kind='cell' [[nodes]] entries (tree.filter(node_idn ==
+    # ...).row(0)). A variable's own node_idn is typically far LESS
+    # deliberately unique than a hand-chosen cell instantiation id (e.g.
+    # "parameter_pick_next" reused verbatim across every sampler-swappable
+    # cell in a bundle), so grafting makes a collision meaningfully more
+    # likely -- checked explicitly here so a collision fails loudly at
+    # parse time instead of silently building the wrong cell for one of
+    # the two (tree.filter(...).row(0) would just pick one arbitrarily).
+    cell_node_idns = tree.filter( pl.col( 'kind' ) == 'cell' )[ 'node_idn' ]
+    dupes = cell_node_idns.filter( cell_node_idns.is_duplicated() ).unique().to_list()
+    if dupes:
+        raise ValueError(
+            f"node_idn(s) {dupes!r} identify more than one kind='cell' node "
+            f"in the assembled tree after graft splicing -- every kind='cell' "
+            f"node_idn (including a variable's own node_idn, once "
+            f"grafted) must be unique across the WHOLE tree, not just "
+            f"locally; give the variable(s) an explicit, distinct "
+            f"node_idn"
+        )
+
+    resolved_resources = resolve_resource_declarations( declarations[ 'resources' ] )
+    resolved_actors    = resolve_actor_declarations( declarations[ 'actors' ] )
+    return tree, parameters, node_idx, resolved_resources, resolved_actors
+#/def splice_actor_grafts
+
+
 def _config_tree_row(
     node_idn:            str,
     parent_idn:          str | None,
@@ -185,9 +448,10 @@ def _config_tree_row(
     source:              Sequence[ str ],
     target:              Sequence[ str ],
     path:                str | None,
+    abs_path:             str,
     cell_source:         Sequence[ str ] | None = None,
     cell_target:         Sequence[ str ] | None = None,
-    placeholder_columns: str | None             = None,
+    variable_columns: str | None             = None,
     op_type:             str | None             = None,
     join:                str | None             = None,
     join_k:              int | None             = None,
@@ -201,9 +465,10 @@ def _config_tree_row(
             'source':               [ list( source ) ],
             'target':               [ list( target ) ],
             'path':                 [ path ],
+            'abs_path':             [ abs_path ],
             'cell_source':          [ list( cell_source ) if cell_source is not None else None ],
             'cell_target':          [ list( cell_target ) if cell_target is not None else None ],
-            'placeholder_columns':  [ placeholder_columns ],
+            'variable_columns':  [ variable_columns ],
             'op_type':              [ op_type ],
             'join':                 [ join ],
             'join_k':               [ join_k ],
@@ -214,9 +479,9 @@ def _config_tree_row(
 #/def _config_tree_row
 
 
-def _placeholder_expr( columns: Any ) -> bdd.Expr:
+def _variable_expr( columns: Any ) -> bdd.Expr:
     """
-    Normalize a kind='placeholder' [[nodes]] entry's `columns` field to one
+    Normalize a kind='variable' [[nodes]] entry's `columns` field to one
     bdd.Expr -- either a TOML/JSON dict ({name = "DtypeStr", ...},
     backward compatible -- "?" or "" as a value now also means "infer",
     same sentinel spelling exprParse.py's text grammar uses) or a plain
@@ -234,9 +499,9 @@ def _placeholder_expr( columns: Any ) -> bdd.Expr:
         )
         return parse_expr( f'Union({atoms_text})' )
     raise TypeError(
-        f"placeholder 'columns' must be a dict or a string (exprParse grammar), got {type(columns)!r}"
+        f"variable 'columns' must be a dict or a string (exprParse grammar), got {type(columns)!r}"
     )
-#/def _placeholder_expr
+#/def _variable_expr
 
 
 def _auto_node_idn( entry: dict[ str, Any ] ) -> str:
@@ -263,7 +528,7 @@ def _auto_node_idn( entry: dict[ str, Any ] ) -> str:
 def _entry_join_fields( entry: dict[ str, Any ], entry_node_idn: str ) -> tuple[ str, int | None ]:
     """
     Extract and validate a [[nodes]] entry's join/join_k -- shared by the
-    op/placeholder/cell branches below (see schema.py's __nodes__ column
+    op/variable/cell branches below (see schema.py's __nodes__ column
     docs / _WiringEngine._scan for what these mean). Default ('all', None)
     reproduces today's only behavior (a plain AND-join) when neither is
     declared.
@@ -294,7 +559,7 @@ def _entry_join_fields( entry: dict[ str, Any ], entry_node_idn: str ) -> tuple[
 
 def _entry_discard_on_null_field( entry: dict[ str, Any ] ) -> bool:
     """Extract a [[nodes]] entry's discard_on_null -- shared by the
-    op/placeholder/cell branches below, same as _entry_join_fields.
+    op/variable/cell branches below, same as _entry_join_fields.
     Default True. No join-compatibility validation needed -- it's simply
     inert when join != 'all' (see schema.py's __nodes__ column docs)."""
     return bool( entry.get( 'discard_on_null', True ) )
@@ -397,52 +662,119 @@ def _parameters_entry_group(
 #/def _parameters_entry_group
 
 
-def _resources_entry_group(
-    block:     dict[ str, Any ] | None,
-    base_path: Path,
-    tvars:     dict[ str, str ],
-    ) -> pl.DataFrame | None:
+def _resolve_target_path( target: str | None, own_abs_path: str ) -> str:
     """
-    Resolve one [resources] or [nodes.resources] TOML/JSON block to a
-    table_index DataFrame (or None if block is None -- no such block
-    declared at all). Either an external '_json' reference (resolved
-    relative to base_path, {key} tvars substituted into the ref string
-    first, then delegated straight to load_resources() -- the exact same
-    {'items': [...]} shape a resources.json file itself has) or an inline
-    'items' list (each item a resources.json list-item dict, tvars
-    substituted into its literal values), never both -- same
-    external-reference-XOR-inline-keys grammar _parameters_entry_group
-    already enforces for [[parameters]].
+    An variables.<channel> entry's `target` is relative to the declaring
+    node itself -- omitted, "", or "." all mean "target myself"; anything
+    else is dotted-joined onto own_abs_path (see module docstring).
     """
-    if block is None:
-        return None
-    block    = dict( block )
-    json_ref = block.pop( '_json', None )
-    items    = block.pop( 'items', None )
+    if target in ( None, '', '.' ):
+        return own_abs_path
+    return f"{own_abs_path}.{target}"
+#/def _resolve_target_path
 
-    if json_ref is not None and items is not None:
-        raise ValueError(
-            "[resources]/[nodes.resources] declares both '_json' and "
-            "'items' -- only one is allowed"
-        )
-    if block:
-        raise ValueError(
-            f"[resources]/[nodes.resources] has unrecognized key(s) "
-            f"{ sorted( block )!r } -- only '_json' or 'items' are allowed"
-        )
 
-    if json_ref is not None:
-        return load_resources(
-            ( base_path / apply_template_vars( json_ref, tvars ) ).resolve(),
-            template_vars = tvars,
-        )
-    if items is not None:
-        rows = [ _table_ref_row( _apply_template_vars_to_value( item, tvars ) ) for item in items ]
-        if rows:
-            return pl.DataFrame( rows, schema = table_schemas[ 'table_index' ] )
-        return pl.DataFrame( schema = table_schemas[ 'table_index' ] )
-    return None
-#/def _resources_entry_group
+def _resource_variable_entries(
+    entries:      list[ dict[ str, Any ] ],
+    own_abs_path: str,
+    own_depth:    int,
+    tvars:        dict[ str, str ],
+    ) -> pl.DataFrame:
+    """Parse this file's own [[variables.resources]] entries into declaration
+    rows -- see module docstring. Each entry is one table_idn binding
+    (table_index's own shape, via ReadWriteOps._table_ref_row) plus a
+    'target' routing key."""
+    rows: list[ dict[ str, Any ] ] = []
+    for entry in entries:
+        entry = dict( entry )
+        target = entry.pop( 'target', None )
+        row = _table_ref_row( _apply_template_vars_to_value( entry, tvars ) )
+        row[ 'abs_path' ]        = _resolve_target_path( target, own_abs_path )
+        row[ 'declarer_depth' ]  = own_depth
+        rows.append( row )
+    if not rows:
+        return _empty_resource_decls()
+    return pl.DataFrame( rows, schema = _RESOURCE_DECL_SCHEMA )
+#/def _resource_variable_entries
+
+
+def _actor_variable_entries(
+    entries:      list[ dict[ str, Any ] ],
+    own_abs_path: str,
+    own_depth:    int,
+    base_path:    Path,
+    tvars:        dict[ str, str ],
+    ) -> pl.DataFrame:
+    """Parse this file's own [[variables.actors]] entries into declaration
+    rows -- see module docstring. Each entry binds exactly one of:
+
+    - op_type (+ optional 'parameters' kwargs, JSON-encoded here rather
+      than routed through the __table_ops_parameters__ forest, to avoid
+      that forest's op_idn-uniqueness assumption -- see the plan notes on
+      op_ctor_kwargs_forest's flat keying), or
+    - toml -- a whole-cell graft, resolved to an absolute path relative to
+      THIS file (base_path, same {key} tvars convention a kind='cell'
+      [[nodes]] entry's own 'toml' already gets) right here, at parse
+      time, since this is the last point this declaration still knows
+      which file it came from. The actual splicing (parsing that file and
+      grafting its subtree in place of the target variable) happens
+      later, in splice_actor_grafts() -- only after every declaration in
+      the whole tree is collected and root-wins resolution has picked a
+      winner, since only the RESOLVED binding is the one that should
+      actually be spliced in.
+    """
+    rows: list[ dict[ str, Any ] ] = []
+    for entry in entries:
+        entry = dict( entry )
+        target = entry.pop( 'target', None )
+        target_path = _resolve_target_path( target, own_abs_path )
+        has_op_type = 'op_type' in entry
+        has_toml    = 'toml' in entry
+        if has_op_type == has_toml:
+            raise ValueError(
+                f"[[variables.actors]] entry targeting {target_path!r} must have "
+                f"exactly one of 'op_type' or 'toml'"
+            )
+        if has_toml:
+            toml_ref = entry.pop( 'toml' )
+            if entry:
+                raise ValueError(
+                    f"[[variables.actors]] entry targeting {target_path!r} has "
+                    f"unrecognized key(s) {sorted(entry)!r} -- a 'toml' graft binding "
+                    f"takes no other keys (the grafted cell's own construction, "
+                    f"including its own ctor kwargs, is entirely its own file's concern)"
+                )
+            resolved_toml_path = str( ( base_path / apply_template_vars( toml_ref, tvars ) ).resolve() )
+            rows.append( {
+                'abs_path':        target_path,
+                'declarer_depth':  own_depth,
+                'kind':            'cell',
+                'op_type':         None,
+                'path':            resolved_toml_path,
+                'kwargs_json':     None,
+                'declaring_path':  own_abs_path,
+            } )
+            continue
+        op_type = entry.pop( 'op_type' )
+        kwargs  = _apply_template_vars_to_value( entry.pop( 'parameters', {} ), tvars )
+        if entry:
+            raise ValueError(
+                f"[[variables.actors]] entry targeting {target_path!r} has "
+                f"unrecognized key(s) {sorted(entry)!r}"
+            )
+        rows.append( {
+            'abs_path':        target_path,
+            'declarer_depth':  own_depth,
+            'kind':            'op',
+            'op_type':         op_type,
+            'path':            None,
+            'kwargs_json':     json.dumps( kwargs ),
+            'declaring_path':  own_abs_path,
+        } )
+    if not rows:
+        return _empty_actor_decls()
+    return pl.DataFrame( rows, schema = _ACTOR_DECL_SCHEMA )
+#/def _actor_variable_entries
 
 
 def config_tree(
@@ -459,10 +791,11 @@ def config_tree(
     join:                str  = 'all',
     join_k:              int | None = None,
     discard_on_null:     bool = True,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
+    ancestor_path:       tuple[ str, ... ] = (),
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
     Parse a config file and its transitive child-file references into
-    (nodes, parameters, next_node_idx, resources_map), dispatching to a
+    (nodes, parameters, next_node_idx, declarations), dispatching to a
     format-specific parser by path's suffix. '.toml' and '.json' are both
     implemented (toml_config_tree/json_config_tree); anything else raises.
 
@@ -472,6 +805,13 @@ def config_tree(
     transitive kind='cell' [[nodes]] entries draws its own parameter tree's node_idx values
     from one running counter, so the whole forest this call produces has
     globally-unique node_idx (not just unique per entry).
+
+    ancestor_path: the dotted chain of node_idns from the OUTERMOST caller's
+    own root down to (but not including) this file's own node_idn -- empty
+    for a root call. Threaded one level deeper on every recursive kind='cell'
+    call so every row this call (and its children) produce carries a
+    correct abs_path -- see module docstring's variables.resources/
+    variables.actors section.
 
     app_name/fallback_data_roots/cells_index_file: only needed if some
     kind='cell' [[nodes]] entry, anywhere in the transitive walk, uses
@@ -509,6 +849,7 @@ def config_tree(
         join                = join,
         join_k              = join_k,
         discard_on_null     = discard_on_null,
+        ancestor_path       = ancestor_path,
     )
 #/def config_tree
 
@@ -527,10 +868,11 @@ def toml_config_tree(
     join:                str  = 'all',
     join_k:              int | None = None,
     discard_on_null:     bool = True,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
+    ancestor_path:       tuple[ str, ... ] = (),
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
     Parse a cell TOML file and its transitive kind='cell' [[nodes]] file references
-    into (nodes, parameters, next_node_idx, resources_map). See
+    into (nodes, parameters, next_node_idx, declarations). See
     _config_tree_from_data() for the format-agnostic parsing logic shared
     with json_config_tree().
     """
@@ -552,6 +894,7 @@ def toml_config_tree(
         join                = join,
         join_k              = join_k,
         discard_on_null     = discard_on_null,
+        ancestor_path       = ancestor_path,
     )
 #/def toml_config_tree
 
@@ -570,15 +913,16 @@ def json_config_tree(
     join:                str  = 'all',
     join_k:              int | None = None,
     discard_on_null:     bool = True,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
+    ancestor_path:       tuple[ str, ... ] = (),
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
     Parse a cell JSON file and its transitive kind='cell' [[nodes]] file
-    references into (nodes, parameters, next_node_idx, resources_map) -- the
+    references into (nodes, parameters, next_node_idx, declarations) -- the
     JSON equivalent of toml_config_tree(): same {'cell': {...}, 'nodes':
-    [...], 'parameters': [...], 'resources': {...}} shape TOML's
-    [cell]/[[nodes]]/[[parameters]]/[resources] tables parse to, just
-    spelled as JSON. See _config_tree_from_data() for the shared parsing
-    logic.
+    [...], 'parameters': [...], 'variables': {...}} shape TOML's
+    [cell]/[[nodes]]/[[parameters]]/[[variables.resources]]/
+    [[variables.actors]] tables parse to, just spelled as JSON. See
+    _config_tree_from_data() for the shared parsing logic.
     """
     path = Path( path ).resolve()
     with open( path, 'r' ) as f:
@@ -598,6 +942,7 @@ def json_config_tree(
         join                = join,
         join_k              = join_k,
         discard_on_null     = discard_on_null,
+        ancestor_path       = ancestor_path,
     )
 #/def json_config_tree
 
@@ -617,22 +962,20 @@ def _config_tree_from_data(
     join:                str  = 'all',
     join_k:              int | None = None,
     discard_on_null:     bool = True,
-    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, dict[ str, pl.DataFrame | None ] ] ]:
+    ancestor_path:       tuple[ str, ... ] = (),
+    ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
     Format-agnostic body shared by toml_config_tree()/json_config_tree():
     given an already-parsed {'cell': {...}, 'nodes': [...], 'parameters':
-    [...], 'resources': {...}} dict plus the resolved path it came from,
-    build this file's (nodes, parameters, next_node_idx, resources_map).
+    [...], 'variables': {...}} dict plus the resolved path it came from,
+    build this file's (nodes, parameters, next_node_idx, declarations).
 
-    resources_map is a node_idn-keyed dict with up to two slots each:
-    'own' (this node's own file's top-level [resources] block -- set once,
-    right below, by the call whose own node_idn IS this node) and
-    'override' (a kind='cell' [[nodes]] entry's [nodes.resources] block --
-    set once, by the PARENT, just before recursing into that child). It is
-    NOT flattened like parameters -- two sibling kind='cell' entries
-    instantiating the same template must resolve the same table_idn
-    differently, so each node_idn's fragment stays independent. See the
-    module docstring's [resources]/[nodes.resources] section.
+    declarations is {'resources': DataFrame, 'actors': DataFrame} -- every
+    variables.resources/variables.actors entry parsed anywhere in this
+    file or its transitive kind='cell' children, flattened into two frames
+    (NOT resolved yet -- resolve_resource_declarations()/
+    resolve_actor_declarations() do that, once, over the whole tree this
+    top-level config_tree() call produces). See module docstring.
 
     node_idn/parent_idn/source/target describe how *this* file was
     referenced by its parent (root call: parent_idn=None, source/target
@@ -649,6 +992,10 @@ def _config_tree_from_data(
     """
     tvars = template_vars or {}
 
+    own_path     = ancestor_path + ( node_idn, )
+    own_abs_path = '.'.join( own_path )
+    own_depth    = len( ancestor_path )
+
     cell_header = data.get( 'cell', {} )
     node_rows: list[ pl.DataFrame ] = [ _config_tree_row(
         node_idn     = node_idn,
@@ -657,6 +1004,7 @@ def _config_tree_from_data(
         source       = source,
         target       = target,
         path         = str( path ),
+        abs_path         = own_abs_path,
         cell_source      = cell_header.get( 'source' ),
         cell_target      = cell_header.get( 'target' ),
         join             = join,
@@ -666,12 +1014,15 @@ def _config_tree_from_data(
     param_rows: list[ pl.DataFrame ] = [ _empty_parameters() ]
     node_idx = node_idx_start
 
-    own_resources_df = _resources_entry_group( data.get( 'resources' ), path.parent, tvars )
-    resources_map: dict[ str, dict[ str, pl.DataFrame | None ] ] = {
-        node_idn: { 'own': own_resources_df },
-    }
+    variables_header = data.get( 'variables', {} )
+    resource_decl_frames: list[ pl.DataFrame ] = [ _resource_variable_entries(
+        variables_header.get( 'resources', [] ), own_abs_path, own_depth, tvars,
+    ) ]
+    actor_decl_frames: list[ pl.DataFrame ] = [ _actor_variable_entries(
+        variables_header.get( 'actors', [] ), own_abs_path, own_depth, path.parent, tvars,
+    ) ]
 
-    # Two passes over [[nodes]], not one: op/placeholder rows are appended
+    # Two passes over [[nodes]], not one: op/variable rows are appended
     # immediately, but kind='cell' entries are only *collected* here and
     # recursed into afterward, once this file's own [[parameters]] have
     # claimed their node_idx range -- preserves the pre-unification
@@ -706,15 +1057,9 @@ def _config_tree_from_data(
             )
         seen_node_idns.add( entry_node_idn )
         kind = entry[ 'kind' ]
+        entry_abs_path = f"{own_abs_path}.{entry_node_idn}"
 
         if kind == 'op':
-            if 'resources' in entry:
-                raise ValueError(
-                    f"[[nodes]] entry {entry_node_idn!r} declares 'resources' but "
-                    f"kind='op' -- resources only make sense for a nested Cell "
-                    f"instantiation (kind='cell'); an op's own resolved resources "
-                    f"come from its enclosing Cell, not a per-op override"
-                )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
             discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
@@ -724,6 +1069,7 @@ def _config_tree_from_data(
                 source           = entry.get( 'source', [] ),
                 target           = entry.get( 'target', [] ),
                 path             = None,
+                abs_path          = entry_abs_path,
                 op_type          = entry.get( 'op_type', entry_node_idn ),
                 join             = join,
                 join_k           = join_k,
@@ -744,31 +1090,26 @@ def _config_tree_from_data(
                 p_tree, node_idx = parameter_group_to_tree( p_node_idn, group, node_idx_start = node_idx )
                 param_rows.append( p_tree )
                 inline_param_op_idns.add( entry_node_idn )
-        elif kind == 'placeholder':
+        elif kind == 'variable':
             if 'parameters' in entry:
                 raise ValueError(
                     f"[[nodes]] entry {entry_node_idn!r} declares 'parameters' but "
-                    f"kind='placeholder' -- placeholders are built directly as "
+                    f"kind='variable' -- variables are built directly as "
                     f"PlaceholderOp(columns=...), never through the "
                     f"__table_ops_parameters__ forest, so inline parameters here "
                     f"would silently never be read"
-                )
-            if 'resources' in entry:
-                raise ValueError(
-                    f"[[nodes]] entry {entry_node_idn!r} declares 'resources' but "
-                    f"kind='placeholder' -- resources only make sense for a nested "
-                    f"Cell instantiation (kind='cell')"
                 )
             join, join_k = _entry_join_fields( entry, entry_node_idn )
             discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
                 node_idn             = entry_node_idn,
                 parent_idn           = node_idn,
-                kind                 = 'placeholder',
+                kind                 = 'variable',
                 source               = entry.get( 'source', [] ),
                 target               = entry.get( 'target', [] ),
                 path                 = None,
-                placeholder_columns  = expr_to_text( _placeholder_expr( entry.get( 'columns', {} ) ) ),
+                abs_path              = entry_abs_path,
+                variable_columns  = expr_to_text( _variable_expr( entry.get( 'columns', {} ) ) ),
                 join                 = join,
                 join_k               = join_k,
                 discard_on_null      = discard_on_null_entry,
@@ -785,7 +1126,7 @@ def _config_tree_from_data(
         else:
             raise ValueError(
                 f"[[nodes]] entry {entry_node_idn!r} has unknown kind {kind!r} -- "
-                f"expected 'op', 'cell', or 'placeholder'"
+                f"expected 'op', 'cell', or 'variable'"
             )
 
     for entry in data.get( 'parameters', [] ):
@@ -828,17 +1169,9 @@ def _config_tree_from_data(
                 f"'toml' nor 'cell_idn' -- one is required"
             )
 
-        # This entry's own [nodes.resources] -- the resources THIS parent
-        # explicitly binds for that one child instantiation ('override').
-        # Parsed and stashed here, before recursing, since it belongs to
-        # entry_node_idn's slot regardless of what the child's own file
-        # declares for itself ('own', set by the recursive call below).
-        override_df = _resources_entry_group( entry.get( 'resources' ), path.parent, tvars )
-        resources_map.setdefault( entry_node_idn, {} )[ 'override' ] = override_df
-
         join, join_k = _entry_join_fields( entry, entry_node_idn )
         discard_on_null_entry = _entry_discard_on_null_field( entry )
-        child_nodes, child_params, node_idx, child_resources_map = config_tree(
+        child_nodes, child_params, node_idx, child_decls = config_tree(
             path                = child_toml_path,
             node_idn            = entry_node_idn,
             parent_idn          = node_idn,
@@ -852,24 +1185,12 @@ def _config_tree_from_data(
             join                = join,
             join_k              = join_k,
             discard_on_null     = discard_on_null_entry,
+            ancestor_path       = own_path,
         )
         node_rows.append( child_nodes )
         param_rows.append( child_params )
-        # Merge the child's own resources_map fragment up -- NOT flattened
-        # into one frame (unlike param_rows): each node_idn keeps its own
-        # small {'own': ..., 'override': ...} dict, so a same-named
-        # table_idn declared by two different (e.g. sibling, same-template)
-        # node_idns never cross-contaminates. Safe only because 'own' is
-        # ever written by the node's own recursive call and 'override' only
-        # ever by that node's parent (immediately above) -- never both by
-        # the same side -- so .update() here never clobbers a value already
-        # written by the other side. Relies on every kind='cell' node_idn
-        # being unique across the WHOLE transitive tree, not just this
-        # file's own [[nodes]] siblings -- a pre-existing assumption
-        # cell.py's _cell_from_tree already leans on (tree.filter(node_idn
-        # == ...).row(0)), not a new one introduced here.
-        for k, v in child_resources_map.items():
-            resources_map.setdefault( k, {} ).update( v )
+        resource_decl_frames.append( child_decls[ 'resources' ] )
+        actor_decl_frames.append( child_decls[ 'actors' ] )
 
     return (
         pl.concat( node_rows,  how = 'vertical' ),
@@ -880,6 +1201,9 @@ def _config_tree_from_data(
         # rather than requiring identical schemas.
         pl.concat( param_rows, how = 'diagonal_relaxed' ),
         node_idx,
-        resources_map,
+        {
+            'resources': pl.concat( resource_decl_frames, how = 'vertical' ),
+            'actors':    pl.concat( actor_decl_frames,    how = 'vertical' ),
+        },
     )
 #/def _config_tree_from_data

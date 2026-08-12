@@ -6,7 +6,7 @@
 #//
 """
 A human-writable text grammar for bdd.Expr, parsed with pyparsing -- lets a
-cell map (configTree.py) declare a placeholder's interface as a real
+cell map (configTree.py) declare a variable's interface as a real
 set-expression (with ColVar) instead of only a flat {name: dtype} dict.
 
 GRAMMAR

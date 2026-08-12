@@ -763,7 +763,7 @@ class EmptyTableOp( TableOp ):
 class PlaceholderOp( TableOp ):
     """
     Stands in for a node whose interface is declared but whose
-    implementation isn't bound yet -- built from a kind="placeholder"
+    implementation isn't bound yet -- built from a kind="variable"
     [[nodes]] entry (configTree.py). Declares the same arity-1
     input/output shape MemoryOp and the static-path read ops use, so
     wiring, schema checks, and __table_op_schema__ all see a real

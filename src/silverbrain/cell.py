@@ -7,7 +7,6 @@ from . import configTree, exprParse, tableOps, tableProcesses, types
 from .types import Actor
 from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
-from .ReadWriteOps import merge_resources
 from .schema import table_schemas, table_schemas_to_df
 from .sunder import sunder_table_factories
 
@@ -36,6 +35,7 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
     # ParameterParser's own (with zero dtypes registered, just its
     # identifier columns), reused directly rather than duplicated.
     '__table_ops_parameters__':   ParameterParser().schema,
+    '__actor_bindings__':         table_schemas[ '__actor_bindings__' ],
 }
 
 # -- Async dispatch: a shared thread pool every Cell's wiring engine and
@@ -470,11 +470,11 @@ class Cell:
         self.tableOps:  types.TableProcessDict = {}
         # A resource manifest (table_index-shaped, see ReadWriteOps.py) --
         # held as a top-level attribute of every Cell. This is already the
-        # fully-resolved OUTPUT of this Cell's own construction-time
-        # caller-wins merge of its declared [resources] defaults and
-        # whatever override its instantiating parent explicitly supplied
-        # (see _cell_from_tree/configTree.py's [resources]/[nodes.resources]
-        # and ReadWriteOps.merge_resources) -- NOT itself forwarded to any
+        # fully-resolved OUTPUT of configTree.py's path-addressed
+        # variables.resources resolution (root-wins across however many
+        # ancestor levels declared something for this Cell's own abs_path
+        # -- see configTree.py's module docstring and
+        # resolve_resource_declarations()) -- NOT itself forwarded to any
         # nested child Cell automatically. Opaque to core Cell itself
         # (which schema/columns it has is a caller concern, e.g.
         # ReadWriteOps.py's table_index) -- just carried, not interpreted.
@@ -509,6 +509,9 @@ class Cell:
             ),
             # __tables_schema__ bootstraps itself — its own schema is one of the rows
             '__tables_schema__':         table_schemas_to_df( _SYSTEM_SCHEMAS ),
+            # One row per variable node_idn bound to a real implementation
+            # via configTree.py's variables.actors -- see _cell_from_tree.
+            '__actor_bindings__':        pl.DataFrame( schema = table_schemas[ '__actor_bindings__' ] ),
         }
         # __table_op_schema__ is now bdd's (op_idn, direction, index)-rooted
         # expression forest -- node_idx must stay globally unique across
@@ -706,9 +709,12 @@ class Cell:
 
         Sunder for now -- no public replace-actor API decided yet (dict
         swap + wiring-row survival semantics still need a caller-facing
-        contract); the wiring row itself (__nodes__: source/target/kind)
-        is untouched, since only which actor answers node_idn is changing,
-        not how it's wired.
+        contract); the wiring row itself (__nodes__: source/target) is
+        untouched, since only which actor answers node_idn is changing,
+        not how it's wired. __nodes__.kind IS recomputed though (see
+        below) -- 'kind' isn't really part of "how it's wired", it's a
+        derived fact about the current actor, and a variable-to-cell
+        (or op-to-cell) swap changes it.
 
         _WiringEngine._dispatch re-reads self.cell.tableOps[node_idn] fresh
         on every firing (no cached bind()), so this takes effect on
@@ -719,6 +725,19 @@ class Cell:
             raise KeyError( f"{ node_idn!r } is not a registered tableOp on this Cell" )
 
         self.tableOps[ node_idn ] = actor
+
+        # kind is inferred the same way register_node's own caller already
+        # does (isinstance check against Cell) -- only meaningful to
+        # recompute for a node that already has a __nodes__ row (register_node
+        # itself hasn't run yet the first time _cell_from_tree binds a
+        # variable's real actor, so there's nothing to update there).
+        new_kind = 'cell' if isinstance( actor, Cell ) else 'op'
+        self.tables[ '__nodes__' ] = self.tables[ '__nodes__' ].with_columns(
+            pl.when( pl.col( 'node_idn' ) == node_idn )
+              .then( pl.lit( new_kind ) )
+              .otherwise( pl.col( 'kind' ) )
+              .alias( 'kind' )
+        )
 
         self.tables[ '__table_op_schema__'  ] = self.tables[ '__table_op_schema__'  ].filter(
             pl.col( 'op_idn' ) != node_idn
@@ -1002,7 +1021,8 @@ def _cell_from_tree(
     rng:        np.random.Generator | None,
     verbose:    int,
     parameters: pl.DataFrame,
-    declared_resources: dict[ str, dict[ str, pl.DataFrame | None ] ] | None = None,
+    resolved_resources: dict[ str, pl.DataFrame ] | None = None,
+    resolved_actors:    dict[ str, dict ]          | None = None,
     ) -> Cell:
     """
     Construct one Cell (and, recursively, its nested Cell children) from a
@@ -1022,28 +1042,24 @@ def _cell_from_tree(
     yet); build_tableOps()/op_ctor_kwargs_forest() already handle a
     non-empty one, ahead of that syntax landing.
 
-    declared_resources (configTree.py's resources_map -- see its
-    [resources]/[nodes.resources] docs) is threaded UNCHANGED to every
-    level, exactly like parameters -- but, unlike parameters, each level
-    only ever reads its OWN node_idn's two slots ('own': this Cell's own
-    declared [resources] defaults; 'override': whatever its instantiating
-    parent explicitly bound for it via [nodes.resources]) and resolves them
-    via merge_resources (caller/override wins on a clashing table_idn).
-    This Cell's OWN resolved Cell.resources is never itself forwarded to
-    any child -- a nested Cell only ever sees resources through its own
-    declared defaults plus its own parent's explicit override slot in
-    declared_resources; there is no automatic inheritance beyond that.
+    resolved_resources/resolved_actors (configTree.resolve_resource_
+    declarations()/resolve_actor_declarations() -- see configTree.py's
+    module docstring) are each a FULLY RESOLVED, whole-tree {abs_path: ...}
+    dict -- computed once by cell_from_file, before any Cell exists, and
+    threaded UNCHANGED to every recursive level here (same as parameters).
+    Unlike the old one-hop resources_map, there is no further per-level
+    merging left to do: every row in `tree` already carries its own
+    abs_path (configTree.py), so each node just looks itself up.
     """
     own_row = tree.filter(
         ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
     ).row( 0, named = True )
     children             = tree.filter( pl.col( 'parent_idn' ) == node_idn )
     op_children          = children.filter( pl.col( 'kind' ) == 'op'          ).to_dicts()
-    placeholder_children = children.filter( pl.col( 'kind' ) == 'placeholder' ).to_dicts()
+    variable_children = children.filter( pl.col( 'kind' ) == 'variable' ).to_dicts()
     cell_children        = children.filter( pl.col( 'kind' ) == 'cell'        ).to_dicts()
 
-    _decl = ( declared_resources or {} ).get( node_idn, {} )
-    effective_resources = merge_resources( _decl.get( 'own' ), _decl.get( 'override' ) )
+    effective_resources = ( resolved_resources or {} ).get( own_row[ 'abs_path' ] )
 
     op_keys: list[ str ] = [ row[ 'node_idn' ] for row in op_children ]
     op_types: dict[ str, str ] = {
@@ -1052,27 +1068,43 @@ def _cell_from_tree(
     }
     ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types, effective_resources )
 
-    for row in placeholder_children:
-        # configTree.py already fully resolved every atom's dtype before
-        # storing (exprParse.expr_to_text always emits them explicitly),
-        # so this parse is pure deserialization -- never expected to hit
-        # the inference-error path.
-        expr = exprParse.parse_expr( row[ 'placeholder_columns' ] )
-        ops[ row[ 'node_idn' ] ] = PlaceholderOp( expr = expr, rng = rng )
+    # node_idn -> resolved actor binding, for the __actor_bindings__ rows
+    # appended below (once this Cell exists to append to).
+    bound_variables: dict[ str, dict ] = {}
+    for row in variable_children:
+        binding = ( resolved_actors or {} ).get( row[ 'abs_path' ] )
+        if binding is None:
+            # configTree.py already fully resolved every atom's dtype
+            # before storing (exprParse.expr_to_text always emits them
+            # explicitly), so this parse is pure deserialization -- never
+            # expected to hit the inference-error path.
+            expr = exprParse.parse_expr( row[ 'variable_columns' ] )
+            ops[ row[ 'node_idn' ] ] = PlaceholderOp( expr = expr, rng = rng )
+        else:
+            cls = op_classes[ binding[ 'op_type' ] ]
+            ops[ row[ 'node_idn' ] ] = cls( rng = rng, **binding[ 'kwargs' ] )
+            bound_variables[ row[ 'node_idn' ] ] = binding
 
+    # A cell_children row whose abs_path has a resolved kind='cell' actor
+    # binding is a graft (configTree.splice_actor_grafts already spliced it
+    # into the tree as an ordinary kind='cell' row, indistinguishable from
+    # a hand-authored one from here on) -- recorded the same way a
+    # kind='op' binding is, just so __actor_bindings__ still shows a
+    # variable was involved at all.
+    grafted_cells: dict[ str, dict ] = {}
     for row in cell_children:
+        binding = ( resolved_actors or {} ).get( row[ 'abs_path' ] )
+        if binding is not None and binding[ 'kind' ] == 'cell':
+            grafted_cells[ row[ 'node_idn' ] ] = binding
         ops[ row[ 'node_idn' ] ] = _cell_from_tree(
-            tree               = tree,
-            node_idn           = row[ 'node_idn' ],
-            op_classes         = op_classes,
-            rng                = rng,
-            verbose            = verbose,
-            parameters         = parameters,
-            # Unchanged, not effective_resources -- a child only ever sees
-            # resources through its OWN 'own'/'override' slots in this same
-            # dict, never through what this level resolved for itself. This
-            # is what enforces "no automatic inheritance" (see docstring).
-            declared_resources = declared_resources,
+            tree                = tree,
+            node_idn            = row[ 'node_idn' ],
+            op_classes          = op_classes,
+            rng                 = rng,
+            verbose             = verbose,
+            parameters          = parameters,
+            resolved_resources  = resolved_resources,
+            resolved_actors     = resolved_actors,
         )
 
     cell = Cell(
@@ -1085,7 +1117,35 @@ def _cell_from_tree(
         resources  = effective_resources,
     )
 
-    for row in op_children + placeholder_children:
+    if bound_variables or grafted_cells:
+        cell.tables[ '__actor_bindings__' ] = pl.concat(
+            [
+                cell.tables[ '__actor_bindings__' ],
+                pl.DataFrame(
+                    [
+                        {
+                            'node_idn':        variable_node_idn,
+                            'kind':            'op',
+                            'op_type':         binding[ 'op_type' ],
+                            'declaring_path':  binding[ 'declaring_path' ],
+                        }
+                        for variable_node_idn, binding in bound_variables.items()
+                    ] + [
+                        {
+                            'node_idn':        cell_node_idn,
+                            'kind':            'cell',
+                            'op_type':         None,
+                            'declaring_path':  binding[ 'declaring_path' ],
+                        }
+                        for cell_node_idn, binding in grafted_cells.items()
+                    ],
+                    schema = table_schemas[ '__actor_bindings__' ],
+                ),
+            ],
+            how = 'vertical',
+        )
+
+    for row in op_children + variable_children:
         cell.register_node(
             node_idn         = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
             join             = row[ 'join' ] or 'all',
@@ -1141,7 +1201,7 @@ def cell_from_file(
                   TOML syntax populates it yet), so an op with no declared
                   parameters just gets `cls(rng=rng)`, relying on its own
                   defaults (or a TypeError for a missing required kwarg).
-                  kind='placeholder' nodes don't consult op_classes at all --
+                  kind='variable' nodes don't consult op_classes at all --
                   they're built directly as tableOps.PlaceholderOp(columns=...).
     main_id     : passed to ``Cell.__init__`` and used as this file's own
                   node_idn in the parsed tree
@@ -1155,16 +1215,16 @@ def cell_from_file(
                   bundle.resolve_map_fp()'s maps_index.toml search. Omit for
                   a config that only ever uses ``toml``.
     resources   : a table_index-shaped resource manifest (see
-                  ReadWriteOps.py) acting as the ROOT Cell's own
-                  caller-override -- merged (caller-wins) against the root
-                  cell's own declared [resources] TOML defaults, exactly
-                  the same role a parent's [nodes.resources] block plays
-                  for a nested kind='cell' instantiation (this Python
-                  kwarg IS that override, for the outermost/no-parent
-                  case). NOT forwarded to any nested child automatically --
-                  a child only ever sees resources via its own [resources]
-                  defaults plus its own parent's explicit
-                  [nodes.resources] override.
+                  ReadWriteOps.py) acting as an even-more-senior override
+                  than anything any [[variables.resources]] block in TOML
+                  could declare for the root cell itself (declarer_depth=-1,
+                  see configTree.py's module docstring) -- this is the
+                  outermost caller's own say, from OUTSIDE the config tree
+                  entirely. Root-wins semantics otherwise apply exactly as
+                  for any in-TOML variables.resources declaration: NOT
+                  forwarded to any nested child automatically -- a child
+                  only ever sees resources it (or some ancestor's
+                  [[variables.resources]] targeting it) declared.
 
     TOML schema expected
     --------------------
@@ -1180,7 +1240,7 @@ def cell_from_file(
 
     [[nodes]]                    # one block per node this file directly owns
         node_idn = "..."          # unique among this file's own nodes
-        kind     = "op"           # "op" | "cell" | "placeholder"
+        kind     = "op"           # "op" | "cell" | "variable"
         source   = [...]          # names this node's positional inputs are
                                    # read from (this Cell's own namespace)
         target   = [...]          # names this node's positional outputs are
@@ -1201,29 +1261,51 @@ def cell_from_file(
         #   leave this child unregistered as a __nodes__ row (still
         #   reachable via bind()).
 
-        # kind="placeholder": interface known, implementation not bound yet --
+        # kind="variable": interface known, implementation not bound yet --
         #   columns = { col_name = "DtypeStr", ... }   # e.g. { a = "Int64" }
         #   Builds a tableOps.PlaceholderOp(columns=...) (arity-1
-        #   input/output, raises if actually called); swap
-        #   cell.tableOps[node_idn] for a real TableOp/Cell before this node
-        #   is reached on a live execution path.
+        #   input/output, raises if actually called), UNLESS some
+        #   [[variables.actors]] declaration (anywhere in the tree, not
+        #   just this node's direct parent) targets this node's abs_path --
+        #   see configTree.py's module docstring.
 
-    [resources]                  # this cell's own declared resources
-        _json = "path/to/resources.json"   # relative to this file -- or,
-                                            # instead (never both):
-    [[resources.items]]
+    [[variables.resources]]      # this cell's own resource manifest, or an
+                                  # override this cell declares for one of
+                                  # its own descendants (arbitrarily deep --
+                                  # see 'target' below)
+        target    = "..."        # optional dotted path, relative to THIS
+                                  # node, of the node being given this
+                                  # binding; omit (or ".") to target this
+                                  # node itself
         table_idn = "..."
         kind      = "local"      # optional, defaults "local"
         path      = "..."        # or db_path/table_name/connection_string/
                                   # schema_name, whichever 'kind' needs
 
-        # A kind='cell' [[nodes]] entry may carry its own [nodes.resources]
-        # (same _json/items grammar) -- the caller-override this specific
-        # instantiation explicitly binds for that child; wins over the
-        # child's own declared defaults on a clashing table_idn. See
-        # configTree.py's module docstring for the full semantics.
+    [[variables.actors]]         # bind a real implementation to a
+                                  # variable -- own or (arbitrarily deep)
+                                  # descendant, same 'target' convention.
+                                  # Exactly one of op_type or toml:
+        target  = "..."
+        op_type = "..."          # a key into op_classes
+        [variables.actors.parameters]
+        some_kwarg = 1            # ctor kwargs for op_type, if any
+
+        # ... or, instead of op_type/parameters, graft a whole Cell in
+        # place of the variable (its own file decides everything about
+        # its own construction -- no parameters key alongside toml):
+        #   [[variables.actors]]
+        #   target = "..."
+        #   toml   = "path/to/child.toml"   # relative to THIS file
+
+        # Root-wins: if more than one node along a target's own ancestor
+        # chain declares a variables.resources/variables.actors entry for
+        # it, the declaration made CLOSEST TO THE ROOT of this whole
+        # config_tree() call wins -- see configTree.py's module docstring
+        # for the full semantics (including why, and how a table_idn-level
+        # resource merge still allows more than one resource per target).
     """
-    tree, parameters, _, declared_resources = configTree.config_tree(
+    tree, parameters, next_node_idx, declarations = configTree.config_tree(
         path                = path,
         node_idn            = main_id,
         template_vars       = template_vars,
@@ -1232,18 +1314,45 @@ def cell_from_file(
         cells_index_file     = cells_index_file,
     )
     if resources is not None:
-        declared_resources = dict( declared_resources )
-        declared_resources[ main_id ] = {
-            **declared_resources.get( main_id, {} ),
-            'override': resources,
-        }
+        # An even-more-senior override than anything in TOML could declare
+        # for the root cell itself -- see the `resources` param's own
+        # docstring above.
+        declarations = dict( declarations )
+        declarations[ 'resources' ] = pl.concat(
+            [
+                declarations[ 'resources' ],
+                resources.with_columns(
+                    pl.lit( main_id ).alias( 'abs_path' ),
+                    pl.lit( -1, dtype = pl.Int64 ).alias( 'declarer_depth' ),
+                ),
+            ],
+            how = 'diagonal_relaxed',
+        )
+    # Resolves declarations AND splices in any variables.actors 'toml'
+    # graft binding (repeatedly, until no more remain -- a graft can
+    # itself introduce further variables/declarations) -- see
+    # configTree.splice_actor_grafts's own docstring. `tree`/`parameters`
+    # come back POSSIBLY LARGER than what config_tree() returned above (a
+    # spliced graft's own subtree), which is why _cell_from_tree below
+    # uses these returned values, not the pre-splice ones.
+    tree, parameters, _, resolved_resources, resolved_actors = configTree.splice_actor_grafts(
+        tree                = tree,
+        parameters          = parameters,
+        node_idx            = next_node_idx,
+        declarations        = declarations,
+        template_vars       = template_vars,
+        app_name            = app_name,
+        fallback_data_roots = fallback_data_roots,
+        cells_index_file     = cells_index_file,
+    )
     return _cell_from_tree(
-        tree               = tree,
-        node_idn           = main_id,
-        op_classes         = op_classes,
-        rng                = rng,
-        verbose            = verbose,
-        parameters         = parameters,
-        declared_resources = declared_resources,
+        tree                = tree,
+        node_idn            = main_id,
+        op_classes          = op_classes,
+        rng                 = rng,
+        verbose             = verbose,
+        parameters          = parameters,
+        resolved_resources  = resolved_resources,
+        resolved_actors     = resolved_actors,
     )
 #/def cell_from_file

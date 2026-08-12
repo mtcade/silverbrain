@@ -97,17 +97,22 @@ def test_nested_child_executes_through_parent_call( tmp_path: Path ) -> None:
 def test_resources_root_override_does_not_reach_nested_child_without_explicit_binding( tmp_path: Path ) -> None:
     """Cell.resources is no longer threaded unchanged down the whole tree.
     A resources= kwarg passed to cell_from_file() only ever becomes the
-    ROOT cell's own caller-override (merged against the root's own
-    declared [resources] TOML defaults, empty here) -- it does NOT
-    automatically reach a nested kind='cell' child. Neither parent.toml
-    nor child.toml declares any [resources]/[nodes.resources] block here,
-    so the child's resources stay None even though the root's don't."""
+    ROOT cell's own most-senior override (see configTree.py's module
+    docstring -- declarer_depth=-1, beating even a TOML [[variables.
+    resources]] targeting the root) -- it does NOT automatically reach a
+    nested kind='cell' child. Neither parent.toml nor child.toml declares
+    any variables.resources here, so the child's resources stay None even
+    though the root's don't. resources= is normalized to the full
+    table_index schema by resolve_resource_declarations (any column the
+    caller's minimal frame omitted comes back null), not passed through
+    verbatim -- so this only checks the one column that matters, not
+    to_dicts() equality."""
     _write( tmp_path / 'child.toml', _CHILD_TOML )
     _write( tmp_path / 'parent.toml', _parent_toml() )
 
     resources = pl.DataFrame( { 'table_idn': [ 'x' ] } )
     parent = cell_from_file( tmp_path / 'parent.toml', _OPS, main_id='parent', resources=resources )
-    assert parent.resources.to_dicts() == resources.to_dicts()
+    assert parent.resources.row( 0, named = True )[ 'table_idn' ] == 'x'
     assert parent.tableOps[ 'kid' ].resources is None
 
 
@@ -227,10 +232,10 @@ kind     = "bogus"
         cell_from_file( tmp_path / 'cell.toml', _OPS, main_id='root' )
 
 
-# -- kind="placeholder"
+# -- kind     = "variable"
 
 
-def test_placeholder_node_builds_placeholder_op( tmp_path: Path ) -> None:
+def test_variable_node_builds_placeholder_op( tmp_path: Path ) -> None:
     _write( tmp_path / 'cell.toml', """\
 [cell]
 source = ["inp"]
@@ -238,7 +243,7 @@ target = ["out"]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 source   = ["inp"]
 target   = ["out"]
 columns  = { a = "Int64" }
@@ -255,10 +260,10 @@ columns  = { a = "Int64" }
     assert m.resolve_to_typed_columns( op.output[ 0 ].expr.to_bdd( m ) ) == { 'a': pl.Int64 }
 
 
-def test_placeholder_node_with_colvar_interface( tmp_path: Path ) -> None:
-    """The main use case: a saved map with a placeholder whose interface
+def test_variable_node_with_colvar_interface( tmp_path: Path ) -> None:
+    """The main use case: a saved map with a variable node whose interface
     references a ColVar (exprParse.py's text grammar), not just literal
-    columns -- once this placeholder is later filled in with a real op/
+    columns -- once this variable is later filled in with a real op/
     Cell, bdd.resolve_signatures can infer more about the whole cell's
     columns from whatever binds that ColVar."""
     _write( tmp_path / 'cell.toml', """\
@@ -268,7 +273,7 @@ target = ["out"]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 source   = ["inp"]
 target   = ["out"]
 columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
@@ -294,7 +299,7 @@ columns  = "Union(ColVar('C'), Atom('nu_col_0', Int64))"
     assert m.resolve_to_columns( resolved[ 'sig' ].to_bdd( m ) ) == frozenset( { 'nu_col_0', 'nu_col_1' } )
 
 
-def test_placeholder_node_raises_if_actually_called( tmp_path: Path ) -> None:
+def test_variable_node_raises_if_actually_called( tmp_path: Path ) -> None:
     _write( tmp_path / 'cell.toml', """\
 [cell]
 source = ["inp"]
@@ -302,7 +307,7 @@ target = ["out"]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 source   = ["inp"]
 target   = ["out"]
 columns  = { a = "Int64" }
@@ -314,7 +319,7 @@ columns  = { a = "Int64" }
         future.result( timeout=5 )
 
 
-def test_placeholder_can_be_swapped_post_init( tmp_path: Path ) -> None:
+def test_variable_can_be_swapped_post_init( tmp_path: Path ) -> None:
     """Nothing about tableOps[node_idn] pins a node to its build-time kind --
     replacing the dict entry is enough for future dispatches to pick it up
     (Cell._WiringEngine looks up self.cell.tableOps[node_idn] live)."""
@@ -325,7 +330,7 @@ target = ["out"]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 source   = ["inp"]
 target   = ["out"]
 columns  = { a = "Int64" }
@@ -383,13 +388,13 @@ kind     = "bogus"
     assert any( 'unknown kind' in str( i ) for i in issues )
 
 
-def test_verify_placeholder_missing_columns( tmp_path: Path ) -> None:
+def test_verify_variable_missing_columns( tmp_path: Path ) -> None:
     _write( tmp_path / 'cell.toml', """\
 [cell]
 
 [[nodes]]
 node_idn = "future"
-kind     = "placeholder"
+kind     = "variable"
 """ )
     issues = verify_toml( tmp_path / 'cell.toml' )
     assert any( "missing 'columns'" in str( i ) for i in issues )

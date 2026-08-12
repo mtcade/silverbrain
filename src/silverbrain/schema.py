@@ -94,8 +94,8 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # kind       — 'op' (leaf TableOp) or 'cell' (nested Cell) in a live
     #              Cell's own __nodes__ table -- both resolved the same way,
     #              via self.tableOps[node_idn]. configTree.py's parse-time
-    #              tree additionally allows 'placeholder' (see
-    #              placeholder_columns below); a placeholder builds into a
+    #              tree additionally allows 'variable' (see
+    #              variable_columns below); a variable builds into a
     #              PlaceholderOp, so it still shows up as kind='op' once a
     #              live Cell reads it back via register_node.
     # source     — names this node's positional dfs inputs are read from,
@@ -148,7 +148,7 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # so the same class can be built by multiple anonymous nodes (node_idn
     # omitted, auto-generated) wired only by source/target. Defaults to the
     # row's own node_idn when omitted (today's behavior). Null on every
-    # other kind -- kind='cell'/'placeholder' resolve their own "type" via
+    # other kind -- kind='cell'/'variable' resolve their own "type" via
     # toml/cell_idn/columns instead.
     'op_type':      pl.Utf8,
     # configTree.py: file-reference metadata for kind='cell' rows only, not
@@ -168,7 +168,7 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'table_name':        pl.Utf8,
     'connection_string': pl.Utf8,
     'schema_name':       pl.Utf8,
-    # configTree.py: kind='placeholder' rows' declared interface -- a
+    # configTree.py: kind='variable' rows' declared interface -- a
     # bdd.Expr serialized via exprParse.expr_to_text (may reference
     # ColVar; every Atom always carries an explicit dtype in this stored
     # form, even though the TOML/JSON source may have omitted one for
@@ -176,7 +176,28 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # other kind. Used to construct a PlaceholderOp(expr=...) at build
     # time, standing in until a real TableOp/Cell is swapped into
     # self.tableOps[node_idn].
-    'placeholder_columns': pl.Utf8,
+    'variable_columns': pl.Utf8,
+    # configTree.py: variables.resources/variables.actors declaration
+    # bookkeeping (see its module docstring). 'abs_path' is the dotted
+    # node_idn chain from a config_tree() call's own root down to some
+    # node -- both a config_tree row's own identity (added to every row,
+    # any kind) and a variables.* declaration's resolved target. Two
+    # different things share this one column name/dtype because they're
+    # literally the same value once resolution matches a declaration to
+    # the row it targets. 'declarer_depth' is how many kind='cell' hops
+    # below config_tree()'s own root the DECLARING node sits at (root=0) --
+    # resolve_resource_declarations()/resolve_actor_declarations() pick the
+    # smallest depth per target (root-wins). 'declaring_path' is the
+    # winning declaration's own abs_path, kept as provenance in a resolved
+    # actor binding / __actor_bindings__ row. 'kwargs_json' is an
+    # variables.actors entry's ctor kwargs, JSON-encoded rather than routed
+    # through the __table_ops_parameters__ forest (that forest's op_idn
+    # keying assumes local-file uniqueness, which a path-addressed
+    # declaration from an arbitrary ancestor doesn't have).
+    'abs_path':         pl.Utf8,
+    'declarer_depth':   pl.Int64,
+    'declaring_path':   pl.Utf8,
+    'kwargs_json':      pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
@@ -270,19 +291,30 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
 
     # configTree.py: a parsed, not-yet-constructed file-reference tree.
     # Same shape as __nodes__ plus 'path'/'cell_source'/'cell_target'/
-    # 'placeholder_columns'. 'path' and 'cell_source'/'cell_target' are only
+    # 'variable_columns'. 'path' and 'cell_source'/'cell_target' are only
     # meaningful on kind='cell' rows: 'path' is which file this node came
     # from (informational -- construction no longer needs to reopen it);
     # 'cell_source'/'cell_target' are that cell's own external binding
     # ([cell].source/[cell].target in a TOML source), carried in the tree
     # alongside the row's own (parent-assigned) source/target so
     # construction never needs to open a file to learn either.
-    # 'placeholder_columns' is only meaningful on kind='placeholder' rows --
+    # 'variable_columns' is only meaningful on kind='variable' rows --
     # see cannonical_schema above.
     'config_tree': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
         'join', 'join_k', 'discard_on_null',
-        'path', 'cell_source', 'cell_target', 'placeholder_columns', 'op_type',
+        'path', 'abs_path', 'cell_source', 'cell_target', 'variable_columns', 'op_type',
+    )),
+
+    # cell.py: one row per variable node_idn that resolved to a real
+    # variables.actors binding (see configTree.py's module docstring) --
+    # append-only in spirit (a future live hot-swap just appends another
+    # row and re-derives "current binding" via
+    # .unique(subset=['node_idn'], keep='last'), same idiom
+    # resolve_actor_declarations already uses). A variable with no
+    # binding at all gets no row (stays a PlaceholderOp, same as today).
+    '__actor_bindings__': cannonical_schema_for_keys((
+        'node_idn', 'kind', 'op_type', 'declaring_path',
     )),
 
     # _trigger: the sunder table (see sunder.py) a Cell auto-supplies to
