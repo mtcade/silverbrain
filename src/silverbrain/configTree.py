@@ -66,8 +66,10 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
     # abs_path.
 - parameters (ParameterParser's tree schema, parameterParse.py): a forest
   of TableOp construction-parameter trees. Every parameterized op's rows
-  share one fixed par_group, parameterParse.TABLE_OPS_PARAMETERS_GROUP
-  ('table_ops_parameters') -- individual ops are told apart within it by
+  are wrapped, at parse time, under the same fixed top-level key
+  parameterParse.TABLE_OPS_PARAMETERS_GROUP ('table_ops_parameters') --
+  purely a to_polars() input-shape convenience, never written to the
+  output (no par_group column) -- individual ops are told apart by
   node_idx, via a root-level leaf with par_name == 'op_idn' -- see
   parameterParse.py's "TableOp construction kwargs" section. Populated
   from each file's own [[parameters]] entries (below), either inline or
@@ -76,8 +78,8 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
   parameter_group_to_tree()), so entries' value-column sets can differ and
   are reconciled with a diagonal concat. node_idx values are kept globally
   unique across the whole forest one config_tree()/toml_config_tree() call
-  produces (this is what makes the shared-par_group scheme safe): a
-  running counter (node_idx_start in, next_node_idx out -- the same
+  produces (this is what makes ops distinguishable purely by node_idx
+  safe): a running counter (node_idx_start in, next_node_idx out -- the same
   dual-return pattern ParameterParser.to_polars()/to_polars_flat() already
   use) is threaded through every [[parameters]] entry at this level and,
   recursively, every kind='cell' [[nodes]] call's own entries. A forest assembled

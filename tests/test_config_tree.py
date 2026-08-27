@@ -22,7 +22,7 @@ from silverbrain.configTree import (
     resolve_actor_declarations, resolve_resource_declarations,
 )
 from silverbrain.exprParse import parse_expr
-from silverbrain.parameterParse import TABLE_OPS_PARAMETERS_GROUP, ParameterParser, op_ctor_kwargs_forest
+from silverbrain.parameterParse import ParameterParser, op_ctor_kwargs_forest
 
 
 def _write( path: Path, content: str ) -> Path:
@@ -31,13 +31,10 @@ def _write( path: Path, content: str ) -> Path:
 
 
 def _node_idx_for_op( params: pl.DataFrame, op_idn: str ) -> int:
-    """The node_idx of the 'op_idn' leaf row identifying op_idn -- since all
-    parameterized ops share one par_group (TABLE_OPS_PARAMETERS_GROUP),
-    node_idx is what actually distinguishes them."""
+    """The node_idx of the 'op_idn' leaf row identifying op_idn -- node_idx
+    is what distinguishes ops (no par_group column)."""
     val_cols = [ c for c in params.columns if c.startswith( 'par_val_' ) ]
-    for row in params.filter(
-        ( pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP ) & ( pl.col( 'par_name' ) == 'op_idn' )
-    ).to_dicts():
+    for row in params.filter( pl.col( 'par_name' ) == 'op_idn' ).to_dicts():
         value = next( ( row[ c ] for c in val_cols if row[ c ] is not None ), None )
         if value == op_idn:
             return row[ 'node_idx' ]
@@ -281,11 +278,9 @@ threshold = 0.5
     )
     assert next_node_idx == 101  # one flat group -> one node_idx consumed
     # both rows in the group (the 'op_idn' leaf and 'threshold') share that
-    # one node_idx -- see _paramGroup_to_tree. All ops share one par_group
-    # (TABLE_OPS_PARAMETERS_GROUP) now, so node_idx is what distinguishes them.
-    assert params.filter(
-        pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP
-    )[ 'node_idx' ].unique().to_list() == [ 100 ]
+    # one node_idx -- see _paramGroup_to_tree. node_idx is what distinguishes
+    # ops (no par_group column).
+    assert params[ 'node_idx' ].unique().to_list() == [ 100 ]
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
 
 

@@ -44,23 +44,29 @@ relate: par_type == '_or' -> children are mutually exclusive alternatives;
 anything else (a content node, or an '_and' junction) -> children are
 unconditionally combined. This is what makes the tree walkable back into the
 flat cross-product with no ambiguity, even when `_or`/`_and` sit at the top
-level with no owning par_group (where a fixed sibling par_group and an
+level with no owning domain group (where a fixed sibling group and an
 `_or`'s alternatives would otherwise be indistinguishable from node_idx/
 parent_idx alone).
 
-Top-level `_or`/`_and` alternatives that bundle multiple par_groups (e.g.
+Top-level `_or`/`_and` alternatives that bundle multiple domain groups (e.g.
 {'y': {...}, 'importances': {...}}) are wrapped in an implicit '_and'
-junction per alternative, so that alternative's par_groups stay tied
-together as one atomic choice rather than fanning out as independent
-children of the outer junction.
+junction per alternative, so that alternative's groups stay tied together as
+one atomic choice rather than fanning out as independent children of the
+outer junction. A top-level dict key (e.g. 'X', 'y', 'importances') is only
+ever an input-organization convenience -- it groups that key's own par_names
+into one node cluster but is never written to the output as its own column
+(no par_group); node_idx/parent_idx already fully capture which rows belong
+together, and a consumer that needs a specific row back out does so via
+par_name.
 
-to_polars_deprecated() / schema_deprecated() are a frozen, unmodified
-snapshot of the pre-refactor implementation (par_idx + node_idx/parent_idx
-in one flat table, reserved key `_groups`), kept only as a regression
-oracle — do not use in new code.
+RESERVED KEY: `_comment`
+
+At any point a dict may also contain `_comment` -- free-form documentation
+for a human reading the JSON/TOML spec, never a par_name. Silently ignored
+everywhere a dict's own keys are otherwise walked (own_keys, dtype
+inference); its value is never inspected.
 """
 
-import itertools
 import polars as pl
 
 from dataclasses import dataclass, field
@@ -84,26 +90,12 @@ from .utilities import TableBuilder
 # for column names/dtypes (including node_idx/parent_idx, which used to
 # be hand-duplicated here). Imported, not redefined.
 
-_PAR_IDX_DTYPE:    pl.DataType = _cannonical_schema['par_idx']
-_NODE_IDX_DTYPE:   pl.DataType = _cannonical_schema['node_idx']
-_PARENT_IDX_DTYPE: pl.DataType = _cannonical_schema['parent_idx']
+_PAR_IDX_DTYPE: pl.DataType = _cannonical_schema['par_idx']
 
-# Frozen dtypes for the deprecated oracle below -- hardcoded independently
-# of cannonical_schema (not imported, even though the values happen to
-# match today) so this oracle never shifts just because the live schema
-# does -- that's the whole point of a regression oracle.
-_NODE_IDX_DTYPE_DEPRECATED:   pl.DataType = pl.UInt32
-_PARENT_IDX_DTYPE_DEPRECATED: pl.DataType = pl.UInt32
-
-_IDENTIFIER_COLS_DEPRECATED: dict[ str, pl.DataType ] = {
-    'par_group':   pl.Utf8,
-    'par_type':    pl.Utf8,
-    'par_idx':     pl.UInt32,
-    'par_name':    pl.Utf8,
-    'par_feature': pl.Utf8,
-    'node_idx':    _NODE_IDX_DTYPE_DEPRECATED,
-    'parent_idx':  _PARENT_IDX_DTYPE_DEPRECATED,
-}
+# '_comment' is a free-form documentation key (module docstring's RESERVED
+# KEY section) -- silently dropped wherever a dict's own keys are walked,
+# never treated as a par_name.
+_IGNORED_KEY = '_comment'
 
 # Cached names for the six common types used in parsing dispatch.
 _COL_STR    = col_for_dtype( pl.Utf8 )              # 'par_val_string'
@@ -354,27 +346,23 @@ class ParameterParser:
     def _junction_row(
         self,
         kind:       Literal[ '_or', '_and' ],
-        par_group:  str | None,
         node_idx:   int,
         parent_idx: int | None,
     ) -> pl.DataFrame:
         row: dict[ str, Any ] = { 'par_type': kind, 'node_idx': node_idx, 'parent_idx': parent_idx }
-        if par_group is not None:
-            row['par_group'] = par_group
         return pl.DataFrame( ( row, ), schema = self.schema )
     #/def _junction_row
 
     def _valueDict_to_tree(
         self,
         valueDict:  ValueDict,
-        par_group:  str,
         par_name:   str,
         node_idx:   int,
         parent_idx: int | None,
     ) -> pl.DataFrame:
         tb   = TableBuilder( schema = self.schema )
         base = {
-            'par_group': par_group, 'par_name': par_name,
+            'par_name': par_name,
             'node_idx': node_idx, 'parent_idx': parent_idx,
         }
 
@@ -477,14 +465,13 @@ class ParameterParser:
     def _paramGroup_to_tree(
         self,
         paramGroup_dict:  ParamGroupDict,
-        par_group:        str,
         parent_node_idx:  int | None = None,
         node_idx_start:   int = 0,
     ) -> tuple[ pl.DataFrame, int ]:
         node_idx = node_idx_start
         rows: list[ pl.DataFrame ] = []
 
-        own_keys = { k: v for k, v in paramGroup_dict.items() if k not in ( '_or', '_and' ) }
+        own_keys = { k: v for k, v in paramGroup_dict.items() if k not in ( '_or', '_and', _IGNORED_KEY ) }
 
         if own_keys:
             this_node_idx = node_idx
@@ -492,13 +479,13 @@ class ParameterParser:
             for name, v in own_keys.items():
                 if isinstance( v, dict ):
                     rows.append( self._valueDict_to_tree(
-                        valueDict = v, par_group = par_group, par_name = name,
+                        valueDict = v, par_name = name,
                         node_idx = this_node_idx, parent_idx = parent_node_idx,
                     ) )
                 else:
                     col = self.col_for_name( name )
                     rows.append( pl.DataFrame(
-                        ( { 'par_group': par_group, 'par_type': 'fixed', 'par_name': name,
+                        ( { 'par_type': 'fixed', 'par_name': name,
                             'par_feature': 'value', col: v,
                             'node_idx': this_node_idx, 'parent_idx': parent_node_idx }, ),
                         schema = self.schema,
@@ -513,11 +500,11 @@ class ParameterParser:
             junction_idx = node_idx
             node_idx += 1
             rows.append( self._junction_row(
-                kind = key, par_group = par_group, node_idx = junction_idx, parent_idx = attach_point,
+                kind = key, node_idx = junction_idx, parent_idx = attach_point,
             ) )
             for child in paramGroup_dict[ key ]:
                 df_child, node_idx = self._paramGroup_to_tree(
-                    paramGroup_dict = child, par_group = par_group,
+                    paramGroup_dict = child,
                     parent_node_idx = junction_idx, node_idx_start = node_idx,
                 )
                 rows.append( df_child )
@@ -539,7 +526,13 @@ class ParameterParser:
         reconstructing the original _or/_and nesting. No par_idx -- see
         to_polars_flat() for the derived, fully cross-producted view.
 
-        :param param_dict:      Top-level dict keyed by par_group (e.g. 'X', 'Xk').
+        :param param_dict:      Top-level dict keyed by a domain name (e.g.
+            'X', 'Xk') that's purely an input-organization convenience -- it
+            groups that key's own par_names into one node cluster (siblings
+            under a shared node_idx) but is never written to the output as
+            its own column; node_idx/parent_idx already fully capture which
+            rows belong together. A consumer that needs to find a specific
+            row back out of the result does so via par_name.
         :param node_idx_start:  First node_idx value to assign.
         :param parent_node_idx: node_idx this call's own content is nested under;
             None at the root.
@@ -549,10 +542,10 @@ class ParameterParser:
         rows: list[ pl.DataFrame ] = []
 
         for k, v in param_dict.items():
-            if k in ( '_or', '_and' ):
+            if k in ( '_or', '_and', _IGNORED_KEY ):
                 continue
             df_k, node_idx = self._paramGroup_to_tree(
-                paramGroup_dict = v, par_group = k,
+                paramGroup_dict = v,
                 parent_node_idx = parent_node_idx, node_idx_start = node_idx,
             )
             rows.append( df_k )
@@ -563,18 +556,19 @@ class ParameterParser:
             junction_idx = node_idx
             node_idx += 1
             rows.append( self._junction_row(
-                kind = key, par_group = None, node_idx = junction_idx, parent_idx = parent_node_idx,
+                kind = key, node_idx = junction_idx, parent_idx = parent_node_idx,
             ) )
             for child in param_dict[ key ]:
-                # A top-level alternative can bundle multiple par_groups (e.g.
-                # {'y': {...}, 'importances': {...}}) -- wrap each alternative
-                # in its own '_and' junction so those par_groups' nodes are
-                # tied together as ONE alternative, not fanned out as
-                # independent (and indistinguishable) children of `junction_idx`.
+                # A top-level alternative can bundle multiple domain groups
+                # (e.g. {'y': {...}, 'importances': {...}}) -- wrap each
+                # alternative in its own '_and' junction so that
+                # alternative's nodes are tied together as ONE choice, not
+                # fanned out as independent (and indistinguishable) children
+                # of `junction_idx`.
                 wrapper_idx = node_idx
                 node_idx += 1
                 rows.append( self._junction_row(
-                    kind = '_and', par_group = None, node_idx = wrapper_idx, parent_idx = junction_idx,
+                    kind = '_and', node_idx = wrapper_idx, parent_idx = junction_idx,
                 ) )
                 df_child, node_idx = self.to_polars(
                     param_dict = child, node_idx_start = node_idx, parent_node_idx = wrapper_idx,
@@ -670,41 +664,22 @@ class ParameterParser:
         return combos
     #/def _expand_node_with_choices
 
-    def leaf_paths(
-        self, tree_df: pl.DataFrame, root_par_group: str | None = None,
-    ) -> list[ 'LeafPath' ]:
+    def leaf_paths( self, tree_df: pl.DataFrame ) -> list[ 'LeafPath' ]:
         """
-        Enumerate leaf paths through a tree-shaped DataFrame (from to_polars()).
+        Enumerate leaf paths through a tree-shaped DataFrame (from to_polars()),
+        walking the whole tree from its true root.
 
         Each leaf corresponds to one full combination -- same as one
         _expand_node() combo -- but also records the ordered trail of '_or'
         decisions (junction_node_idx, chosen_child_node_idx) made from the
-        subtree root down to that leaf, so callers can walk/report/resume a
-        tree search without flattening away which choice was made where.
-
-        :param root_par_group: If given, restricts the walk to the subtree(s)
-            rooted at node(s) with par_group == root_par_group and parent_idx
-            null (that group's own top-level attachment point(s)) -- e.g.
-            "importances" to walk only that group's own nesting, independent
-            of unrelated top-level groups/`_or`s elsewhere in the spec. If
-            None, walks the whole tree from the true root.
+        root down to that leaf, so callers can walk/report/resume a tree
+        search without flattening away which choice was made where.
         """
         children, node_kind = self._tree_children_maps( tree_df )
 
-        if root_par_group is None:
-            roots: list[ int | None ] = [ None ]
-        else:
-            root_rows = tree_df.filter(
-                ( pl.col( 'par_group' ) == root_par_group ) & pl.col( 'parent_idx' ).is_null()
-            )
-            roots = sorted( root_rows[ 'node_idx' ].unique().to_list() )
-            if not roots:
-                return []
-
         leaves: list[ LeafPath ] = []
-        for root in roots:
-            for content, choices in self._expand_node_with_choices( root, children, node_kind ):
-                leaves.append( LeafPath( content_node_idxs=content, choices=choices ) )
+        for content, choices in self._expand_node_with_choices( None, children, node_kind ):
+            leaves.append( LeafPath( content_node_idxs=content, choices=choices ) )
         return leaves
     #/def leaf_paths
 
@@ -747,309 +722,17 @@ class ParameterParser:
         flat_df, n_combos = self._expand_tree_to_flat( tree_df, par_idx_start = par_idx_start )
         return flat_df, par_idx_start + n_combos, next_node_idx
     #/def to_polars_flat
-
-    # -- Deprecated oracle (frozen pre-refactor implementation)
-    #
-    # Verbatim snapshot of the original to_polars/_paramGroup_to_polars/
-    # _valueDict_to_polars/.schema, from before the tree/flat split. Kept
-    # unchanged as a regression oracle — later stages diff their output
-    # against this. Do not modify.
-
-    @property
-    def schema_deprecated( self ) -> dict[ str, pl.DataType ]:
-        """Frozen pre-refactor row schema: identifier columns (including
-        node_idx/parent_idx) + one value column per unique registered dtype."""
-        val_cols: dict[ str, pl.DataType ] = {
-            col_for_dtype( dtype ): dtype
-            for dtype in dict.fromkeys( self._dtype_map.values() )
-        }
-        return dict( _IDENTIFIER_COLS_DEPRECATED ) | val_cols
-    #/def schema_deprecated
-
-    def _valueDict_to_polars_deprecated(
-        self,
-        valueDict:  ValueDict,
-        par_group:  str,
-        par_idx:    int,
-        par_name:   str,
-        node_idx:   int,
-        parent_idx: int | None,
-    ) -> pl.DataFrame:
-        tb   = TableBuilder( schema = self.schema_deprecated )
-        base = {
-            'par_group': par_group, 'par_idx': par_idx, 'par_name': par_name,
-            'node_idx': node_idx, 'parent_idx': parent_idx,
-        }
-
-        def _app( par_type: str, par_feature: str, val: dict ) -> None:
-            tb.append(
-                base | { 'par_type': par_type, 'par_feature': par_feature } | val,
-                allow_missing = True,
-            )
-
-        d = valueDict
-
-        if 'values_search' in d:
-            col = self.col_for_name( par_name )
-            _app( 'search', 'value', { col: d['values_search'] } )
-
-        elif 'values_random' in d:
-            col = self.col_for_name( par_name )
-            _app( 'random', 'value', { col: d['values_random'] } )
-
-        elif 'logit_step' in d:
-            if not ( 0 < d['start'] < 1 ):
-                raise ValueError( f"logit_step start must be in (0, 1), got {d['start']!r}" )
-            _app( 'search', 'start',      { _COL_FLOAT: d['start']      } )
-            _app( 'search', 'logit_step', { _COL_FLOAT: d['logit_step'] } )
-
-        elif 'log_step' in d:
-            if d['start'] <= 0:
-                raise ValueError( f"log_step start must be > 0, got {d['start']!r}" )
-            if isinstance( d['start'], int ):
-                _app( 'search', 'start',    { _COL_INT:   d['start']    } )
-                _app( 'search', 'log_step', { _COL_FLOAT: d['log_step'] } )
-                if 'min' in d:
-                    if d['min'] <= 0: raise ValueError( f"log_step min must be > 0, got {d['min']!r}" )
-                    _app( 'search', 'min', { _COL_INT: d['min'] } )
-                if 'max' in d:
-                    if d['max'] <= 0: raise ValueError( f"log_step max must be > 0, got {d['max']!r}" )
-                    _app( 'search', 'max', { _COL_INT: d['max'] } )
-            else:
-                _app( 'search', 'start',    { _COL_FLOAT: d['start']    } )
-                _app( 'search', 'log_step', { _COL_FLOAT: d['log_step'] } )
-                if 'min' in d:
-                    if d['min'] <= 0: raise ValueError( f"log_step min must be > 0, got {d['min']!r}" )
-                    _app( 'search', 'min', { _COL_FLOAT: d['min'] } )
-                if 'max' in d:
-                    if d['max'] <= 0: raise ValueError( f"log_step max must be > 0, got {d['max']!r}" )
-                    _app( 'search', 'max', { _COL_FLOAT: d['max'] } )
-
-        elif 'step' in d:
-            if isinstance( d['start'], int ):
-                _app( 'search', 'start', { _COL_INT: d['start'] } )
-                _app( 'search', 'step',  { _COL_INT: d['step']  } )
-                if 'min' in d: _app( 'search', 'min', { _COL_INT: d['min'] } )
-                if 'max' in d: _app( 'search', 'max', { _COL_INT: d['max'] } )
-            else:
-                _app( 'search', 'start', { _COL_FLOAT: d['start'] } )
-                _app( 'search', 'step',  { _COL_FLOAT: d['step']  } )
-                if 'min' in d: _app( 'search', 'min', { _COL_FLOAT: d['min'] } )
-                if 'max' in d: _app( 'search', 'max', { _COL_FLOAT: d['max'] } )
-
-        elif 'distribution' in d:
-            dist = d['distribution']
-            _app( 'random', 'distribution', { _COL_STR: dist } )
-            is_log   = dist.startswith( 'log' )
-            is_logit = 'logit' in dist
-            if dist in ( 'uniform_int', 'log_uniform_int' ):
-                if 'min' in d:
-                    if is_log   and d['min'] <= 0:               raise ValueError( f"min must be > 0 for {dist!r}, got {d['min']!r}" )
-                    if is_logit and not ( 0 < d['min'] < 1 ):   raise ValueError( f"min must be in (0, 1) for {dist!r}, got {d['min']!r}" )
-                    _app( 'random', 'min', { _COL_INT: d['min'] } )
-                if 'max' in d:
-                    if is_log   and d['max'] <= 0:               raise ValueError( f"max must be > 0 for {dist!r}, got {d['max']!r}" )
-                    if is_logit and not ( 0 < d['max'] < 1 ):   raise ValueError( f"max must be in (0, 1) for {dist!r}, got {d['max']!r}" )
-                    _app( 'random', 'max', { _COL_INT: d['max'] } )
-            else:
-                if 'min' in d:
-                    if is_log   and d['min'] <= 0:               raise ValueError( f"min must be > 0 for {dist!r}, got {d['min']!r}" )
-                    if is_logit and not ( 0 < d['min'] < 1 ):   raise ValueError( f"min must be in (0, 1) for {dist!r}, got {d['min']!r}" )
-                    _app( 'random', 'min', { _COL_FLOAT: d['min'] } )
-                if 'max' in d:
-                    if is_log   and d['max'] <= 0:               raise ValueError( f"max must be > 0 for {dist!r}, got {d['max']!r}" )
-                    if is_logit and not ( 0 < d['max'] < 1 ):   raise ValueError( f"max must be in (0, 1) for {dist!r}, got {d['max']!r}" )
-                    _app( 'random', 'max', { _COL_FLOAT: d['max'] } )
-
-        else:
-            raise ValueError( "Unrecognized valueDict={!r}".format( valueDict ) )
-
-        return tb.to_polars()
-    #/def _valueDict_to_polars_deprecated
-
-    def _paramGroup_to_polars_deprecated(
-        self,
-        paramGroup_dict:  ParamGroupDict,
-        par_group:        str,
-        sibling_df:       pl.DataFrame | None = None,
-        par_idx_start:    int = 0,
-        node_idx_start:   int = 0,
-        parent_node_idx:  int | None = None,
-    ) -> tuple[ pl.DataFrame, int, int ]:
-        schema       = self.schema_deprecated
-        df_own_list: list[ pl.DataFrame ] = []
-
-        for k, v in paramGroup_dict.items():
-            if k == '_groups':
-                continue
-            if isinstance( v, dict ):
-                df_own_list.append( self._valueDict_to_polars_deprecated(
-                    valueDict = v, par_group = par_group,
-                    par_idx   = par_idx_start, par_name = k,
-                    node_idx  = node_idx_start, parent_idx = parent_node_idx,
-                ) )
-            else:
-                col = self.col_for_name( k )
-                df_own_list.append( pl.DataFrame(
-                    ( { 'par_group': par_group, 'par_type': 'fixed',
-                        'par_idx':   par_idx_start, 'par_name': k,
-                        'par_feature': 'value', col: v,
-                        'node_idx': node_idx_start, 'parent_idx': parent_node_idx }, ),
-                    schema = schema,
-                ) )
-
-        if df_own_list:
-            this_node_idx = node_idx_start
-            node_idx      = node_idx_start + 1
-        else:
-            this_node_idx = parent_node_idx
-            node_idx      = node_idx_start
-
-        if sibling_df is not None:
-            reindexed = sibling_df.with_columns( pl.lit( par_idx_start, dtype=_PAR_IDX_DTYPE ).alias( 'par_idx' ) )
-            df_combined = (
-                pl.concat( [ reindexed ] + df_own_list, how = 'vertical' )
-                if df_own_list else reindexed
-            )
-        elif df_own_list:
-            df_combined = pl.concat( df_own_list, how = 'vertical' )
-        else:
-            df_combined = pl.DataFrame( schema = schema )
-
-        if '_groups' not in paramGroup_dict:
-            return df_combined, par_idx_start + 1, node_idx
-
-        par_idx = par_idx_start
-        df_out_list: list[ pl.DataFrame ] = []
-        for child in paramGroup_dict['_groups']:
-            df_next, par_idx, node_idx = self._paramGroup_to_polars_deprecated(
-                paramGroup_dict = child, par_group = par_group,
-                sibling_df = df_combined, par_idx_start = par_idx,
-                node_idx_start = node_idx, parent_node_idx = this_node_idx,
-            )
-            df_out_list.append( df_next )
-        return pl.concat( df_out_list, how = 'vertical' ), par_idx, node_idx
-    #/def _paramGroup_to_polars_deprecated
-
-    def to_polars_deprecated(
-        self,
-        param_dict:       ParamDict,
-        sibling_df:       pl.DataFrame | None = None,
-        par_idx_start:    int = 0,
-        node_idx_start:   int = 0,
-        parent_node_idx:  int | None = None,
-    ) -> tuple[ pl.DataFrame, int, int ]:
-        """Frozen pre-refactor to_polars — see class-level note above. Do not modify."""
-        schema         = self.schema_deprecated
-        par_group_dfs: dict[ str, pl.DataFrame ] = {}
-
-        node_idx = node_idx_start
-        for k, v in param_dict.items():
-            if k == '_groups':
-                continue
-            df_k, _, node_idx = self._paramGroup_to_polars_deprecated(
-                paramGroup_dict = v, par_group = k, par_idx_start = 0,
-                node_idx_start = node_idx, parent_node_idx = parent_node_idx,
-            )
-            par_group_dfs[ k ] = df_k
-
-        if par_group_dfs:
-            local_idx_sets = [
-                sorted( df['par_idx'].unique().to_list() )
-                for df in par_group_dfs.values()
-            ]
-            group_keys   = list( par_group_dfs.keys() )
-            combinations = list( itertools.product( *local_idx_sets ) )
-
-            record_dfs: list[ pl.DataFrame ] = []
-            for offset, combo in enumerate( combinations ):
-                global_idx = par_idx_start + offset
-                record_dfs.append( pl.concat(
-                    [
-                        par_group_dfs[ k ]
-                            .filter( pl.col( 'par_idx' ) == local_idx )
-                            .with_columns( pl.lit( global_idx, dtype=_PAR_IDX_DTYPE ).alias( 'par_idx' ) )
-                        for k, local_idx in zip( group_keys, combo )
-                    ],
-                    how = 'vertical',
-                ) )
-            df_own    = pl.concat( record_dfs, how = 'vertical' )
-            n_records = len( combinations )
-        else:
-            df_own    = pl.DataFrame( schema = schema )
-            n_records = 0
-
-        if sibling_df is not None and n_records > 0:
-            own_par_idxs = sorted( df_own['par_idx'].unique().to_list() )
-            df_combined  = pl.concat(
-                [
-                    pl.concat(
-                        [ sibling_df.with_columns( pl.lit( p, dtype=_PAR_IDX_DTYPE ).alias( 'par_idx' ) ),
-                          df_own.filter( pl.col( 'par_idx' ) == p ) ],
-                        how = 'vertical',
-                    )
-                    for p in own_par_idxs
-                ],
-                how = 'vertical',
-            )
-        elif sibling_df is not None:
-            df_combined = sibling_df.with_columns( pl.lit( par_idx_start, dtype=_PAR_IDX_DTYPE ).alias( 'par_idx' ) )
-            n_records   = 1
-        else:
-            df_combined = df_own
-
-        par_idx_after_own = par_idx_start + n_records
-
-        if '_groups' not in param_dict:
-            return df_combined, par_idx_after_own, node_idx
-
-        for child in param_dict['_groups']:
-            if '_groups' in child:
-                raise ValueError(
-                    "_groups cannot be nested directly inside another _groups "
-                    "(no par_group dict in between). Nest the inner _groups inside "
-                    "a specific par_group's own dict instead, e.g. "
-                    "{'X': {'_groups': [...]}} rather than "
-                    "{'_groups': [{'_groups': [...]}]}."
-                )
-
-        par_idx      = par_idx_after_own
-        df_out_list: list[ pl.DataFrame ] = []
-
-        if n_records > 0:
-            distinct_par_idxs = sorted( df_combined['par_idx'].unique().to_list() )
-            for child in param_dict['_groups']:
-                for p in distinct_par_idxs:
-                    df_next, par_idx, node_idx = self.to_polars_deprecated(
-                        param_dict      = child,
-                        sibling_df      = df_combined.filter( pl.col( 'par_idx' ) == p ),
-                        par_idx_start   = par_idx,
-                        node_idx_start  = node_idx,
-                        parent_node_idx = parent_node_idx,
-                    )
-                    df_out_list.append( df_next )
-        else:
-            for child in param_dict['_groups']:
-                df_next, par_idx, node_idx = self.to_polars_deprecated(
-                    param_dict      = child, sibling_df = None, par_idx_start = par_idx,
-                    node_idx_start  = node_idx, parent_node_idx = parent_node_idx,
-                )
-                df_out_list.append( df_next )
-
-        return pl.concat( df_out_list, how = 'vertical' ), par_idx, node_idx
-    #/def to_polars_deprecated
 #/class ParameterParser
 
 
 # -- TableOp construction kwargs (__table_ops_parameters__ forest, cell.py)
 #
-# Every parameterized op's row group shares one par_group,
-# TABLE_OPS_PARAMETERS_GROUP -- a fixed, categorical label (matching this
-# codebase's par_group convention elsewhere: a role/domain name like
-# 'importances'/'model_name'/'epochs_per_stage' in silverknockoff's specs,
-# lowercase snake_case, never a per-instance identifier), not the op's own
-# node_idn. Individual ops are told apart within that shared par_group by
-# node_idx: configTree.py threads a running node_idx_start/next_node_idx
+# Every parameterized op lands in the same forest, wrapped under the same
+# fixed top-level key, TABLE_OPS_PARAMETERS_GROUP, purely so
+# parameter_group_to_tree() has a valid ParamDict to hand to to_polars() --
+# that key is never written to the output (no par_group column). Individual
+# ops are told apart by node_idx: configTree.py threads a running
+# node_idx_start/next_node_idx
 # counter (the same dual-return pattern to_polars()/to_polars_flat() use)
 # through every [[parameters]] entry it parses, so each op's root-level
 # rows (parent_idx is null) land at their own node_idx, globally unique
@@ -1086,22 +769,23 @@ def op_ctor_kwargs_forest( parameters: pl.DataFrame ) -> dict[ str, dict[ str, A
     Extract TableOp constructor kwargs for every op declared in the
     __table_ops_parameters__ forest (cell.py), keyed by op_idn.
 
-    Rows outside par_group == TABLE_OPS_PARAMETERS_GROUP are ignored (the
-    forest could in principle carry other, unrelated parameter groups
-    someday). Within that group, each op's root-level rows (parent_idx is
-    null, grouped by node_idx) include one par_name == 'op_idn' row
-    identifying the op, plus its sibling ctor-kwarg rows. Only
-    par_type == 'fixed' rows are supported at the root: a random/search
-    sibling raises, since construction-time kwargs need concrete values,
-    not search specs (that machinery is for a different downstream
-    consumer, e.g. hyperparameter search, not this one). Any non-root row
-    in the node (parent_idx not null -- i.e. a `_or`/`_and` nested
-    underneath) also raises, since there is no single unambiguous value to
-    pick for a ctor kwarg in that case. A node_idx carrying more than one
-    'op_idn' leaf also raises -- since every parameterized op now shares
-    one par_group, this can only mean node_idx collided between two ops
-    (e.g. built without threading node_idx_start), which would otherwise
-    silently merge their kwargs into one entry.
+    Every op's own root sits at parent_idx is null (top of its own subtree)
+    -- grouping by node_idx there, rather than scanning the whole forest's
+    node_idx range, is what makes this correct: a nested _or/_and's
+    junction/leaf rows live under DIFFERENT node_idx values (children of
+    the root's), so they'd otherwise never be seen. Each root group
+    includes one par_name == 'op_idn' row identifying the op, plus its
+    sibling ctor-kwarg rows. Only par_type == 'fixed' rows are supported at
+    the root: a random/search sibling raises, since construction-time
+    kwargs need concrete values, not search specs (that machinery is for a
+    different downstream consumer, e.g. hyperparameter search, not this
+    one). Any non-root row in the node (parent_idx not null -- i.e. a
+    `_or`/`_and` nested underneath) also raises, since there is no single
+    unambiguous value to pick for a ctor kwarg in that case. A node_idx
+    carrying more than one 'op_idn' leaf also raises -- this can only mean
+    node_idx collided between two ops (e.g. built without threading
+    node_idx_start), which would otherwise silently merge their kwargs
+    into one entry.
 
     Returns {} for an empty forest. An op_idn with no declared parameter
     node simply has no entry, same as if the whole forest were empty;
@@ -1112,16 +796,9 @@ def op_ctor_kwargs_forest( parameters: pl.DataFrame ) -> dict[ str, dict[ str, A
         return {}
 
     val_cols = [ c for c in parameters.columns if c.startswith( 'par_val_' ) ]
-    table_ops_rows = parameters.filter( pl.col( 'par_group' ) == TABLE_OPS_PARAMETERS_GROUP )
-    # Every op's own root sits at parent_idx is null (top of its own
-    # subtree) -- grouping by node_idx there, rather than scanning
-    # table_ops_rows' whole node_idx range, is what makes this correct now
-    # that ops no longer get their own par_group to scope by: a nested
-    # _or/_and's junction/leaf rows live under DIFFERENT node_idx values
-    # (children of the root's), so they'd otherwise never be seen.
-    roots_by_group = table_ops_rows.filter( pl.col( 'parent_idx' ).is_null() )
+    roots_by_group = parameters.filter( pl.col( 'parent_idx' ).is_null() )
     nodes_with_children = set(
-        table_ops_rows.filter( pl.col( 'parent_idx' ).is_not_null() )[ 'parent_idx' ].to_list()
+        parameters.filter( pl.col( 'parent_idx' ).is_not_null() )[ 'parent_idx' ].to_list()
     )
     result: dict[ str, dict[ str, Any ] ] = {}
     for node_idx in roots_by_group[ 'node_idx' ].drop_nulls().unique().to_list():
@@ -1133,9 +810,8 @@ def op_ctor_kwargs_forest( parameters: pl.DataFrame ) -> dict[ str, dict[ str, A
             op_idns = [ _leaf_value( r, val_cols ) for r in id_rows ]
             raise ValueError(
                 f"node_idx={ node_idx!r } carries multiple op_idn leaves "
-                f"{ op_idns!r } -- node_idx must be unique per op within "
-                f"{ TABLE_OPS_PARAMETERS_GROUP!r } (thread node_idx_start/"
-                f"next_node_idx across calls that share it)"
+                f"{ op_idns!r } -- node_idx must be unique per op (thread "
+                f"node_idx_start/next_node_idx across calls that share it)"
             )
         op_idn = _leaf_value( id_rows[ 0 ], val_cols )
         if node_idx in nodes_with_children:
@@ -1193,9 +869,11 @@ def _register_param_group_dtypes( parser: ParameterParser, group: dict ) -> None
     (step/log_step/logit_step/distribution) pick their column from the
     literal value's own runtime type inline, not a registration, so nothing
     to do for those. Recurses into _or/_and alternatives (still the same
-    par_group).
+    par_group). Ignores '_comment' (module docstring's RESERVED KEY section).
     """
     for key, value in group.items():
+        if key == _IGNORED_KEY:
+            continue
         if key in ( '_or', '_and' ):
             for alt in value:
                 _register_param_group_dtypes( parser, alt )
@@ -1219,11 +897,12 @@ def parameter_group_to_tree(
     optional _or/_and) shape a hand-written pre-ParameterParser JSON/TOML
     spec already uses (parameterParse.py's module docstring). The 'op_idn'
     identity leaf op_ctor_kwargs_forest() reads back out is added here
-    automatically. Every call lands under the same fixed
-    TABLE_OPS_PARAMETERS_GROUP par_group (not op_idn) -- ops are told apart
-    within it by node_idx (see the "TableOp construction kwargs" comment
-    above op_ctor_kwargs_forest) -- callers (e.g. configTree.py) supply
-    just the op's own kwargs, keyed by name.
+    automatically. Every call is wrapped under the same fixed top-level
+    TABLE_OPS_PARAMETERS_GROUP key (a to_polars() input-shape convenience
+    only, never written to the output) -- ops are told apart by node_idx
+    (see the "TableOp construction kwargs" comment above
+    op_ctor_kwargs_forest) -- callers (e.g. configTree.py) supply just the
+    op's own kwargs, keyed by name.
 
     Dtypes are inferred from the literal values present (see
     _register_param_group_dtypes) rather than requiring a separate

@@ -100,10 +100,10 @@ def test_to_dataframes_includes_source_and_target() -> None:
 
 
 def test_merge_concatenates_parameters() -> None:
-    params_a = pl.DataFrame( [ { 'par_group': 'a', 'par_type': 'fixed', 'par_name': 'op_idn',
+    params_a = pl.DataFrame( [ { 'par_type': 'fixed', 'par_name': 'op_idn',
                                   'par_feature': None, 'node_idx': 0, 'parent_idx': None } ],
                               schema = ParameterParser().schema )
-    params_b = pl.DataFrame( [ { 'par_group': 'b', 'par_type': 'fixed', 'par_name': 'op_idn',
+    params_b = pl.DataFrame( [ { 'par_type': 'fixed', 'par_name': 'op_idn',
                                   'par_feature': None, 'node_idx': 0, 'parent_idx': None } ],
                               schema = ParameterParser().schema )
     a = Cell( main_id='a', parameters=params_a )

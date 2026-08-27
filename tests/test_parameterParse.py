@@ -25,6 +25,38 @@ def _make_parser() -> ParameterParser:
 #/def _make_parser
 
 
+# -- _comment (reserved key, silently ignored everywhere own keys are walked)
+
+def test_comment_key_ignored_in_tree_top_level() -> None:
+    p = _make_parser()
+    df, _ = p.to_polars( { '_comment': 'top-level note', 'X': { 'a': 1 } } )
+    assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
+#/def test_comment_key_ignored_in_tree_top_level
+
+
+def test_comment_key_ignored_inside_param_group() -> None:
+    p = _make_parser()
+    df, _ = p.to_polars( { 'X': { 'a': 1, '_comment': 'inline note' } } )
+    assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
+#/def test_comment_key_ignored_inside_param_group
+
+
+def test_comment_key_ignored_in_flat() -> None:
+    p = _make_parser()
+    df, next_par_idx, _ = p.to_polars_flat( { 'X': { 'a': 1, '_comment': 'inline note' } } )
+    assert next_par_idx == 1
+    assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
+#/def test_comment_key_ignored_in_flat
+
+
+def test_comment_key_ignored_by_dtype_inference() -> None:
+    tree, _ = parameter_group_to_tree(
+        'reader', { 'threshold': 0.5, '_comment': 'why threshold=0.5' },
+    )
+    assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.5 } }
+#/def test_comment_key_ignored_by_dtype_inference
+
+
 # -- par_idx (to_polars_flat, now derived by expanding to_polars()'s tree)
 
 def test_flat_dict_par_idx_unchanged() -> None:
@@ -75,7 +107,7 @@ def test_or_nested_inside_par_group_does_not_raise() -> None:
 #/def test_or_nested_inside_par_group_does_not_raise
 
 
-# -- _and (flat): new capability, no deprecated oracle to diff against
+# -- _and (flat)
 
 def test_flat_and_of_two_or_blocks_is_2x2_cross_product() -> None:
     # {'X': {'_and': [{'_or': [{'a':1},{'a':2}]}, {'_or': [{'b':1},{'b':2}]}]}}
@@ -105,18 +137,20 @@ def test_flat_and_of_two_or_blocks_is_2x2_cross_product() -> None:
 #/def test_flat_and_of_two_or_blocks_is_2x2_cross_product
 
 
-def test_flat_top_level_or_bundles_multiple_par_groups_together() -> None:
-    # Real-data shape: a fixed X plus a top-level _or bundling X's own 'b'
-    # override + a second par_group Xk, per alternative -- each flat
-    # combination must pair the RIGHT X.b with the RIGHT Xk.b, not cross
-    # them independently.
+def test_flat_top_level_or_bundles_multiple_domain_groups_together() -> None:
+    # Real-data shape: a fixed X plus a top-level _or bundling X's own
+    # override + a second domain group Xk, per alternative -- each flat
+    # combination must pair the RIGHT x_b with the RIGHT xk_b, not cross
+    # them independently. Domain groups no longer get a par_group label, so
+    # the two overrides need distinct par_names to stay distinguishable.
     p = _make_parser()
-    p.register( 'Xk', pl.Int64 )
+    p.register( 'x_b',  pl.Int64 )
+    p.register( 'xk_b', pl.Int64 )
     d = {
         'X': { 'a': 1 },
         '_or': [
-            { 'X': { 'b': 10 }, 'Xk': { 'b': 20 } },
-            { 'X': { 'b': 11 }, 'Xk': { 'b': 21 } },
+            { 'X': { 'x_b': 10 }, 'Xk': { 'xk_b': 20 } },
+            { 'X': { 'x_b': 11 }, 'Xk': { 'xk_b': 21 } },
         ],
     }
     df, next_par_idx, _ = p.to_polars_flat( d )
@@ -124,12 +158,12 @@ def test_flat_top_level_or_bundles_multiple_par_groups_together() -> None:
     assert next_par_idx == 2
     pairs = set()
     for par_idx, group in df.group_by( 'par_idx' ):
-        x_b  = group.filter( ( pl.col( 'par_group' ) == 'X'  ) & ( pl.col( 'par_name' ) == 'b' ) )['par_val_int64'][ 0 ]
-        xk_b = group.filter( ( pl.col( 'par_group' ) == 'Xk' ) & ( pl.col( 'par_name' ) == 'b' ) )['par_val_int64'][ 0 ]
+        x_b  = group.filter( pl.col( 'par_name' ) == 'x_b'  )['par_val_int64'][ 0 ]
+        xk_b = group.filter( pl.col( 'par_name' ) == 'xk_b' )['par_val_int64'][ 0 ]
         pairs.add( ( x_b, xk_b ) )
     # only the paired combinations from the same alternative -- never (10, 21) or (11, 20)
     assert pairs == { ( 10, 20 ), ( 11, 21 ) }
-#/def test_flat_top_level_or_bundles_multiple_par_groups_together
+#/def test_flat_top_level_or_bundles_multiple_domain_groups_together
 
 
 # -- tree (to_polars/schema): _or, no duplication of shared content
@@ -250,7 +284,7 @@ def test_tree_top_level_or_bundles_multiple_par_groups() -> None:
 
     or_junction = df.filter( pl.col( 'par_type' ) == '_or' )
     assert or_junction.shape[ 0 ] == 1
-    assert or_junction['parent_idx'][ 0 ] is None  # top-level _or has no owning par_group
+    assert or_junction['parent_idx'][ 0 ] is None  # top-level _or has no owning domain group
 #/def test_tree_top_level_or_bundles_multiple_par_groups
 
 
@@ -275,10 +309,10 @@ def test_tree_disambiguates_fixed_sibling_from_or_alternatives() -> None:
     assert df.filter( pl.col( 'node_idx' ) == or_node )['parent_idx'][ 0 ] is None
     # X's node and the _or junction are siblings under the root, but only the
     # _or junction's own children (each alternative's '_and' wrapper) are
-    # OR-related -- each wrapper bundles that alternative's own par_groups.
+    # OR-related -- each wrapper bundles that alternative's own domain groups.
     wrappers = df.filter( ( pl.col( 'par_type' ) == '_and' ) & ( pl.col( 'parent_idx' ) == or_node ) )
     assert wrappers.shape[ 0 ] == 2
-    y_rows = df.filter( pl.col( 'par_group' ) == 'Y' )
+    y_rows = df.filter( pl.col( 'par_name' ).is_in( [ 'b', 'rho' ] ) )
     assert y_rows.shape[ 0 ] == 2
     assert set( y_rows['parent_idx'].to_list() ) == set( wrappers['node_idx'].to_list() )
 #/def test_tree_disambiguates_fixed_sibling_from_or_alternatives
@@ -436,86 +470,6 @@ def test_values_random_unsupported_dtype_raises() -> None:
 #/def test_values_random_unsupported_dtype_raises
 
 
-# -- deprecated oracle: frozen pre-refactor behavior (regression safety net)
-#
-# Mirrors the tests above but targets to_polars_deprecated/schema_deprecated,
-# which are never modified again after this. Later refactor stages diff their
-# new implementations' output against this oracle.
-
-def test_deprecated_flat_dict_par_idx_unchanged() -> None:
-    p  = _make_parser()
-    df, next_par_idx, next_node_idx = p.to_polars_deprecated( { 'X': { 'a': 1, 'b': 2 } } )
-    assert sorted( df['par_idx'].unique().to_list() ) == [ 0 ]
-    assert next_par_idx  == 1
-    assert next_node_idx == 1
-#/def test_deprecated_flat_dict_par_idx_unchanged
-
-
-def test_deprecated_groups_par_idx_matches_pre_existing_numbering() -> None:
-    p  = _make_parser()
-    d  = { 'X': { 'a': 1 }, '_groups': [ { 'X': { 'b': 2 } }, { 'X': { 'b': 3 } } ] }
-    df, next_par_idx, _ = p.to_polars_deprecated( d )
-    assert sorted( df['par_idx'].unique().to_list() ) == [ 1, 2 ]
-    assert next_par_idx == 3
-#/def test_deprecated_groups_par_idx_matches_pre_existing_numbering
-
-
-def test_deprecated_flat_dict_single_node_null_parent() -> None:
-    p  = _make_parser()
-    df, _, _ = p.to_polars_deprecated( { 'X': { 'a': 1, 'b': 2 } } )
-    assert df['node_idx'].n_unique() == 1
-    assert df['parent_idx'].is_null().all()
-#/def test_deprecated_flat_dict_single_node_null_parent
-
-
-def test_deprecated_groups_inside_par_group_chains_to_parent() -> None:
-    p  = _make_parser()
-    d  = { 'X': { 'a': 1, '_groups': [ { 'rho': 0.1 }, { 'rho': 0.2 } ] } }
-    df, _, _ = p.to_polars_deprecated( d )
-
-    base_node_idx = df.filter( pl.col( 'par_name' ) == 'a' )['node_idx'][ 0 ]
-    rho_rows      = df.filter( pl.col( 'par_name' ) == 'rho' )
-    assert rho_rows.shape[ 0 ] == 2
-    assert ( rho_rows['parent_idx'] == base_node_idx ).all()
-    assert rho_rows['node_idx'].n_unique() == 2
-    assert base_node_idx not in rho_rows['node_idx'].to_list()
-#/def test_deprecated_groups_inside_par_group_chains_to_parent
-
-
-def test_deprecated_sibling_par_groups_do_not_parent_each_other() -> None:
-    p  = _make_parser()
-    d  = { 'X': { 'a': 1 }, 'Y': { 'b': 2 } }
-    df, _, _ = p.to_polars_deprecated( d )
-
-    x_node = df.filter( pl.col( 'par_group' ) == 'X' )['node_idx'][ 0 ]
-    y_node = df.filter( pl.col( 'par_group' ) == 'Y' )['node_idx'][ 0 ]
-    assert x_node != y_node
-    assert ( df.filter( pl.col( 'par_group' ) == 'X' )['parent_idx'] ).is_null().all()
-    assert ( df.filter( pl.col( 'par_group' ) == 'Y' )['parent_idx'] ).is_null().all()
-#/def test_deprecated_sibling_par_groups_do_not_parent_each_other
-
-
-def test_deprecated_groups_directly_nested_in_groups_raises() -> None:
-    p = _make_parser()
-    d = {
-        '_groups': [
-            { 'X': { 'a': 1 }, '_groups': [ { 'X': { 'a': 2 } } ] },
-        ],
-    }
-    with pytest.raises( ValueError, match = '_groups cannot be nested directly' ):
-        p.to_polars_deprecated( d )
-#/def test_deprecated_groups_directly_nested_in_groups_raises
-
-
-def test_deprecated_schema_includes_node_and_parent_idx() -> None:
-    p = _make_parser()
-    schema = p.schema_deprecated
-    assert 'node_idx'   in schema
-    assert 'parent_idx' in schema
-    assert 'par_idx'    in schema
-#/def test_deprecated_schema_includes_node_and_parent_idx
-
-
 # -- op_ctor_kwargs_forest (__table_ops_parameters__ -> TableOp ctor kwargs)
 
 def _op_params_parser() -> ParameterParser:
@@ -543,11 +497,10 @@ def test_op_ctor_kwargs_forest_extracts_one_op() -> None:
 
 
 def test_op_ctor_kwargs_forest_extracts_multiple_ops_via_threaded_node_idx() -> None:
-    # All parameterized ops share one par_group (TABLE_OPS_PARAMETERS_GROUP)
-    # -- they're told apart by node_idx instead, so node_idx must actually be
-    # threaded (node_idx_start in, next returned out) across sibling calls
-    # sharing that par_group, same as configTree.py does across
-    # [[parameters]] entries.
+    # Every parameterized op is told apart by node_idx (no par_group column
+    # any more) -- so node_idx must actually be threaded (node_idx_start in,
+    # next returned out) across sibling calls, same as configTree.py does
+    # across [[parameters]] entries.
     p = _op_params_parser()
     tree_a, next_idx = p.to_polars(
         { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } },
@@ -565,10 +518,9 @@ def test_op_ctor_kwargs_forest_extracts_multiple_ops_via_threaded_node_idx() -> 
 
 
 def test_op_ctor_kwargs_forest_rejects_colliding_node_idx_across_ops() -> None:
-    # Without threading node_idx, two ops sharing TABLE_OPS_PARAMETERS_GROUP
-    # both landing on node_idx 0 is now ambiguous (was previously
-    # disambiguated by per-op par_group -- no longer true) -- raise rather
-    # than silently merging/misattributing kwargs between them.
+    # Without threading node_idx, two ops both landing on node_idx 0 is
+    # ambiguous -- raise rather than silently merging/misattributing kwargs
+    # between them.
     p = _op_params_parser()
     tree_a, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } } )
     tree_b, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'writer', 'label': 'out' } } )
@@ -593,15 +545,15 @@ def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling() -> None:
 #/def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling
 
 
-def test_op_ctor_kwargs_forest_ignores_rows_outside_table_ops_parameters_group() -> None:
-    # A par_group other than TABLE_OPS_PARAMETERS_GROUP isn't a TableOp
-    # parameter node at all -- e.g. some unrelated parameter tree sharing
-    # the same dataframe -- and is filtered out before op_idn is even
-    # considered.
+def test_op_ctor_kwargs_forest_ignores_top_level_key_choice() -> None:
+    # The top-level dict key passed to to_polars() (TABLE_OPS_PARAMETERS_GROUP
+    # or anything else) is purely an input-organization convenience -- never
+    # written to the output -- so op_ctor_kwargs_forest reads the same result
+    # regardless of what key wraps the op's own root.
     p = _op_params_parser()
     tree, _ = p.to_polars( { 'unrelated': { 'op_idn': 'reader', 'threshold': 0.9 } } )
-    assert op_ctor_kwargs_forest( tree ) == {}
-#/def test_op_ctor_kwargs_forest_ignores_rows_outside_table_ops_parameters_group
+    assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.9 } }
+#/def test_op_ctor_kwargs_forest_ignores_top_level_key_choice
 
 
 def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf() -> None:
@@ -631,10 +583,11 @@ def test_op_ctor_kwargs_forest_rejects_nested_or_and() -> None:
 
 # -- parameter_group_to_tree (raw dict -> forest tree, no pre-registration)
 
-def test_parameter_group_to_tree_uses_fixed_par_group() -> None:
+def test_parameter_group_to_tree_has_no_par_group_column() -> None:
     tree, _ = parameter_group_to_tree( 'reader', { 'threshold': 0.5 } )
-    assert tree[ 'par_group' ].unique().to_list() == [ TABLE_OPS_PARAMETERS_GROUP ]
-#/def test_parameter_group_to_tree_uses_fixed_par_group
+    assert 'par_group' not in tree.columns
+    assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.5 } }
+#/def test_parameter_group_to_tree_has_no_par_group_column
 
 
 def test_parameter_group_to_tree_infers_dtypes_from_literal_values() -> None:
@@ -647,7 +600,8 @@ def test_parameter_group_to_tree_multiple_ops_thread_node_idx() -> None:
     # Each call registers dtypes independently -- concatenating fragments
     # whose value-column sets differ requires a relaxed/diagonal concat.
     # node_idx must be threaded across calls (same as configTree.py does
-    # across [[parameters]] entries) since they now share one par_group.
+    # across [[parameters]] entries) since node_idx is what distinguishes
+    # ops (no par_group column).
     tree_a, next_idx = parameter_group_to_tree( 'reader', { 'threshold': 0.5 } )
     tree_b, _        = parameter_group_to_tree( 'writer', { 'label': 'out' }, node_idx_start = next_idx )
     forest = pl.concat( [ tree_a, tree_b ], how = 'diagonal_relaxed' )
@@ -668,8 +622,8 @@ def test_parameter_group_to_tree_supports_values_search_dtype_inference() -> Non
 
 
 # -- schema.table_schemas['parameter_tree'] consolidation (schema.py is
-# now the single source of truth par_group/par_type/.../node_idx/
-# parent_idx/par_val_* naming was previously hand-duplicated here)
+# now the single source of truth -- par_type/.../node_idx/parent_idx/
+# par_val_* naming was previously hand-duplicated here)
 
 def test_fresh_parser_schema_matches_table_schemas_parameter_tree() -> None:
     assert ParameterParser().schema == table_schemas[ 'parameter_tree' ]

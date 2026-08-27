@@ -65,10 +65,13 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     # parameter spec rows (parameterParse.py's ParameterParser) -- par_idx
     # is the flat/cross-producted view's row-group id; node_idx/parent_idx
     # are the tree view's permanent-id/parent-link pair (both views share
-    # everything else: par_group/par_type/par_name/par_feature + the
-    # par_val_* value columns, added below via col_for_dtype).
+    # everything else: par_type/par_name/par_feature + the par_val_* value
+    # columns, added below via col_for_dtype). No par_group column -- which
+    # rows belong together is fully captured by node_idx/parent_idx; a
+    # consumer that needs to pick specific rows out of a mixed forest does
+    # so via par_name (domain-specific, assumed unique within whatever
+    # scope it's read back in), not a separate categorical label.
     'par_idx':          pl.UInt32,
-    'par_group':        pl.Utf8,
     'par_type':         pl.Utf8,
     'par_name':         pl.Utf8,
     'par_feature':      pl.Utf8,
@@ -226,10 +229,10 @@ cannonical_schema |= {
 # parameterParse.py's two row shapes -- both single source of truth here
 # now, parameterParse.py imports rather than redefines them.
 _IDENTIFIER_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
-    'par_group', 'par_type', 'par_idx', 'par_name', 'par_feature',
+    'par_type', 'par_idx', 'par_name', 'par_feature',
 ) )
 _TREE_IDENTIFIER_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
-    'par_group', 'par_type', 'par_name', 'par_feature', 'node_idx', 'parent_idx',
+    'par_type', 'par_name', 'par_feature', 'node_idx', 'parent_idx',
 ) )
 _CANDIDATE_LIST_COLS: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
     col_for_dtype( pl.List( pl.Utf8 ) ), col_for_dtype( pl.List( pl.Int64 ) ), col_for_dtype( pl.List( pl.Float64 ) ),
