@@ -10,7 +10,7 @@ from .parameterParse import ParameterParser, op_ctor_kwargs_forest
 from .schema import table_schemas, table_schemas_to_df
 from .sunder import sunder_table_factories
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, Sequence
@@ -43,6 +43,67 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
 # non-blocking Future uniformly with a nested Cell (which already returns
 # one natively) or a Ray remote handle. See squishy-sleeping-snowflake.md.
 _EXECUTOR = ThreadPoolExecutor( thread_name_prefix = 'silverbrain-actor' )
+
+# -- Process-wide in-flight tracking, for drain_executor() below. A Cell's
+# own Future resolves as soon as its declared target is satisfied (see
+# _WiringEngine._scan) -- deliberately, so a node feeding only some OTHER,
+# not-yet-needed name (e.g. an internal loop-back a caller re-invokes this
+# Cell over, from outside) never blocks that Cell's own return. But
+# nothing then guarantees every node this run ever dispatched, anywhere in
+# the tree, has actually finished -- some of that work can legitimately
+# still be in flight, on _EXECUTOR's shared worker threads, after the
+# outermost caller's own Future has already resolved. A one-off script
+# (duckpond.scripts.run.run(), a test) that wants to be sure nothing it
+# kicked off is still running (still printing, still writing) before it
+# moves on -- rather than a Cell resolving early on purpose mid-loop --
+# needs a *separate* signal from any one Cell's own Future: this registry
+# + drain_executor().
+_pending_lock:    threading.Lock = threading.Lock()
+_pending_futures: set[ Future ]  = set()
+
+
+def _tracked_submit( fn, *args, **kwargs ) -> Future:
+    """_EXECUTOR.submit, plus registering the returned Future in
+    _pending_futures until it completes -- every call site that dispatches
+    onto _EXECUTOR (_WiringEngine._dispatch, Cell.bind's _bound) goes
+    through this, never _EXECUTOR.submit directly, so drain_executor() can
+    see the whole process's in-flight work, not just one Cell's own."""
+    fut = _EXECUTOR.submit( fn, *args, **kwargs )
+    with _pending_lock:
+        _pending_futures.add( fut )
+    fut.add_done_callback( lambda f: _pending_futures.discard( f ) )
+    return fut
+#/def _tracked_submit
+
+
+def drain_executor() -> None:
+    """
+    Block until every Actor call submitted to the shared _EXECUTOR (by any
+    Cell, anywhere, as a side effect of any run) has finished -- not just
+    the specific Future some caller happens to be holding. A Cell's own
+    Future resolving only means ITS OWN declared target got satisfied
+    (see _WiringEngine._scan's docstring); it says nothing about sibling
+    work the same run dispatched that no declared target ever needed (an
+    internal loop-back producer, e.g.) -- that work can still be mid-
+    flight on some other worker thread. Call this at a true top-level
+    boundary (a script's own entry point, a test) after awaiting whatever
+    Future you actually needed, when you want the guarantee that nothing
+    this process kicked off is still running before you move on.
+
+    Loops rather than waiting once: completion of one round of pending
+    futures can itself dispatch more (e.g. _on_done -> _scan -> further
+    _dispatch calls), so this keeps re-snapshotting and waiting until a
+    snapshot comes up empty -- convergence to full quiescence, not just
+    "whatever was pending at the first instant this was called."
+    """
+    while True:
+        with _pending_lock:
+            futures = list( _pending_futures )
+        if not futures:
+            return
+        wait( futures )
+    #/while True
+#/def drain_executor
 
 
 # Sentinel distinguishing "no non-null token yet" from a genuine None
@@ -147,10 +208,20 @@ class _WiringEngine:
     target isn't fully resolved, `future` gets a RuntimeError naming the
     unresolved names.
 
-    A Cell's own target resolves on each name's first NON-null token, not
-    merely its first token -- an internal null token (e.g. a loop's
-    in-progress signal on one branch while the real result is still being
-    computed on another) is never mistaken for "the Cell is done."
+    A Cell's own target resolves on each name's first token, null included
+    -- a null result is an ordinary, final answer for the firing that
+    produced it (e.g. a sampler op whose next/done outputs are mutually
+    exclusive per call: one branch's null and the other's real value both
+    land in the very same firing), not a placeholder to wait past. This
+    Cell's own __call__ never re-fires on its own to produce a "better,
+    later" token for a name that already has one -- a fresh call each
+    time is Cell.__call__'s whole model (see its own docstring: "a fresh
+    _WiringEngine ... is constructed every call regardless") -- so a loop
+    that needs a different branch to eventually go non-null is necessarily
+    the CALLER's concern, expressed by re-invoking this Cell again from
+    outside (a fresh call, fresh engine, fresh chance for the other branch
+    to be the one that's null this time), never by this engine privately
+    holding out for a second token on the same name within one call.
 
     discard_on_null (__nodes__ row, default True, only consulted when
     join='all'): the ordinary/default behavior is that once a `join='all'`
@@ -252,14 +323,11 @@ class _WiringEngine:
         with self.lock:
             if self.future.done():
                 return
-            # Resolve on each target's first NON-null token, not merely its
-            # first token -- a null token is a legitimate in-flight signal
-            # (e.g. loop-in-progress) an internal node may pass through
-            # before the real result arrives; the Future this Cell itself
-            # returns should never resolve to "nothing yet" just because a
-            # transient null happened to reach a target name first.
+            # Resolve on each target's first token, null included -- see
+            # class docstring. A name with no token logged at all yet is
+            # still _UNRESOLVED (distinct from "resolved to None").
             resolved = {
-                t: next( ( tok.value for tok in self.logs.get( t, [] ) if tok.value is not None ), _UNRESOLVED )
+                t: ( self.logs[ t ][ 0 ].value if self.logs.get( t ) else _UNRESOLVED )
                 for t in self.cell.target
             }
             if all( v is not _UNRESOLVED for v in resolved.values() ):
@@ -359,7 +427,7 @@ class _WiringEngine:
         if self.verbose >= 1 and is_leaf_op:
             print( f"{ op_prefix } { tuple( row[ 'source' ] or () ) }" )
         #
-        fut = _EXECUTOR.submit(
+        fut = _tracked_submit(
             _call_actor, actor, inputs, dispatch_corr_id, self.verbose, op_prefix,
         )
         if self.verbose >= 1 and is_leaf_op:
@@ -614,7 +682,7 @@ class Cell:
             verbose:        int = 0,
             verbose_prefix: str = '',
             ) -> Future[ tuple[ pl.DataFrame, ... ] ]:
-            return _EXECUTOR.submit( _call_actor, target, dfs, corr_id, verbose, verbose_prefix )
+            return _tracked_submit( _call_actor, target, dfs, corr_id, verbose, verbose_prefix )
         #/def _bound
 
         return _bound

@@ -47,7 +47,7 @@ def test_default_cell_idn_raises_when_key_missing( tmp_path: Path ) -> None:
 
 def _write_cells_index_fixture( fp: Path, cell_idn: str, target_path: Path ) -> None:
     fp.parent.mkdir( parents=True, exist_ok=True )
-    fp.write_text( f'[[cells]]\ncell_idn = {cell_idn!r}\npath = {str(target_path)!r}\n' )
+    fp.write_text( f'[[cells]]\ncell_idn = {cell_idn!r}\ntoml = {str(target_path)!r}\n' )
 
 
 def test_resolve_cell_fp_finds_cell_idn_in_fallback_data_root( tmp_path: Path ) -> None:
@@ -188,7 +188,7 @@ def test_written_index_paths_are_relative_and_survive_a_move( tmp_path: Path ) -
 
     index_fp = original_root / 'cells_index.toml'
     _write_cells_index( index_fp, { 'my_cell': target } )
-    assert not Path( index_fp.read_text().split( "path = " )[ 1 ].split( "\n" )[ 0 ].strip( "'\"" ) ).is_absolute()
+    assert not Path( index_fp.read_text().split( "toml = " )[ 1 ].split( "\n" )[ 0 ].strip( "'\"" ) ).is_absolute()
 
     # Move the whole directory tree -- a relatively-stored path must still resolve.
     moved_root = tmp_path / 'moved'

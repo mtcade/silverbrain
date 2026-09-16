@@ -65,12 +65,11 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
     # declaration (see below) binds a real implementation to this node's
     # abs_path.
 - parameters (ParameterParser's tree schema, parameterParse.py): a forest
-  of TableOp construction-parameter trees. Every parameterized op's rows
-  are wrapped, at parse time, under the same fixed top-level key
-  parameterParse.TABLE_OPS_PARAMETERS_GROUP ('table_ops_parameters') --
-  purely a to_polars() input-shape convenience, never written to the
-  output (no par_group column) -- individual ops are told apart by
-  node_idx, via a root-level leaf with par_name == 'op_idn' -- see
+  of TableOp construction-parameter trees. Each parameterized op's own
+  dict (its ctor kwargs, plus an injected 'op_idn' leaf) is handed to
+  to_polars() directly -- no wrapper key, since to_polars() has no concept
+  of a top-level "group" a dict lives under -- individual ops are told
+  apart by node_idx, via a root-level leaf with par_name == 'op_idn' -- see
   parameterParse.py's "TableOp construction kwargs" section. Populated
   from each file's own [[parameters]] entries (below), either inline or
   via an external .toml/.json reference; every entry gets its own fresh
@@ -107,13 +106,11 @@ inline on its own [[nodes]] entry instead, see below):
     _json = "path/to/params.json"   # ditto
 
 An external .toml/.json file's top-level content IS the ParamGroupDict --
-the same par_name -> scalar-or-valueDict (+ optional _or/_and) shape a
-hand-written pre-ParameterParser JSON spec already uses (see
-parameterParse.py's module docstring), just without the outer
-{par_group: ...} wrapping (parameter_group_to_tree() supplies
-TABLE_OPS_PARAMETERS_GROUP for that; node_idn supplies the 'op_idn'
-identity leaf). Inline keys in the TOML block itself (beyond
-node_idn/_toml/_json) are read the same way.
+the same par_name -> scalar-or-valueDict (+ at most one of _or/_and) shape
+a hand-written pre-ParameterParser JSON spec already uses (see
+parameterParse.py's module docstring); node_idn supplies the 'op_idn'
+identity leaf parameter_group_to_tree() injects. Inline keys in the TOML
+block itself (beyond node_idn/_toml/_json) are read the same way.
 
 config_tree() is the format dispatcher, inferring which parser to use from
 the file suffix at every node in the walk (not just the root) -- so a

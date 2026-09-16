@@ -26,16 +26,20 @@ a "before" snapshot. No node_idx/parent_idx. to_polars_flat() derives this by
 calling to_polars() and expanding the resulting tree (see
 _expand_tree_to_flat()).
 
-RESERVED KEYS: `_or` AND `_and`
+RESERVED KEYS: `_or` XOR `_and`
 
-At any point, a dict may contain `_or`, a list of alternative dicts: exactly
-one is chosen per combination (mutually exclusive), each combined with the
-rest of the enclosing dict. `_and` is the AND counterpart: a list of dicts
-that must ALL be included together (cross-producted with each other and the
-rest of the enclosing dict) — useful for crossing multiple independent `_or`
-blocks that have no natural owning key of their own, e.g.
-{'_and': [{'_or': [...]}, {'_or': [...]}]}. Both may nest arbitrarily deep,
-including directly inside each other, with no restriction.
+At any point, a dict may contain EITHER `_or`, a list of alternative dicts
+(exactly one is chosen per combination -- mutually exclusive, each combined
+with the rest of the enclosing dict), OR `_and`, the AND counterpart (a list
+of dicts that must ALL be included together, cross-producted with each other
+and the rest of the enclosing dict) -- never both in the same dict. There is
+no expressive loss from this restriction: a dict that would otherwise need
+both is just as easily written with one nested inside the other, e.g.
+{'_and': [{'_or': [...]}, {...}]} instead of {'_or': [...], '_and': [...]}
+as siblings -- so parameterParse simply never allows the ambiguous sibling
+form, and raises ValueError on a dict containing both keys. Both `_or` and
+`_and` may otherwise nest arbitrarily deep, including directly inside each
+other, with no restriction.
 
 Every `_or`/`_and` always mints an explicit junction node in the tree (row
 with par_type='_or' or '_and', no par_name/value) — never a silent
@@ -43,21 +47,23 @@ pass-through. A node's own par_type fully determines how ITS children
 relate: par_type == '_or' -> children are mutually exclusive alternatives;
 anything else (a content node, or an '_and' junction) -> children are
 unconditionally combined. This is what makes the tree walkable back into the
-flat cross-product with no ambiguity, even when `_or`/`_and` sit at the top
-level with no owning domain group (where a fixed sibling group and an
-`_or`'s alternatives would otherwise be indistinguishable from node_idx/
-parent_idx alone).
+flat cross-product with no ambiguity, even at the top level, with no owning
+node (where a fixed sibling group and an `_or`'s alternatives would
+otherwise be indistinguishable from node_idx/parent_idx alone).
 
-Top-level `_or`/`_and` alternatives that bundle multiple domain groups (e.g.
-{'y': {...}, 'importances': {...}}) are wrapped in an implicit '_and'
-junction per alternative, so that alternative's groups stay tied together as
-one atomic choice rather than fanning out as independent children of the
-outer junction. A top-level dict key (e.g. 'X', 'y', 'importances') is only
-ever an input-organization convenience -- it groups that key's own par_names
-into one node cluster but is never written to the output as its own column
-(no par_group); node_idx/parent_idx already fully capture which rows belong
-together, and a consumer that needs a specific row back out does so via
-par_name.
+parameterParse has no concept of a named "domain group" or "par_group" at
+any level, including the top level passed to to_polars()/to_polars_flat()
+-- every dict, at every depth, is parsed by the exact same rule: its own
+non-reserved keys are ordinary par_name -> value/ValueDict leaves (siblings,
+sharing one content node_idx), plus at most one of `_or`/`_and` for
+structure. Grouping/labeling par_names for an application's own purposes
+(e.g. "this cluster of parameters is conceptually 'space' settings") is
+entirely an application-level concern, done with an ordinary par_name of its
+own if needed -- never a key parameterParse itself treats specially. A
+consumer that needs a specific row back out of the result does so via
+par_name (see ParameterParser.subtree() below for extracting a whole
+subtree rooted at a given node_idx, and leaf_paths() for the branch from
+root to each terminal leaf).
 
 RESERVED KEY: `_comment`
 
@@ -211,12 +217,12 @@ ValueDict: Type = (
 
 
 class ParamGroupDict( TypedDict, closed = False ):
-    _or: NotRequired[ list[ Self ] ]
+    # At most one of _or/_and is ever present -- see module docstring's
+    # RESERVED KEYS section (enforced at runtime in ParameterParser.to_polars(),
+    # not expressible as a TypedDict constraint).
+    _or:  NotRequired[ list[ Self ] ]
+    _and: NotRequired[ list[ Self ] ]
     __extra_items__: RegularValue | ValueDict
-
-class ParamDict( TypedDict, closed = False ):
-    _or: NotRequired[ list[ Self ] ]
-    __extra_items__: ParamGroupDict
 
 
 # -- Leaf path (tree-walk result)
@@ -462,16 +468,43 @@ class ParameterParser:
         return tb.to_polars()
     #/def _valueDict_to_tree
 
-    def _paramGroup_to_tree(
+    def to_polars(
         self,
-        paramGroup_dict:  ParamGroupDict,
-        parent_node_idx:  int | None = None,
+        param_dict:       ParamGroupDict,
         node_idx_start:   int = 0,
+        parent_node_idx:  int | None = None,
     ) -> tuple[ pl.DataFrame, int ]:
+        """
+        Convert a parameter spec dict to a tree-shaped DataFrame: one row per
+        node (no duplication of shared content), with node_idx/parent_idx
+        reconstructing the original _or/_and nesting. No par_idx -- see
+        to_polars_flat() for the derived, fully cross-producted view.
+
+        Every level is parsed by the same rule (recursive: a `_or`/`_and`
+        child is itself a ParamGroupDict, parsed by this same method) -- see
+        module docstring's RESERVED KEYS section. A dict's own non-reserved
+        keys are ordinary par_name -> value/ValueDict leaves, all sharing one
+        content node_idx; `_or` and `_and` are the only structural devices,
+        and a dict containing both raises ValueError (nest one inside the
+        other instead -- there is no case that genuinely needs both as
+        siblings).
+
+        :param param_dict:      The spec dict for this call's own level.
+        :param node_idx_start:  First node_idx value to assign.
+        :param parent_node_idx: node_idx this call's own content is nested under;
+            None at the root.
+        :returns: (DataFrame with self.schema, next available node_idx)
+        """
+        if '_or' in param_dict and '_and' in param_dict:
+            raise ValueError(
+                "A dict may not contain both '_or' and '_and' -- nest one "
+                "inside the other instead, e.g. {'_and': [{'_or': [...]}, {...}]}"
+            )
+
         node_idx = node_idx_start
         rows: list[ pl.DataFrame ] = []
 
-        own_keys = { k: v for k, v in paramGroup_dict.items() if k not in ( '_or', '_and', _IGNORED_KEY ) }
+        own_keys = { k: v for k, v in param_dict.items() if k not in ( '_or', '_and', _IGNORED_KEY ) }
 
         if own_keys:
             this_node_idx = node_idx
@@ -495,83 +528,17 @@ class ParameterParser:
             attach_point = parent_node_idx
 
         for key in ( '_or', '_and' ):
-            if key not in paramGroup_dict:
+            if key not in param_dict:
                 continue
             junction_idx = node_idx
             node_idx += 1
             rows.append( self._junction_row(
                 kind = key, node_idx = junction_idx, parent_idx = attach_point,
             ) )
-            for child in paramGroup_dict[ key ]:
-                df_child, node_idx = self._paramGroup_to_tree(
-                    paramGroup_dict = child,
-                    parent_node_idx = junction_idx, node_idx_start = node_idx,
-                )
-                rows.append( df_child )
-
-        if rows:
-            return pl.concat( rows, how = 'vertical' ), node_idx
-        return pl.DataFrame( schema = self.schema ), node_idx
-    #/def _paramGroup_to_tree
-
-    def to_polars(
-        self,
-        param_dict:       ParamDict,
-        node_idx_start:   int = 0,
-        parent_node_idx:  int | None = None,
-    ) -> tuple[ pl.DataFrame, int ]:
-        """
-        Convert a top-level parameter spec dict to a tree-shaped DataFrame: one row
-        per node (no duplication of shared content), with node_idx/parent_idx
-        reconstructing the original _or/_and nesting. No par_idx -- see
-        to_polars_flat() for the derived, fully cross-producted view.
-
-        :param param_dict:      Top-level dict keyed by a domain name (e.g.
-            'X', 'Xk') that's purely an input-organization convenience -- it
-            groups that key's own par_names into one node cluster (siblings
-            under a shared node_idx) but is never written to the output as
-            its own column; node_idx/parent_idx already fully capture which
-            rows belong together. A consumer that needs to find a specific
-            row back out of the result does so via par_name.
-        :param node_idx_start:  First node_idx value to assign.
-        :param parent_node_idx: node_idx this call's own content is nested under;
-            None at the root.
-        :returns: (DataFrame with self.schema, next available node_idx)
-        """
-        node_idx = node_idx_start
-        rows: list[ pl.DataFrame ] = []
-
-        for k, v in param_dict.items():
-            if k in ( '_or', '_and', _IGNORED_KEY ):
-                continue
-            df_k, node_idx = self._paramGroup_to_tree(
-                paramGroup_dict = v,
-                parent_node_idx = parent_node_idx, node_idx_start = node_idx,
-            )
-            rows.append( df_k )
-
-        for key in ( '_or', '_and' ):
-            if key not in param_dict:
-                continue
-            junction_idx = node_idx
-            node_idx += 1
-            rows.append( self._junction_row(
-                kind = key, node_idx = junction_idx, parent_idx = parent_node_idx,
-            ) )
             for child in param_dict[ key ]:
-                # A top-level alternative can bundle multiple domain groups
-                # (e.g. {'y': {...}, 'importances': {...}}) -- wrap each
-                # alternative in its own '_and' junction so that
-                # alternative's nodes are tied together as ONE choice, not
-                # fanned out as independent (and indistinguishable) children
-                # of `junction_idx`.
-                wrapper_idx = node_idx
-                node_idx += 1
-                rows.append( self._junction_row(
-                    kind = '_and', node_idx = wrapper_idx, parent_idx = junction_idx,
-                ) )
                 df_child, node_idx = self.to_polars(
-                    param_dict = child, node_idx_start = node_idx, parent_node_idx = wrapper_idx,
+                    param_dict = child,
+                    parent_node_idx = junction_idx, node_idx_start = node_idx,
                 )
                 rows.append( df_child )
 
@@ -683,6 +650,44 @@ class ParameterParser:
         return leaves
     #/def leaf_paths
 
+    def subtree( self, tree_df: pl.DataFrame, node_idx: int ) -> pl.DataFrame:
+        """
+        All rows in the subtree rooted at `node_idx` (inclusive) -- `node_idx`
+        itself plus every descendant, found by walking parent_idx forward
+        (via the same children map leaf_paths()/to_polars_flat() use) from
+        `node_idx` down. The counterpart to leaf_paths()'s branch-to-root
+        walk (which starts at a terminal leaf and walks up to the true
+        root): this instead starts at any node and walks down.
+
+        node_idx/parent_idx values are returned as-is (not renumbered), so
+        the result composes with leaf_paths()/_expand_tree_to_flat()-style
+        consumers unchanged as long as it's read starting from `node_idx`
+        (its own parent_idx still points outside the returned rows). A
+        caller wanting a fresh, self-contained, independently-renumbered
+        tree (e.g. to feed back through to_polars_flat()'s own node_idx_start
+        threading as an unrelated forest) renumbers separately -- not this
+        method's concern, per parameterParse's own module docstring:
+        applications get the subtrees/branches they want out of the general
+        tree/leaf primitives, not a bespoke grouping concept baked in here.
+
+        Raises KeyError if `node_idx` isn't present in `tree_df` at all.
+        """
+        if node_idx not in tree_df[ 'node_idx' ]:
+            raise KeyError( f"node_idx={node_idx!r} not present in tree_df" )
+
+        children, _ = self._tree_children_maps( tree_df )
+        keep: set[ int ] = set()
+        frontier = [ node_idx ]
+        while frontier:
+            n = frontier.pop()
+            if n in keep:
+                continue
+            keep.add( n )
+            frontier.extend( children.get( n, [] ) )
+
+        return tree_df.filter( pl.col( 'node_idx' ).is_in( list( keep ) ) )
+    #/def subtree
+
     def _expand_tree_to_flat(
         self, tree_df: pl.DataFrame, par_idx_start: int = 0,
     ) -> tuple[ pl.DataFrame, int ]:
@@ -708,7 +713,7 @@ class ParameterParser:
 
     def to_polars_flat(
         self,
-        param_dict:     ParamDict,
+        param_dict:     ParamGroupDict,
         par_idx_start:  int = 0,
         node_idx_start: int = 0,
     ) -> tuple[ pl.DataFrame, int, int ]:
@@ -727,20 +732,18 @@ class ParameterParser:
 
 # -- TableOp construction kwargs (__table_ops_parameters__ forest, cell.py)
 #
-# Every parameterized op lands in the same forest, wrapped under the same
-# fixed top-level key, TABLE_OPS_PARAMETERS_GROUP, purely so
-# parameter_group_to_tree() has a valid ParamDict to hand to to_polars() --
-# that key is never written to the output (no par_group column). Individual
-# ops are told apart by node_idx: configTree.py threads a running
-# node_idx_start/next_node_idx
-# counter (the same dual-return pattern to_polars()/to_polars_flat() use)
-# through every [[parameters]] entry it parses, so each op's root-level
-# rows (parent_idx is null) land at their own node_idx, globally unique
-# across one config_tree() call's whole forest. Each such root group
-# carries one par_name == 'op_idn' row identifying which op its sibling
-# rows are ctor kwargs for -- kept as an explicit, self-describing identity
-# marker (consistent with the original design sketch,
-# nested-gathering-russell.md) rather than inferring identity from
+# Every parameterized op lands in the same forest, each as its own
+# op_idn-rooted ParamGroupDict handed straight to to_polars() (no wrapper
+# key -- see parameter_group_to_tree() below). Individual ops are told
+# apart by node_idx: configTree.py threads a running node_idx_start/
+# next_node_idx counter (the same dual-return pattern to_polars()/
+# to_polars_flat() use) through every [[parameters]] entry it parses, so
+# each op's root-level rows (parent_idx is null) land at their own
+# node_idx, globally unique across one config_tree() call's whole forest.
+# Each such root group carries one par_name == 'op_idn' row identifying
+# which op its sibling rows are ctor kwargs for -- kept as an explicit,
+# self-describing identity marker (consistent with the original design
+# sketch, nested-gathering-russell.md) rather than inferring identity from
 # node_idx position alone.
 #
 # Caveat: this relies on node_idx actually being unique forest-wide, which
@@ -750,8 +753,6 @@ class ParameterParser:
 # reintroduce colliding node_idx across different ops, silently merging
 # two ops' kwargs into one entry. Not handled here; revisit if that merge
 # path is ever exercised with real [[parameters]] data.
-
-TABLE_OPS_PARAMETERS_GROUP: str = 'table_ops_parameters'
 
 def _leaf_value( row: dict, val_cols: list[ str ] ) -> Any:
     """The single non-null par_val_* value on a tree row, or None if it
@@ -863,13 +864,33 @@ def _register_param_group_dtypes( parser: ParameterParser, group: dict ) -> None
     Auto-register every par_name this group needs a dtype for, inferred
     from the literal values present -- parser.to_polars() requires
     pre-registration for plain fixed values (via col_for_name) and for
-    values_search/values_random spec lists (via the registered dtype's
-    coercion), and configTree.py has no advance knowledge of what dtype any
-    given TOML/JSON-sourced parameter should be. Other valueDict shapes
-    (step/log_step/logit_step/distribution) pick their column from the
-    literal value's own runtime type inline, not a registration, so nothing
-    to do for those. Recurses into _or/_and alternatives (still the same
-    par_group). Ignores '_comment' (module docstring's RESERVED KEY section).
+    every ValueDict shape, since _valueDict_to_tree's own column choice
+    (_COL_INT/_COL_FLOAT/etc.) only lands in the actual output if that
+    dtype was registered somewhere first -- ParameterParser.schema's
+    val_cols come from the registered-dtype set, not from which column a
+    given row happens to target, so an appended value whose column isn't
+    in schema is silently dropped by TableBuilder.append(allow_missing=
+    True) (loops over self.columns, never sees unregistered keys).
+    configTree.py has no advance knowledge of what dtype any given
+    TOML/JSON-sourced parameter should be, hence inferring here rather
+    than requiring a separate .register() pass. Recurses into _or/_and
+    alternatives (same group). Ignores '_comment' (module docstring's
+    RESERVED KEY section).
+
+    Mirrors _valueDict_to_tree's own shape dispatch (values_search ->
+    values_random -> logit_step -> log_step -> step -> distribution),
+    registering whatever dtype that branch will actually write: the
+    dtype of values[0] for values_search/values_random (list-of-
+    candidates columns are unconditionally present regardless of
+    registration, but registering the element dtype keeps coercion
+    correct); Float64 for logit_step (always float, by its own 0<start<1
+    domain constraint); the dtype of 'start' for log_step/step (both
+    pick Int64 vs Float64 by isinstance(start, int), consistently across
+    start/step/min/max); Int64 for a 'uniform_int'/'log_uniform_int'
+    distribution, Float64 for any other distribution. An unrecognized
+    shape (none of the above) is left unregistered, same as before --
+    _valueDict_to_tree raises ValueError for it anyway once actually
+    parsed, so there's nothing useful to register.
     """
     for key, value in group.items():
         if key == _IGNORED_KEY:
@@ -879,9 +900,20 @@ def _register_param_group_dtypes( parser: ParameterParser, group: dict ) -> None
                 _register_param_group_dtypes( parser, alt )
             continue
         if isinstance( value, dict ):
-            values = value.get( 'values_search', value.get( 'values_random' ) )
-            if values:
-                parser.register( key, _dtype_for_value( values[ 0 ] ) )
+            d = value
+            if 'values_search' in d or 'values_random' in d:
+                values = d.get( 'values_search', d.get( 'values_random' ) )
+                if values:
+                    parser.register( key, _dtype_for_value( values[ 0 ] ) )
+            elif 'logit_step' in d:
+                parser.register( key, pl.Float64 )
+            elif 'log_step' in d or 'step' in d:
+                parser.register( key, _dtype_for_value( d[ 'start' ] ) )
+            elif 'distribution' in d:
+                if d[ 'distribution' ] in ( 'uniform_int', 'log_uniform_int' ):
+                    parser.register( key, pl.Int64 )
+                else:
+                    parser.register( key, pl.Float64 )
             continue
         parser.register( key, _dtype_for_value( value ) )
     #/for key, value in group.items()
@@ -893,14 +925,14 @@ def parameter_group_to_tree(
     ) -> tuple[ pl.DataFrame, int ]:
     """
     Build one op's row-group for the __table_ops_parameters__ forest from a
-    raw ParamGroupDict -- the same par_name -> scalar-or-valueDict (+
-    optional _or/_and) shape a hand-written pre-ParameterParser JSON/TOML
+    raw ParamGroupDict -- the same par_name -> scalar-or-valueDict (+ at
+    most one of _or/_and) shape a hand-written pre-ParameterParser JSON/TOML
     spec already uses (parameterParse.py's module docstring). The 'op_idn'
     identity leaf op_ctor_kwargs_forest() reads back out is added here
-    automatically. Every call is wrapped under the same fixed top-level
-    TABLE_OPS_PARAMETERS_GROUP key (a to_polars() input-shape convenience
-    only, never written to the output) -- ops are told apart by node_idx
-    (see the "TableOp construction kwargs" comment above
+    automatically, as an ordinary sibling par_name alongside the op's own
+    kwargs -- no wrapper key needed (to_polars() has no concept of a
+    top-level "group" any given dict lives under) -- ops are told apart by
+    node_idx (see the "TableOp construction kwargs" comment above
     op_ctor_kwargs_forest) -- callers (e.g. configTree.py) supply just the
     op's own kwargs, keyed by name.
 
@@ -911,11 +943,9 @@ def parameter_group_to_tree(
     aren't known at parse time anyway (op_classes isn't available until
     Cell construction).
     """
+    full_group = { 'op_idn': op_idn, **group }
     parser = ParameterParser()
     parser.register( 'op_idn', pl.Utf8 )
-    _register_param_group_dtypes( parser, group )
-    return parser.to_polars(
-        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': op_idn, **group } },
-        node_idx_start = node_idx_start,
-    )
+    _register_param_group_dtypes( parser, full_group )
+    return parser.to_polars( full_group, node_idx_start = node_idx_start )
 #/def parameter_group_to_tree

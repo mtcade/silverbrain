@@ -26,7 +26,7 @@ ReadOp/WriteOp/ReadWriteOp are the public, generic TableOps: each takes
 resource it names via `resolve_table_idn` (raising immediately if
 table_idn is missing, or if its kind isn't a raw-table kind they support),
 and dispatches internally to a small per-kind implementation
-(_LocalParquetImpl/_SQLiteImpl/_PostgresImpl) -- one common constructor
+(_LocalParquetImpl/_SQLiteImpl/_PostgresImpl/_TSVImpl) -- one common constructor
 per direction, not one hand-written class per backend x per direction.
 kind='json_ptree' (a parameter-tree-shaped JSON file) is deliberately
 rejected here -- it's silverflow.tableOps.ReadParametersOp's own concern,
@@ -137,6 +137,7 @@ _TABLE_INDEX_REQUIRED_COLUMNS: dict[ str, tuple[ str, ... ] ] = {
     'sqlite_db':  ( 'db_path', ),
     'postgres':   ( 'connection_string', 'table_name' ),
     'json_ptree': ( 'path', ),
+    'tsv':        ( 'path', ),
 }
 
 def _table_ref_row( entry: dict[ str, Any ] ) -> dict[ str, Any ]:
@@ -248,6 +249,24 @@ def _write_parquet( df: pl.DataFrame, fp: str, if_exists: str ) -> None:
     df.write_parquet( fp )
 #/def _write_parquet
 
+def _read_tsv( fp: str ) -> pl.DataFrame:
+    """duckpond's settings/init_parameters/*.tsv shape: tab-separated, with
+    a leading '# table_idn: <name>' comment line (documentation only --
+    the table_idn actually used is whatever the table_index entry names,
+    not re-parsed from this line) and blank cells meaning null."""
+    return pl.read_csv( fp, separator = '\t', comment_prefix = '#', null_values = [ '' ] )
+#/def _read_tsv
+
+def _write_tsv( df: pl.DataFrame, fp: str, if_exists: str, table_idn: str ) -> None:
+    if if_exists == 'fail' and Path( fp ).is_file():
+        raise FileExistsError( f"TSV file already exists: {fp}" )
+    if if_exists == 'append' and Path( fp ).is_file():
+        df = pl.concat( [ _read_tsv( fp ), df ] )
+    with open( fp, 'w' ) as f:
+        f.write( f"# table_idn: {table_idn}\n" )
+        f.write( df.write_csv( separator = '\t' ) )
+#/def _write_tsv
+
 def _write_sqlite_conn( conn: sqlite3.Connection, table_name: str, if_exists: str, df: pl.DataFrame ) -> None:
     """Same logic as a one-shot _write_sqlite, operating on an
     already-open connection (see _SQLiteImpl -- opened once at
@@ -343,7 +362,22 @@ class _LocalParquetImpl:
 class _SQLiteImpl:
     def __init__( self: Self, resource: TableIndexEntry ) -> None:
         self.table_name = resource.table_name
-        self._conn      = sqlite3.connect( resource.db_path )
+        # check_same_thread=False: this connection is opened once, here, on
+        # whichever thread constructs the owning op -- every later read()/
+        # write() call is dispatched onto cell.py's shared _EXECUTOR thread
+        # pool instead, on a worker thread that need not be (and generally
+        # isn't) this one. Safe despite sqlite3's default same-thread guard:
+        # _WiringEngine.in_flight already guarantees a single op instance's
+        # own calls never overlap in time (a node is never dispatched again
+        # while a prior firing of itself is still in flight), so this
+        # connection is still only ever used by one thread AT A TIME, just
+        # not always the same thread across separate calls -- exactly what
+        # check_same_thread guards against by identity rather than by
+        # actual concurrency. Does NOT protect two separate op instances
+        # (e.g. two different node_idns) sharing the same db_path from
+        # racing each other -- sqlite's own file locking handles that case
+        # (a 'database is locked' retry/error under contention), not this.
+        self._conn      = sqlite3.connect( resource.db_path, check_same_thread = False )
     def read( self: Self ) -> pl.DataFrame:
         return _read_sqlite_conn( self._conn, self.table_name )
     def write( self: Self, df: pl.DataFrame, mode: str ) -> None:
@@ -355,7 +389,22 @@ class _PostgresImpl:
         raise NotImplementedError( 'UC: postgres backend not yet implemented' )
 #/class _PostgresImpl
 
-_IMPLS: dict[ str, type ] = { 'local': _LocalParquetImpl, 'sqlite': _SQLiteImpl, 'postgres': _PostgresImpl }
+class _TSVImpl:
+    def __init__( self: Self, resource: TableIndexEntry ) -> None:
+        self.path      = resource.path
+        self.table_idn = resource.table_idn
+    def read( self: Self ) -> pl.DataFrame:
+        return _read_tsv( self.path )
+    def write( self: Self, df: pl.DataFrame, mode: str ) -> None:
+        _write_tsv( df, self.path, mode, self.table_idn )
+#/class _TSVImpl
+
+_IMPLS: dict[ str, type ] = {
+    'local':    _LocalParquetImpl,
+    'sqlite':   _SQLiteImpl,
+    'postgres': _PostgresImpl,
+    'tsv':      _TSVImpl,
+}
 
 
 def _open_output_schema() -> OutputSchema:
@@ -370,7 +419,7 @@ def _open_output_schema() -> OutputSchema:
 
 class ReadOp( TableOp ):
     """table_idn+resources resolved at construction (raises if missing, or
-    if its kind isn't one of 'local'/'sqlite'/'postgres' -- 'json_ptree' is
+    if its kind isn't one of 'local'/'sqlite'/'postgres'/'tsv' -- 'json_ptree' is
     silverflow.tableOps.ReadParametersOp's concern, not this). Trivial
     input (ignored -- _WiringEngine never dispatches a node with an empty
     declared source list); output is whatever the resolved resource holds."""

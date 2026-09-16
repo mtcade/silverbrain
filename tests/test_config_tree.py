@@ -278,8 +278,8 @@ threshold = 0.5
     )
     assert next_node_idx == 101  # one flat group -> one node_idx consumed
     # both rows in the group (the 'op_idn' leaf and 'threshold') share that
-    # one node_idx -- see _paramGroup_to_tree. node_idx is what distinguishes
-    # ops (no par_group column).
+    # one node_idx -- see ParameterParser.to_polars(). node_idx is what
+    # distinguishes ops (no par_group column).
     assert params[ 'node_idx' ].unique().to_list() == [ 100 ]
     assert op_ctor_kwargs_forest( params ) == { 'reader': { 'threshold': 0.5 } }
 
@@ -824,7 +824,7 @@ def test_cell_kind_resolves_via_cell_idn( tmp_path: Path ) -> None:
     _write( data_root / 'cells_index.toml', """\
 [[cells]]
 cell_idn = "child_cell"
-path     = "cells/child.toml"
+toml     = "cells/child.toml"
 """ )
     _write( data_root / 'cells' / 'child.toml', "[cell]\n" )
     _write( tmp_path / 'parent.toml', """\

@@ -7,7 +7,6 @@ import polars as pl
 import pytest
 
 from silverbrain.parameterParse import (
-    TABLE_OPS_PARAMETERS_GROUP,
     ParameterParser,
     op_ctor_kwargs_forest,
     parameter_group_to_tree,
@@ -29,21 +28,21 @@ def _make_parser() -> ParameterParser:
 
 def test_comment_key_ignored_in_tree_top_level() -> None:
     p = _make_parser()
-    df, _ = p.to_polars( { '_comment': 'top-level note', 'X': { 'a': 1 } } )
+    df, _ = p.to_polars( { '_comment': 'top-level note', 'a': 1 } )
     assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
 #/def test_comment_key_ignored_in_tree_top_level
 
 
-def test_comment_key_ignored_inside_param_group() -> None:
+def test_comment_key_ignored_inside_nested_group() -> None:
     p = _make_parser()
-    df, _ = p.to_polars( { 'X': { 'a': 1, '_comment': 'inline note' } } )
+    df, _ = p.to_polars( { '_or': [ { 'a': 1, '_comment': 'inline note' } ] } )
     assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
-#/def test_comment_key_ignored_inside_param_group
+#/def test_comment_key_ignored_inside_nested_group
 
 
 def test_comment_key_ignored_in_flat() -> None:
     p = _make_parser()
-    df, next_par_idx, _ = p.to_polars_flat( { 'X': { 'a': 1, '_comment': 'inline note' } } )
+    df, next_par_idx, _ = p.to_polars_flat( { 'a': 1, '_comment': 'inline note' } )
     assert next_par_idx == 1
     assert df[ 'par_name' ].drop_nulls().to_list() == [ 'a' ]
 #/def test_comment_key_ignored_in_flat
@@ -61,17 +60,17 @@ def test_comment_key_ignored_by_dtype_inference() -> None:
 
 def test_flat_dict_par_idx_unchanged() -> None:
     p  = _make_parser()
-    df, next_par_idx, _ = p.to_polars_flat( { 'X': { 'a': 1, 'b': 2 } } )
+    df, next_par_idx, _ = p.to_polars_flat( { 'a': 1, 'b': 2 } )
     assert sorted( df['par_idx'].unique().to_list() ) == [ 0 ]
     assert next_par_idx  == 1
 #/def test_flat_dict_par_idx_unchanged
 
 
 def test_or_par_idx_matches_pre_existing_numbering() -> None:
-    # One sibling par_group crossed with a 2-alternative _or: par_idx should
-    # be assigned exactly as before node_idx/parent_idx existed.
+    # A fixed sibling crossed with a 2-alternative _or: par_idx should be
+    # assigned exactly as before node_idx/parent_idx existed.
     p  = _make_parser()
-    d  = { 'X': { 'a': 1 }, '_or': [ { 'X': { 'b': 2 } }, { 'X': { 'b': 3 } } ] }
+    d  = { 'a': 1, '_or': [ { 'b': 2 }, { 'b': 3 } ] }
     df, next_par_idx, _ = p.to_polars_flat( d )
     assert sorted( df['par_idx'].unique().to_list() ) == [ 0, 1 ]
     assert next_par_idx == 2
@@ -86,41 +85,37 @@ def test_flat_or_directly_nested_in_or_does_not_raise() -> None:
     p = _make_parser()
     d = {
         '_or': [
-            { 'X': { 'a': 1 }, '_or': [ { 'X': { 'a': 2 } } ] },
+            { 'a': 1, '_or': [ { 'a': 2 } ] },
         ],
     }
     p.to_polars_flat( d )  # should not raise
 #/def test_flat_or_directly_nested_in_or_does_not_raise
 
 
-def test_or_nested_inside_par_group_does_not_raise() -> None:
+def test_or_nested_inside_content_does_not_raise() -> None:
     p = _make_parser()
     d = {
-        'X': {
-            'a': 1,
-            '_or': [
-                { '_or': [ { 'rho': 0.1 } ] },
-            ],
-        },
+        'a': 1,
+        '_or': [
+            { '_or': [ { 'rho': 0.1 } ] },
+        ],
     }
     p.to_polars_flat( d )  # should not raise
-#/def test_or_nested_inside_par_group_does_not_raise
+#/def test_or_nested_inside_content_does_not_raise
 
 
 # -- _and (flat)
 
 def test_flat_and_of_two_or_blocks_is_2x2_cross_product() -> None:
-    # {'X': {'_and': [{'_or': [{'a':1},{'a':2}]}, {'_or': [{'b':1},{'b':2}]}]}}
+    # {'_and': [{'_or': [{'a':1},{'a':2}]}, {'_or': [{'b':1},{'b':2}]}]}
     # -- two independent _or axes crossed via _and: 4 combinations, each with
     # exactly one 'a' value and one 'b' value.
     p = _make_parser()
     d = {
-        'X': {
-            '_and': [
-                { '_or': [ { 'a': 1 }, { 'a': 2 } ] },
-                { '_or': [ { 'b': 1 }, { 'b': 2 } ] },
-            ],
-        },
+        '_and': [
+            { '_or': [ { 'a': 1 }, { 'a': 2 } ] },
+            { '_or': [ { 'b': 1 }, { 'b': 2 } ] },
+        ],
     }
     df, next_par_idx, _ = p.to_polars_flat( d )
 
@@ -137,20 +132,20 @@ def test_flat_and_of_two_or_blocks_is_2x2_cross_product() -> None:
 #/def test_flat_and_of_two_or_blocks_is_2x2_cross_product
 
 
-def test_flat_top_level_or_bundles_multiple_domain_groups_together() -> None:
-    # Real-data shape: a fixed X plus a top-level _or bundling X's own
-    # override + a second domain group Xk, per alternative -- each flat
-    # combination must pair the RIGHT x_b with the RIGHT xk_b, not cross
-    # them independently. Domain groups no longer get a par_group label, so
-    # the two overrides need distinct par_names to stay distinguishable.
+def test_flat_or_alternative_bundles_multiple_par_names_together() -> None:
+    # A fixed 'a' plus an _or whose alternatives each carry TWO correlated
+    # par_names ('x_b'/'xk_b') as ordinary siblings in one dict -- no
+    # wrapper key needed, since siblings in the same dict already share one
+    # node_idx. Each flat combination must pair the RIGHT x_b with the
+    # RIGHT xk_b, not cross them independently.
     p = _make_parser()
     p.register( 'x_b',  pl.Int64 )
     p.register( 'xk_b', pl.Int64 )
     d = {
-        'X': { 'a': 1 },
+        'a': 1,
         '_or': [
-            { 'X': { 'x_b': 10 }, 'Xk': { 'xk_b': 20 } },
-            { 'X': { 'x_b': 11 }, 'Xk': { 'xk_b': 21 } },
+            { 'x_b': 10, 'xk_b': 20 },
+            { 'x_b': 11, 'xk_b': 21 },
         ],
     }
     df, next_par_idx, _ = p.to_polars_flat( d )
@@ -163,16 +158,16 @@ def test_flat_top_level_or_bundles_multiple_domain_groups_together() -> None:
         pairs.add( ( x_b, xk_b ) )
     # only the paired combinations from the same alternative -- never (10, 21) or (11, 20)
     assert pairs == { ( 10, 20 ), ( 11, 21 ) }
-#/def test_flat_top_level_or_bundles_multiple_domain_groups_together
+#/def test_flat_or_alternative_bundles_multiple_par_names_together
 
 
 # -- tree (to_polars/schema): _or, no duplication of shared content
 
 def test_tree_or_no_duplication_of_base_content() -> None:
-    # {'X': {'a': 1, '_or': [{'b': 2}, {'rho': 0.3}]}} -- 'a' must appear
-    # exactly once in the tree, unlike the flat cross-product view.
+    # {'a': 1, '_or': [{'b': 2}, {'rho': 0.3}]} -- 'a' must appear exactly
+    # once in the tree, unlike the flat cross-product view.
     p = _make_parser()
-    d = { 'X': { 'a': 1, '_or': [ { 'b': 2 }, { 'rho': 0.3 } ] } }
+    d = { 'a': 1, '_or': [ { 'b': 2 }, { 'rho': 0.3 } ] }
     df, next_node_idx = p.to_polars( d )
 
     a_rows = df.filter( pl.col( 'par_name' ) == 'a' )
@@ -204,10 +199,10 @@ def test_tree_schema_has_no_par_idx() -> None:
 # -- tree (to_polars/schema): _and, new capability
 
 def test_tree_and_siblings_attach_under_one_and_junction() -> None:
-    # {'X': {'_and': [{'a': 1}, {'b': 2}]}} -- both list items must attach as
+    # {'_and': [{'a': 1}, {'b': 2}]} -- both list items must attach as
     # AND-siblings under one '_and' junction node.
     p = _make_parser()
-    d = { 'X': { '_and': [ { 'a': 1 }, { 'b': 2 } ] } }
+    d = { '_and': [ { 'a': 1 }, { 'b': 2 } ] }
     df, _ = p.to_polars( d )
 
     and_junction = df.filter( pl.col( 'par_type' ) == '_and' )
@@ -222,17 +217,15 @@ def test_tree_and_siblings_attach_under_one_and_junction() -> None:
 
 
 def test_tree_and_of_two_or_blocks_cross_product_shape() -> None:
-    # {'X': {'_and': [{'_or': [{'a':1},{'a':2}]}, {'_or': [{'b':1},{'b':2}]}]}}
-    # -- two independent _or axes crossed via _and; no natural owning key
-    # needed for either axis.
+    # {'_and': [{'_or': [{'a':1},{'a':2}]}, {'_or': [{'b':1},{'b':2}]}]}
+    # -- two independent _or axes crossed via _and; no owning key needed for
+    # either axis.
     p = _make_parser()
     d = {
-        'X': {
-            '_and': [
-                { '_or': [ { 'a': 1 }, { 'a': 2 } ] },
-                { '_or': [ { 'b': 1 }, { 'b': 2 } ] },
-            ],
-        },
+        '_and': [
+            { '_or': [ { 'a': 1 }, { 'a': 2 } ] },
+            { '_or': [ { 'b': 1 }, { 'b': 2 } ] },
+        ],
     }
     df, _ = p.to_polars( d )
 
@@ -254,95 +247,43 @@ def test_tree_and_of_two_or_blocks_cross_product_shape() -> None:
 
 def test_tree_or_directly_nested_in_or_does_not_raise() -> None:
     p = _make_parser()
-    d = { '_or': [ { 'X': { 'a': 1 }, '_or': [ { 'X': { 'a': 2 } } ] } ] }
+    d = { '_or': [ { 'a': 1, '_or': [ { 'a': 2 } ] } ] }
     p.to_polars( d )  # should not raise -- explicit junction nodes compose freely
 #/def test_tree_or_directly_nested_in_or_does_not_raise
 
 
 def test_tree_and_directly_nested_in_or_does_not_raise() -> None:
     p = _make_parser()
-    d = { '_or': [ { 'X': { '_and': [ { 'a': 1 }, { 'b': 2 } ] } } ] }
+    d = { '_or': [ { '_and': [ { 'a': 1 }, { 'b': 2 } ] } ] }
     p.to_polars( d )  # should not raise
 #/def test_tree_and_directly_nested_in_or_does_not_raise
 
 
-# -- tree: top-level _or bundling multiple par_groups per alternative
+# -- reserved keys: _or and _and are never allowed as siblings in one dict
 
-def test_tree_top_level_or_bundles_multiple_par_groups() -> None:
+def test_or_and_and_as_siblings_raises() -> None:
+    # There is no case that genuinely needs both at once -- nest one inside
+    # the other instead (see module docstring's RESERVED KEYS section).
     p = _make_parser()
-    d = {
-        'X': { 'a': 1 },
-        '_or': [
-            { 'X': { 'b': 2 } },
-            { 'X': { 'rho': 0.5 } },
-        ],
-    }
-    df, _ = p.to_polars( d )
-
-    x_base = df.filter( pl.col( 'par_name' ) == 'a' )
-    assert x_base.shape[ 0 ] == 1  # base X content not duplicated
-
-    or_junction = df.filter( pl.col( 'par_type' ) == '_or' )
-    assert or_junction.shape[ 0 ] == 1
-    assert or_junction['parent_idx'][ 0 ] is None  # top-level _or has no owning domain group
-#/def test_tree_top_level_or_bundles_multiple_par_groups
+    d = { '_or': [ { 'a': 1 } ], '_and': [ { 'b': 2 } ] }
+    with pytest.raises( ValueError, match = "both '_or' and '_and'" ):
+        p.to_polars( d )
+#/def test_or_and_and_as_siblings_raises
 
 
-def test_tree_disambiguates_fixed_sibling_from_or_alternatives() -> None:
-    # The motivating ambiguous case: X's fixed content alongside Y's two _or
-    # alternatives, all logically "children of the root". node_idx/parent_idx
-    # alone couldn't tell these apart before par_type='_or' junctions existed.
+def test_or_and_and_as_siblings_raises_when_nested() -> None:
     p = _make_parser()
-    d = {
-        'X': { 'a': 1 },
-        '_or': [
-            { 'Y': { 'b': 2 } },
-            { 'Y': { 'rho': 0.5 } },
-        ],
-    }
-    df, _ = p.to_polars( d )
-
-    x_node = df.filter( pl.col( 'par_name' ) == 'a' )['node_idx'][ 0 ]
-    assert df.filter( pl.col( 'node_idx' ) == x_node )['parent_idx'][ 0 ] is None
-
-    or_node = df.filter( pl.col( 'par_type' ) == '_or' )['node_idx'][ 0 ]
-    assert df.filter( pl.col( 'node_idx' ) == or_node )['parent_idx'][ 0 ] is None
-    # X's node and the _or junction are siblings under the root, but only the
-    # _or junction's own children (each alternative's '_and' wrapper) are
-    # OR-related -- each wrapper bundles that alternative's own domain groups.
-    wrappers = df.filter( ( pl.col( 'par_type' ) == '_and' ) & ( pl.col( 'parent_idx' ) == or_node ) )
-    assert wrappers.shape[ 0 ] == 2
-    y_rows = df.filter( pl.col( 'par_name' ).is_in( [ 'b', 'rho' ] ) )
-    assert y_rows.shape[ 0 ] == 2
-    assert set( y_rows['parent_idx'].to_list() ) == set( wrappers['node_idx'].to_list() )
-#/def test_tree_disambiguates_fixed_sibling_from_or_alternatives
-
-
-def test_tree_matches_real_data_shape() -> None:
-    # Structural analogue of the synth_0 bundle shape: a fixed X, an Xk with
-    # its own _or, and a top-level _or bundling y+importances per alternative.
-    p = _make_parser()
-    d = {
-        'X':  { 'a': 1 },
-        'Xk': { '_or': [ { 'b': 2 }, { 'b': 3 } ] },
-        '_or': [
-            { 'X': { 'rho': 0.1 } },
-            { 'X': { 'rho': 0.2 } },
-        ],
-    }
-    df, _ = p.to_polars( d )
-
-    assert df.filter( pl.col( 'par_name' ) == 'a' ).shape[ 0 ] == 1
-    assert df.filter( pl.col( 'par_type' ) == '_or' ).shape[ 0 ] == 2  # Xk's + top-level
-    assert df.filter( pl.col( 'par_name' ) == 'rho' ).shape[ 0 ] == 2
-#/def test_tree_matches_real_data_shape
+    d = { '_or': [ { '_or': [ { 'a': 1 } ], '_and': [ { 'b': 2 } ] } ] }
+    with pytest.raises( ValueError, match = "both '_or' and '_and'" ):
+        p.to_polars( d )
+#/def test_or_and_and_as_siblings_raises_when_nested
 
 
 # -- repeat (constant/independent) on distribution-based random specs
 
 def test_repeat_row_defaults_to_constant() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0 } } }
+    d = { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0 } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'repeat' ) )
     assert row.shape[ 0 ] == 1
@@ -352,7 +293,7 @@ def test_repeat_row_defaults_to_constant() -> None:
 
 def test_repeat_row_reflects_explicit_independent() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'independent' } } }
+    d = { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'independent' } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'repeat' ) )
     assert row.shape[ 0 ] == 1
@@ -362,7 +303,7 @@ def test_repeat_row_reflects_explicit_independent() -> None:
 
 def test_repeat_invalid_value_raises() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'bogus' } } }
+    d = { 'rho': { 'distribution': 'uniform', 'min': 0.0, 'max': 1.0, 'repeat': 'bogus' } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_repeat_invalid_value_raises
@@ -370,7 +311,7 @@ def test_repeat_invalid_value_raises() -> None:
 
 def test_repeat_on_values_random_raises() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'values_random': [ 0.1, 0.2 ], 'repeat': 'independent' } } }
+    d = { 'rho': { 'values_random': [ 0.1, 0.2 ], 'repeat': 'independent' } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_repeat_on_values_random_raises
@@ -378,7 +319,7 @@ def test_repeat_on_values_random_raises() -> None:
 
 def test_repeat_on_step_search_raises() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'start': 0.1, 'step': 0.1, 'repeat': 'independent' } } }
+    d = { 'rho': { 'start': 0.1, 'step': 0.1, 'repeat': 'independent' } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_repeat_on_step_search_raises
@@ -388,7 +329,7 @@ def test_repeat_on_step_search_raises() -> None:
 
 def test_values_random_scalar_dtype_round_trips() -> None:
     p = _make_parser()
-    d = { 'X': { 'method': { 'values_random': [ 'a', 'b', 'c' ] } } }
+    d = { 'method': { 'values_random': [ 'a', 'b', 'c' ] } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'method' ) & ( pl.col( 'par_feature' ) == 'value' ) )
     assert row.shape[ 0 ] == 1
@@ -399,7 +340,7 @@ def test_values_random_scalar_dtype_round_trips() -> None:
 
 def test_values_search_scalar_dtype_round_trips() -> None:
     p = _make_parser()
-    d = { 'X': { 'method': { 'values_search': [ 'a', 'b', 'c' ] } } }
+    d = { 'method': { 'values_search': [ 'a', 'b', 'c' ] } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'method' ) & ( pl.col( 'par_feature' ) == 'value' ) )
     assert row.shape[ 0 ] == 1
@@ -411,7 +352,7 @@ def test_values_search_scalar_dtype_round_trips() -> None:
 def test_values_random_list_dtype_round_trips() -> None:
     p = _make_parser()
     p.register( 'modes_magnitude', pl.List( pl.Float64 ) )
-    d = { 'X': { 'modes_magnitude': { 'values_random': [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } } }
+    d = { 'modes_magnitude': { 'values_random': [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'modes_magnitude' ) & ( pl.col( 'par_feature' ) == 'value' ) )
     assert row.shape[ 0 ] == 1
@@ -430,7 +371,7 @@ def test_register_list_dtype_twice_adds_one_wrapped_column() -> None:
 
 def test_values_random_casts_int_to_float() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'values_random': [ 1, 2, 3 ] } } }
+    d = { 'rho': { 'values_random': [ 1, 2, 3 ] } }
     df, _ = p.to_polars( d )
     row = df.filter( ( pl.col( 'par_name' ) == 'rho' ) & ( pl.col( 'par_feature' ) == 'value' ) )
     assert list( row[ 'par_val_list_float64' ][ 0 ] ) == [ 1.0, 2.0, 3.0 ]
@@ -439,7 +380,7 @@ def test_values_random_casts_int_to_float() -> None:
 
 def test_values_random_rejects_wrong_type() -> None:
     p = _make_parser()
-    d = { 'X': { 'a': { 'values_random': [ 'x', 'y' ] } } }
+    d = { 'a': { 'values_random': [ 'x', 'y' ] } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_values_random_rejects_wrong_type
@@ -447,7 +388,7 @@ def test_values_random_rejects_wrong_type() -> None:
 
 def test_values_random_rejects_lossy_float() -> None:
     p = _make_parser()
-    d = { 'X': { 'a': { 'values_random': [ 1.5 ] } } }
+    d = { 'a': { 'values_random': [ 1.5 ] } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_values_random_rejects_lossy_float
@@ -455,7 +396,7 @@ def test_values_random_rejects_lossy_float() -> None:
 
 def test_values_random_rejects_empty_list() -> None:
     p = _make_parser()
-    d = { 'X': { 'rho': { 'values_random': [] } } }
+    d = { 'rho': { 'values_random': [] } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_values_random_rejects_empty_list
@@ -464,7 +405,7 @@ def test_values_random_rejects_empty_list() -> None:
 def test_values_random_unsupported_dtype_raises() -> None:
     p = _make_parser()
     p.register( 'standardize_y', pl.Boolean )
-    d = { 'X': { 'standardize_y': { 'values_random': [ True, False ] } } }
+    d = { 'standardize_y': { 'values_random': [ True, False ] } }
     with pytest.raises( ValueError ):
         p.to_polars( d )
 #/def test_values_random_unsupported_dtype_raises
@@ -489,24 +430,19 @@ def test_op_ctor_kwargs_forest_empty_forest_returns_empty_dict() -> None:
 
 def test_op_ctor_kwargs_forest_extracts_one_op() -> None:
     p = _op_params_parser()
-    tree, _ = p.to_polars(
-        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5, 'label': 'x' } },
-    )
+    tree, _ = p.to_polars( { 'op_idn': 'reader', 'threshold': 0.5, 'label': 'x' } )
     assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.5, 'label': 'x' } }
 #/def test_op_ctor_kwargs_forest_extracts_one_op
 
 
 def test_op_ctor_kwargs_forest_extracts_multiple_ops_via_threaded_node_idx() -> None:
-    # Every parameterized op is told apart by node_idx (no par_group column
-    # any more) -- so node_idx must actually be threaded (node_idx_start in,
-    # next returned out) across sibling calls, same as configTree.py does
-    # across [[parameters]] entries.
+    # Every parameterized op is told apart by node_idx -- so node_idx must
+    # actually be threaded (node_idx_start in, next returned out) across
+    # sibling calls, same as configTree.py does across [[parameters]] entries.
     p = _op_params_parser()
-    tree_a, next_idx = p.to_polars(
-        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } },
-    )
+    tree_a, next_idx = p.to_polars( { 'op_idn': 'reader', 'threshold': 0.5 } )
     tree_b, _ = p.to_polars(
-        { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'writer', 'label': 'out' } },
+        { 'op_idn': 'writer', 'label': 'out' },
         node_idx_start = next_idx,
     )
     forest = pl.concat( [ tree_a, tree_b ], how = 'vertical' )
@@ -522,8 +458,8 @@ def test_op_ctor_kwargs_forest_rejects_colliding_node_idx_across_ops() -> None:
     # ambiguous -- raise rather than silently merging/misattributing kwargs
     # between them.
     p = _op_params_parser()
-    tree_a, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'reader', 'threshold': 0.5 } } )
-    tree_b, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'op_idn': 'writer', 'label': 'out' } } )
+    tree_a, _ = p.to_polars( { 'op_idn': 'reader', 'threshold': 0.5 } )
+    tree_b, _ = p.to_polars( { 'op_idn': 'writer', 'label': 'out' } )
     forest = pl.concat( [ tree_a, tree_b ], how = 'vertical' )
     with pytest.raises( ValueError, match = 'multiple .*op_idn' ):
         op_ctor_kwargs_forest( forest )
@@ -536,32 +472,18 @@ def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling() -> None:
     # search), not something build_tableOps() can turn into a kwarg.
     p = _op_params_parser()
     tree, _ = p.to_polars( {
-        TABLE_OPS_PARAMETERS_GROUP: {
-            'op_idn': 'reader', 'threshold': { 'values_search': [ 0.1, 0.5 ] },
-        },
+        'op_idn': 'reader', 'threshold': { 'values_search': [ 0.1, 0.5 ] },
     } )
     with pytest.raises( ValueError, match = 'only fixed values are supported' ):
         op_ctor_kwargs_forest( tree )
 #/def test_op_ctor_kwargs_forest_rejects_non_fixed_sibling
 
 
-def test_op_ctor_kwargs_forest_ignores_top_level_key_choice() -> None:
-    # The top-level dict key passed to to_polars() (TABLE_OPS_PARAMETERS_GROUP
-    # or anything else) is purely an input-organization convenience -- never
-    # written to the output -- so op_ctor_kwargs_forest reads the same result
-    # regardless of what key wraps the op's own root.
-    p = _op_params_parser()
-    tree, _ = p.to_polars( { 'unrelated': { 'op_idn': 'reader', 'threshold': 0.9 } } )
-    assert op_ctor_kwargs_forest( tree ) == { 'reader': { 'threshold': 0.9 } }
-#/def test_op_ctor_kwargs_forest_ignores_top_level_key_choice
-
-
 def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf() -> None:
-    # Within TABLE_OPS_PARAMETERS_GROUP, a node with no 'op_idn' leaf isn't
-    # a TableOp parameter node -- forward-looking, not exercised by any
-    # producer today.
+    # A root node with no 'op_idn' leaf isn't a TableOp parameter node --
+    # forward-looking, not exercised by any producer today.
     p = _op_params_parser()
-    tree, _ = p.to_polars( { TABLE_OPS_PARAMETERS_GROUP: { 'threshold': 0.9 } } )
+    tree, _ = p.to_polars( { 'threshold': 0.9 } )
     assert op_ctor_kwargs_forest( tree ) == {}
 #/def test_op_ctor_kwargs_forest_ignores_node_with_no_op_idn_leaf
 
@@ -571,10 +493,8 @@ def test_op_ctor_kwargs_forest_rejects_nested_or_and() -> None:
     # alternatives -- reject rather than guess.
     p = _op_params_parser()
     tree, _ = p.to_polars( {
-        TABLE_OPS_PARAMETERS_GROUP: {
-            'op_idn': 'reader',
-            '_or': [ { 'threshold': 0.1 }, { 'threshold': 0.5 } ],
-        },
+        'op_idn': 'reader',
+        '_or': [ { 'threshold': 0.1 }, { 'threshold': 0.5 } ],
     } )
     with pytest.raises( ValueError, match = 'nested _or/_and structure' ):
         op_ctor_kwargs_forest( tree )
@@ -619,6 +539,66 @@ def test_parameter_group_to_tree_supports_values_search_dtype_inference() -> Non
     with pytest.raises( ValueError, match = 'only fixed values are supported' ):
         op_ctor_kwargs_forest( tree )  # parses fine; rejected only at extraction
 #/def test_parameter_group_to_tree_supports_values_search_dtype_inference
+
+
+# -- subtree() (the downward counterpart to leaf_paths()'s branch-to-root walk)
+
+def test_subtree_at_or_junction_returns_junction_plus_both_alternatives() -> None:
+    p = _make_parser()
+    d = { 'a': 1, '_or': [ { 'b': 2 }, { 'rho': 0.5 } ] }
+    df, _ = p.to_polars( d )
+
+    or_node = df.filter( pl.col( 'par_type' ) == '_or' )[ 'node_idx' ][ 0 ]
+    sub = p.subtree( df, or_node )
+
+    # the 'a' content node (a sibling of the _or junction, not a
+    # descendant) must NOT be included
+    assert 'a' not in sub[ 'par_name' ].drop_nulls().to_list()
+    assert set( sub[ 'par_name' ].drop_nulls().to_list() ) == { 'b', 'rho' }
+    assert sub.filter( pl.col( 'par_type' ) == '_or' ).shape[ 0 ] == 1
+#/def test_subtree_at_or_junction_returns_junction_plus_both_alternatives
+
+
+def test_subtree_at_leaf_node_returns_only_that_row() -> None:
+    p = _make_parser()
+    d = { 'a': 1, '_or': [ { 'b': 2 }, { 'rho': 0.5 } ] }
+    df, _ = p.to_polars( d )
+
+    b_node = df.filter( pl.col( 'par_name' ) == 'b' )[ 'node_idx' ][ 0 ]
+    sub = p.subtree( df, b_node )
+    assert sub[ 'par_name' ].drop_nulls().to_list() == [ 'b' ]
+#/def test_subtree_at_leaf_node_returns_only_that_row
+
+
+def test_subtree_at_root_returns_whole_tree() -> None:
+    p = _make_parser()
+    d = { 'a': 1, '_or': [ { 'b': 2 }, { 'rho': 0.5 } ] }
+    df, _ = p.to_polars( d )
+
+    root_node = df.filter( pl.col( 'par_name' ) == 'a' )[ 'node_idx' ][ 0 ]
+    sub = p.subtree( df, root_node )
+    assert sub.shape[ 0 ] == df.shape[ 0 ]
+#/def test_subtree_at_root_returns_whole_tree
+
+
+def test_subtree_nested_and_within_or_returns_and_and_its_children_only() -> None:
+    p = _make_parser()
+    d = { '_or': [ { '_and': [ { 'a': 1 }, { 'b': 2 } ] }, { 'rho': 0.5 } ] }
+    df, _ = p.to_polars( d )
+
+    and_node = df.filter( pl.col( 'par_type' ) == '_and' )[ 'node_idx' ][ 0 ]
+    sub = p.subtree( df, and_node )
+    assert set( sub[ 'par_name' ].drop_nulls().to_list() ) == { 'a', 'b' }
+    assert 'rho' not in sub[ 'par_name' ].drop_nulls().to_list()
+#/def test_subtree_nested_and_within_or_returns_and_and_its_children_only
+
+
+def test_subtree_missing_node_idx_raises_keyerror() -> None:
+    p = _make_parser()
+    df, _ = p.to_polars( { 'a': 1 } )
+    with pytest.raises( KeyError ):
+        p.subtree( df, 999 )
+#/def test_subtree_missing_node_idx_raises_keyerror
 
 
 # -- schema.table_schemas['parameter_tree'] consolidation (schema.py is
