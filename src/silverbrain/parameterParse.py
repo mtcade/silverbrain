@@ -76,7 +76,7 @@ inference); its value is never inspected.
 import polars as pl
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Type
+from typing import Any, Literal, Sequence, Type
 from typing_extensions import TypedDict, NotRequired, Self
 
 from .schema import (
@@ -676,6 +676,17 @@ class ParameterParser:
             raise KeyError( f"node_idx={node_idx!r} not present in tree_df" )
 
         children, _ = self._tree_children_maps( tree_df )
+        keep = self._subtree_node_idxs( node_idx, children )
+        return tree_df.filter( pl.col( 'node_idx' ).is_in( list( keep ) ) )
+    #/def subtree
+
+    def _subtree_node_idxs(
+        self, node_idx: int, children: dict[ int | None, list[ int ] ],
+    ) -> set[ int ]:
+        """node_idx plus every descendant's own node_idx (the set subtree()
+        itself filters tree_df down to) -- split out so branch() can reuse
+        the exact same downward walk without re-deriving `children` or
+        re-filtering tree_df a second time."""
         keep: set[ int ] = set()
         frontier = [ node_idx ]
         while frontier:
@@ -684,9 +695,132 @@ class ParameterParser:
                 continue
             keep.add( n )
             frontier.extend( children.get( n, [] ) )
+        return keep
+    #/def _subtree_node_idxs
 
+    @staticmethod
+    def _content_value( row: dict[ str, Any ] ) -> Any:
+        """The single non-null par_val_* value on one to_polars() row, or
+        None if it's a junction row ('_or'/'_and', no par_name/value at
+        all) -- same "whichever par_val_* column is set" pattern
+        silverflow.tableOps._search_scalar uses for a single reserved
+        par_name, generalized here to an arbitrary row."""
+        for k, v in row.items():
+            if k.startswith( 'par_val_' ) and v is not None:
+                return v
+        return None
+    #/def _content_value
+
+    def branch( self, tree_df: pl.DataFrame, path: Sequence[ tuple[ str, Any ] ] ) -> pl.DataFrame:
+        """
+        Walk `path` -- an ordered sequence of (par_name, value) pairs --
+        down from tree_df's true root, at each step descending into the
+        nearest descendant node (crossing through any intervening
+        '_or'/'_and' junction node transparently -- e.g. par_group=
+        'actor' -> actor_type='plant' passes through an '_or' junction
+        node with no par_name/value of its own) whose own content rows
+        include that exact (par_name, value) pair, then narrowing the
+        search to JUST that node's own children before matching the next
+        path element (so a value re-used under a different branch, e.g.
+        the same par_name appearing under both 'plant' and 'sentient',
+        can never be matched from the wrong branch). Returns the UNION of:
+
+          - every node's own content rows along that root-to-match path
+            (so a value declared at an ANCESTOR level -- e.g. one shared
+            across every species below it, like 'global_health_decay' one
+            level above every species_idn -- is included alongside the
+            specific match), and
+          - subtree(tree_df, matched_node_idx) for the LAST path
+            element's own match (so values nested further below the
+            final match -- e.g. everything under one specific species_idn
+            -- are included too).
+
+        The third primitive alongside subtree() (walks down from an
+        already-known node_idx) and leaf_paths() (enumerates every fully-
+        expanded leaf's own root-to-leaf '_or' trail) -- this is for "give
+        me the one branch matching this specific chain of labels" without
+        already knowing its node_idx, e.g.
+        `branch(tree_df, [('par_group','actor'), ('actor_type','plant'),
+        ('species_idn','grass_0')])`.
+
+        Idempotent: `branch(branch(tree_df, path), path) == branch(tree_df,
+        path)` (identical rows, same node_idx/parent_idx) -- the result
+        already contains every row `path` could ever match again (the
+        full ancestor chain up to path[0]'s own match, plus everything
+        `path`'s last match's own subtree holds), at the same node_idx
+        values, so re-applying the identical path to its own output finds
+        the same nodes and changes nothing. An empty `path` returns
+        `tree_df` unchanged (there is nothing to narrow by).
+
+        Raises KeyError, naming the failing (par_name, value) pair and
+        how much of `path` matched before it, if any step matches no
+        node reachable from the previous one (or from the true root, for
+        path's own first element).
+        """
+        if not path:
+            return tree_df
+
+        children, _ = self._tree_children_maps( tree_df )
+        parent_of: dict[ int, int | None ] = {
+            row[ 'node_idx' ]: row[ 'parent_idx' ]
+            for row in tree_df.select( [ 'node_idx', 'parent_idx' ] ).unique( subset = [ 'node_idx' ] ).iter_rows( named = True )
+        }
+
+        matched: int | None = None
+        frontier = children.get( None, [] )
+        for step_idx, ( par_name, value ) in enumerate( path ):
+            found = self._find_descendant( tree_df, children, frontier, par_name, value )
+            if found is None:
+                raise KeyError(
+                    f"branch(): no node found for path[{step_idx}]=({par_name!r}, {value!r}) "
+                    f"-- matched {list( path[ :step_idx ] )!r} so far"
+                )
+            matched = found
+            frontier = children.get( found, [] )
+        #/for step_idx, ( par_name, value ) in enumerate( path )
+
+        ancestor_idxs: set[ int ] = set()
+        n: int | None = matched
+        while n is not None:
+            ancestor_idxs.add( n )
+            n = parent_of.get( n )
+        #/while n is not None
+
+        keep = ancestor_idxs | self._subtree_node_idxs( matched, children )
         return tree_df.filter( pl.col( 'node_idx' ).is_in( list( keep ) ) )
-    #/def subtree
+    #/def branch
+
+    def _find_descendant(
+        self,
+        tree_df:  pl.DataFrame,
+        children: dict[ int | None, list[ int ] ],
+        frontier: list[ int ],
+        par_name: str,
+        value:    Any,
+    ) -> int | None:
+        """Nearest node_idx reachable from `frontier` (breadth-first,
+        descending through children -- including pure junction nodes,
+        which carry no par_name/value of their own to match) that has a
+        content row with par_name == `par_name` and that row's own
+        (whichever par_val_* is set) value == `value`. None if no such
+        node is reachable at all."""
+        seen:  set[ int ] = set()
+        queue: list[ int ] = list( frontier )
+        while queue:
+            n = queue.pop( 0 )
+            if n in seen:
+                continue
+            seen.add( n )
+            rows = tree_df.filter( ( pl.col( 'node_idx' ) == n ) & ( pl.col( 'par_name' ) == par_name ) )
+            for row in rows.iter_rows( named = True ):
+                if self._content_value( row ) == value:
+                    return n
+                #/if self._content_value( row ) == value
+            #/for row in rows.iter_rows( named = True )
+            queue.extend( children.get( n, [] ) )
+        #/while queue
+        return None
+    #/def _find_descendant
 
     def _expand_tree_to_flat(
         self, tree_df: pl.DataFrame, par_idx_start: int = 0,

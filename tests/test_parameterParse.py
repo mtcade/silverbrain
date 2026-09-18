@@ -601,6 +601,126 @@ def test_subtree_missing_node_idx_raises_keyerror() -> None:
 #/def test_subtree_missing_node_idx_raises_keyerror
 
 
+# -- branch() (the third primitive alongside subtree()/leaf_paths(): find
+# the one node matching an ordered chain of (par_name, value) pairs,
+# walking through '_or'/'_and' junctions transparently, and return every
+# ancestor's own content plus that match's own subtree())
+
+def _species_tree_parser() -> ParameterParser:
+    p = _make_parser()
+    p.register( 'actor_type',  pl.Utf8 )
+    p.register( 'species_idn', pl.Utf8 )
+    return p
+#/def _species_tree_parser
+
+# Mirrors duckpond's own world_0.json shape closely enough to exercise the
+# same 'par_group=\"actor\" -> actor_type=\"plant\" -> species_idn=\"grass_0\"'
+# walk through two levels of '_or' junction, plus a value ('a') shared by
+# every branch and one ('b') shared by every plant species specifically.
+_SPECIES_TREE_DICT = {
+    'a': 1,
+    '_or': [
+        {
+            'actor_type': 'plant', 'b': 2,
+            '_or': [
+                { 'species_idn': 'grass_0', 'rho': 0.1 },
+                { 'species_idn': 'berry_0', 'rho': 0.2 },
+            ],
+        },
+        { 'actor_type': 'sentient' },
+    ],
+}
+
+def test_branch_walks_through_or_junctions_and_includes_ancestor_content() -> None:
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+
+    result = p.branch( df, [ ( 'actor_type', 'plant' ), ( 'species_idn', 'grass_0' ) ] )
+
+    assert set( result[ 'par_name' ].drop_nulls().to_list() ) == { 'a', 'actor_type', 'b', 'species_idn', 'rho' }
+    rho_row = result.filter( pl.col( 'par_name' ) == 'rho' ).row( 0, named = True )
+    assert ParameterParser._content_value( rho_row ) == 0.1
+#/def test_branch_walks_through_or_junctions_and_includes_ancestor_content
+
+
+def test_branch_excludes_sibling_branches() -> None:
+    """berry_0's own 'rho' (a different node_idx sharing the same
+    par_name) and sentient's own 'actor_type'='sentient' row must not
+    leak into grass_0's own branch."""
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+
+    result = p.branch( df, [ ( 'actor_type', 'plant' ), ( 'species_idn', 'grass_0' ) ] )
+
+    rho_values = { ParameterParser._content_value( r ) for r in result.filter( pl.col( 'par_name' ) == 'rho' ).iter_rows( named = True ) }
+    assert rho_values == { 0.1 }
+    actor_type_values = { ParameterParser._content_value( r ) for r in result.filter( pl.col( 'par_name' ) == 'actor_type' ).iter_rows( named = True ) }
+    assert actor_type_values == { 'plant' }
+#/def test_branch_excludes_sibling_branches
+
+
+def test_branch_includes_full_subtree_below_final_match() -> None:
+    """A species_idn block with further nesting below it (unlike
+    grass_0/berry_0 above, which are leaves) -- every descendant comes
+    along, same as subtree() would give directly."""
+    p = _species_tree_parser()
+    p.register( 'variant', pl.Utf8 )
+    d = {
+        '_or': [
+            {
+                'species_idn': 'grass_0',
+                '_and': [ { 'variant': 'tall' }, { 'variant': 'short' } ],
+            },
+        ],
+    }
+    df, _ = p.to_polars( d )
+
+    result = p.branch( df, [ ( 'species_idn', 'grass_0' ) ] )
+    assert sorted(
+        ParameterParser._content_value( r )
+        for r in result.filter( pl.col( 'par_name' ) == 'variant' ).iter_rows( named = True )
+    ) == [ 'short', 'tall' ]
+#/def test_branch_includes_full_subtree_below_final_match
+
+
+def test_branch_is_idempotent() -> None:
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+    path = [ ( 'actor_type', 'plant' ), ( 'species_idn', 'grass_0' ) ]
+
+    once  = p.branch( df, path )
+    twice = p.branch( once, path )
+
+    assert once.equals( twice )
+#/def test_branch_is_idempotent
+
+
+def test_branch_empty_path_returns_whole_tree() -> None:
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+    assert p.branch( df, [] ).equals( df )
+#/def test_branch_empty_path_returns_whole_tree
+
+
+def test_branch_raises_keyerror_for_unmatched_step() -> None:
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+    with pytest.raises( KeyError, match = 'mineral_0' ):
+        p.branch( df, [ ( 'actor_type', 'plant' ), ( 'species_idn', 'mineral_0' ) ] )
+#/def test_branch_raises_keyerror_for_unmatched_step
+
+
+def test_branch_does_not_search_across_unrelated_branch() -> None:
+    """species_idn only exists under the 'plant' branch -- starting the
+    path at 'actor_type'='sentient' must not find it by searching outside
+    that branch."""
+    p = _species_tree_parser()
+    df, _ = p.to_polars( _SPECIES_TREE_DICT )
+    with pytest.raises( KeyError ):
+        p.branch( df, [ ( 'actor_type', 'sentient' ), ( 'species_idn', 'grass_0' ) ] )
+#/def test_branch_does_not_search_across_unrelated_branch
+
+
 # -- schema.table_schemas['parameter_tree'] consolidation (schema.py is
 # now the single source of truth -- par_type/.../node_idx/parent_idx/
 # par_val_* naming was previously hand-duplicated here)
