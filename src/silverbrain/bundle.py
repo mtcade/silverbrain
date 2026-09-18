@@ -9,6 +9,8 @@ from typing import Any
 
 from platformdirs import PlatformDirs
 
+from .utilities import apply_template_vars
+
 CELLS_INDEX_FILE_DEFAULT:  Path = Path('cells_index.toml')
 BUNDLE_INDEX_FILE_DEFAULT: Path = Path('bundle_index.toml')
 BUNDLE_TOML_DEFAULT:       Path = Path('bundle.toml')
@@ -492,19 +494,91 @@ def register_bundle(
 
 def _template_vars(
     bundle_root:              Path,
+    app_name:                 str,
     fallback_data_roots:      dict[ str, Path ] | None = None,
     ) -> dict[ str, str ]:
-    """{bundle_root}, plus one {name} entry per fallback_data_roots key
-    (e.g. {impl_data_root}/{silverflow_data_root}) -- for cell TOML files
-    loaded via cell_from_bundle()/resolve_cell_fp(). bundle_root is
-    whatever resolve_bundle() already resolved (convention or explicit
-    override) -- this function no longer recomputes it itself."""
-    tvars: dict[ str, str ] = { 'bundle_root': str( bundle_root ) }
+    """{bundle_root}/{app_root}, plus one {name} entry per
+    fallback_data_roots key (e.g. {impl_data_root}/{silverflow_data_root})
+    -- for cell TOML files loaded via cell_from_bundle()/resolve_cell_fp().
+    bundle_root is whatever resolve_bundle() already resolved (convention
+    or explicit override) -- this function no longer recomputes it itself.
+
+    {app_root} is the platformdirs top-level root itself (PlatformDirs(
+    app_name).user_data_path -- the same directory bundle_index.toml/
+    cells_index.toml/every bundles/<name>/, settings/<name>/ live directly
+    under). {bundle_root}/{app_root} are deliberately the ONLY bundle-
+    layout shorthand offered here -- no {settings_root}/{data_root}-style
+    var whose target could silently depend on some other key elsewhere in
+    the same file. A bundle.toml spells out explicitly which OTHER
+    bundle's settings tree it means when reusing one (e.g.
+    "{app_root}/settings/train_0/..."), while {bundle_root} is what a
+    reusable CELL file (not bundle.toml) uses for its own on-disk state
+    that should resolve differently per bundle that loads it -- e.g.
+    silverflow's randomSampler_0.toml points its own best-so-far cache at
+    "{bundle_root}/data/search_state.db" -- since every bundle_root now has
+    its own data/ dir directly underneath it (BundleDirs.data), that
+    resolves correctly with no bundle.toml override needed at all."""
+    tvars: dict[ str, str ] = {
+        'bundle_root': str( bundle_root ),
+        'app_root':    str( PlatformDirs( app_name ).user_data_path ),
+    }
     for name, root in ( fallback_data_roots or {} ).items():
         tvars[ name ] = str( Path( root ) )
     #/for name, root in ( fallback_data_roots or {} ).items()
     return tvars
 #/def _template_vars
+
+
+def _bundle_cell_link(
+    bundle_data:         dict[ str, Any ],
+    bundle_toml_fp:      Path,
+    app_name:            str,
+    fallback_data_roots: dict[ str, Path ] | None,
+    cells_index_file:    Path,
+    template_vars:       dict[ str, str ],
+    ) -> tuple[ Path, str ]:
+    """
+    Resolve a bundle.toml's own [cell] table -- the LINKED cell this bundle
+    wraps -- to (cell_fp, main_id). Exactly one of:
+
+        [cell]
+        toml = "path/to/cell.toml"   # resolved relative to bundle.toml's
+                                       # own directory, same {key} template-
+                                       # var substitution a kind='cell'
+                                       # [[nodes]] entry's own 'toml' gets
+        # ... or:
+        [cell]
+        cell_idn = "some-cell-idn"    # resolved via resolve_cell_fp(),
+                                       # same as a kind='cell' [[nodes]]
+                                       # entry using 'cell_idn' instead of
+                                       # 'toml'
+
+    is required -- same has-exactly-one-of grammar
+    configTree._config_tree_from_data's own kind='cell' [[nodes]] entries
+    already enforce, reused here since a bundle.toml's [cell] table plays
+    the identical role for its own single linked cell. main_id is cell_idn
+    when given, else the toml path's own stem (e.g. 'train_0.toml' ->
+    'train_0') -- this becomes the linked cell's own root node_idn/abs_path,
+    exactly as if bundle.toml's variables.resources/variables.actors
+    entries had been declared inside the linked cell's own file (see
+    cell_from_bundle).
+    """
+    cell_header  = bundle_data.get( 'cell', {} )
+    has_toml     = 'toml' in cell_header
+    has_cell_idn = 'cell_idn' in cell_header
+    if has_toml == has_cell_idn:
+        raise ValueError(
+            f"bundle.toml at {bundle_toml_fp!r} must declare exactly one of "
+            f"[cell].toml or [cell].cell_idn -- the linked cell this bundle wraps"
+        )
+    if has_cell_idn:
+        cell_idn = cell_header[ 'cell_idn' ]
+        cell_fp  = resolve_cell_fp( cell_idn, app_name, fallback_data_roots, cells_index_file )
+        return cell_fp, cell_idn
+    toml_ref = cell_header[ 'toml' ]
+    cell_fp  = ( bundle_toml_fp.parent / apply_template_vars( toml_ref, template_vars ) ).resolve()
+    return cell_fp, Path( toml_ref ).stem
+#/def _bundle_cell_link
 
 
 def cell_from_bundle(
@@ -514,44 +588,70 @@ def cell_from_bundle(
     fallback_data_roots:     dict[ str, Path ] | None = None,
     cells_index_file:        Path = CELLS_INDEX_FILE_DEFAULT,
     bundle_index_file:       Path = BUNDLE_INDEX_FILE_DEFAULT,
+    bundle_toml_file:        Path = BUNDLE_TOML_DEFAULT,
     rng                           = None,
     verbose:                 int  = 0,
     resources                     = None,
     ):
     """
-    Load the top-level Cell for a registered bundle_name: resolve_bundle()
-    finds its {bundle_root, cell_idn} via bundle_index.toml, then
-    resolve_cell_fp() finds that cell_idn's actual file via cells_index.toml
-    (platformdirs, then fallback_data_roots) -- bundle_root/resources
-    resolution happens exactly once, here, at the top; every nested
-    kind='cell' [[nodes]] reference (library cells, sub-components) reuses
-    these same template_vars unchanged (see configTree.py) -- they're
-    never re-resolved per nested cell_idn, by design (a nested cell is
-    never itself "a bundle"). resources (a table_index-shaped resource
-    manifest, see ReadWriteOps.py) is forwarded to cell_from_file as the
-    ROOT cell's own caller-override -- merged there (caller-wins) against
-    the root cell's own declared [resources] TOML defaults; NOT
-    automatically visible to any nested kind='cell' child unless that
-    child's own instantiation site declares a [nodes.resources] override
-    in TOML (see cell.py's cell_from_file/configTree.py's
-    [resources]/[nodes.resources]). Callers typically load it via
-    ReadWriteOps.load_resources() against this same bundle's resolved
-    bundle_root/resources.json before calling this.
+    Load the top-level Cell for a registered bundle_name.
+
+    Resolution: resolve_bundle() finds this bundle's bundle_root via
+    bundle_index.toml; {bundle_root}/bundle_toml_file (default
+    'bundle.toml') is then read for its own [cell] table -- naming the
+    LINKED cell this bundle wraps, resolved exactly like an ordinary
+    kind='cell' [[nodes]] entry (one of 'toml' or 'cell_idn' -- see
+    _bundle_cell_link()) -- plus whatever [[variables.resources]]/
+    [[variables.actors]] entries it declares (configTree.
+    bundle_variable_declarations()), applied against the linked cell's own
+    subtree with declarer_depth=-1: senior to any declaration the linked
+    cell (or any node inside it) makes for itself, since bundle.toml sits
+    entirely outside that cell's own config_tree() call (see that
+    function's own docstring). A bundle.toml is NOT parsed as an ordinary
+    cell TOML -- it has no [[nodes]]/[[parameters]] of its own; its only
+    two responsibilities are naming the linked cell and supplying
+    bindings for it/its descendants from outside its file entirely.
+
+    The linked cell's own file may itself declare kind='cell' children
+    (via 'toml' or 'cell_idn', same resolution machinery) and its own
+    [[variables.actors]] grafts/bindings, same as any other cell TOML --
+    see configTree.py's module docstring.
+
+    resources (a table_index-shaped resource manifest, see ReadWriteOps.py)
+    is forwarded to cell_from_file as an even-more-senior override still --
+    see that function's own `resources` param docstring. Callers typically
+    load it via ReadWriteOps.load_resources() against this same bundle's
+    resolved bundle_root/resources.json before calling this.
 
     app_name=None (the default) auto-discovers -- see resolve_cell_fp --
     resolved exactly once here, then passed down as a concrete value to
     resolve_bundle()/resolve_cell_fp() (which never re-discover once
     given a real app_name)."""
+    from . import configTree
     from .cell import cell_from_file
 
     app_name, fallback_data_roots = _resolve_app_config( app_name, fallback_data_roots )
-    entry         = resolve_bundle( bundle_name, app_name, bundle_index_file )
-    cell_fp       = resolve_cell_fp( entry.cell_idn, app_name, fallback_data_roots, cells_index_file )
-    template_vars = _template_vars( entry.bundle_root, fallback_data_roots )
+    entry          = resolve_bundle( bundle_name, app_name, bundle_index_file )
+    bundle_toml_fp = entry.bundle_root / bundle_toml_file
+    if not bundle_toml_fp.exists():
+        raise FileNotFoundError(
+            f"{bundle_toml_file!r} not found for bundle {bundle_name!r} at {bundle_toml_fp}"
+        )
+
+    with open( bundle_toml_fp, 'rb' ) as f:
+        bundle_data = tomllib.load( f )
+
+    template_vars = _template_vars( entry.bundle_root, app_name, fallback_data_roots )
+    cell_fp, main_id = _bundle_cell_link(
+        bundle_data, bundle_toml_fp, app_name, fallback_data_roots, cells_index_file, template_vars,
+    )
+    extra_declarations = configTree.bundle_variable_declarations(
+        bundle_data, main_id, bundle_toml_fp.parent, template_vars,
+    )
     return cell_from_file(
         path                = cell_fp,
         op_classes          = op_classes,
-        main_id             = entry.cell_idn,
+        main_id             = main_id,
         rng                 = rng,
         verbose             = verbose,
         template_vars       = template_vars,
@@ -559,6 +659,7 @@ def cell_from_bundle(
         fallback_data_roots = fallback_data_roots,
         cells_index_file    = cells_index_file,
         resources           = resources,
+        extra_declarations  = extra_declarations,
     )
 #/def cell_from_bundle
 
@@ -569,24 +670,27 @@ def resolve_bundle_target(
     fallback_data_roots:     dict[ str, Path ] | None = None,
     cells_index_file:        Path = CELLS_INDEX_FILE_DEFAULT,
     bundle_index_file:       Path = BUNDLE_INDEX_FILE_DEFAULT,
+    bundle_toml_file:        Path = BUNDLE_TOML_DEFAULT,
     ) -> tuple[ Path, dict[ str, str ], str, str ]:
     """
     Resolve `name` to a cell FILE (no live Cell construction -- for
     tooling that only wants to read/introspect a cell tree, e.g. sf-viz,
     not run one) by trying, in the same order a human would guess it:
 
-      1. A registered bundle_name -- resolve_bundle() then
-         resolve_cell_fp(), exactly like cell_from_bundle(), giving a
-         real {bundle_root} template var.
+      1. A registered bundle_name -- resolve_bundle() then this bundle's
+         own bundle.toml [cell] table (_bundle_cell_link()), exactly like
+         cell_from_bundle(), giving a real {bundle_root} template var. Any
+         [[variables.resources]]/[[variables.actors]] bundle.toml declares
+         are NOT applied here -- this only resolves the linked FILE, it
+         never constructs anything.
       2. A bare cell_idn -- resolve_cell_fp() alone, no bundle_root (a
          library cell was never attached to one); only fallback_data_roots'
          own {name} template vars are available.
 
     Returns (cell_fp, template_vars, resolved_app_name, root_node_idn) --
-    root_node_idn is the bundle's own cell_idn in case (1), or `name`
-    itself in case (2) (same main_id convention cell_from_bundle/
-    cell_from_file use). Raises ValueError (from resolve_cell_fp, whose
-    message already names both index files it checked) if neither
+    root_node_idn is the bundle's own linked cell's main_id in case (1), or
+    `name` itself in case (2) (same main_id convention cell_from_bundle/
+    cell_from_file use). Raises ValueError/FileNotFoundError if neither
     resolves. app_name=None auto-discovers -- see resolve_cell_fp;
     resolved once, up front, so both attempts below share one concrete
     app_name rather than re-discovering per attempt.
@@ -597,9 +701,18 @@ def resolve_bundle_target(
     except ValueError:
         pass
     else:
-        cell_fp       = resolve_cell_fp( entry.cell_idn, app_name, fallback_data_roots, cells_index_file )
-        template_vars = _template_vars( entry.bundle_root, fallback_data_roots )
-        return cell_fp, template_vars, app_name, entry.cell_idn
+        bundle_toml_fp = entry.bundle_root / bundle_toml_file
+        if not bundle_toml_fp.exists():
+            raise FileNotFoundError(
+                f"{bundle_toml_file!r} not found for bundle {name!r} at {bundle_toml_fp}"
+            )
+        with open( bundle_toml_fp, 'rb' ) as f:
+            bundle_data = tomllib.load( f )
+        template_vars = _template_vars( entry.bundle_root, app_name, fallback_data_roots )
+        cell_fp, main_id = _bundle_cell_link(
+            bundle_data, bundle_toml_fp, app_name, fallback_data_roots, cells_index_file, template_vars,
+        )
+        return cell_fp, template_vars, app_name, main_id
 
     cell_fp = resolve_cell_fp( name, app_name, fallback_data_roots, cells_index_file )
     template_vars = { k: str( Path( v ) ) for k, v in ( fallback_data_roots or {} ).items() }
@@ -618,14 +731,38 @@ class BundleDirs:
 
     Layout under user_data_path/<app_name>/:
         bundles/<bundle_name>/
-            bundle.toml # by default -- a bundle's own self-description
-                        # (default_cell_idn, required_cell_idns), read
-                        # once at pull-from-hub time to seed bundle_index/
-                        # cells_index -- not consulted at resolution time
+            bundle.toml # by default -- two independent roles, two separate
+                        # top-level tables in the SAME file:
+                        #   [bundle]   self-description (default_cell_idn,
+                        #              required_cell_idns), read once at
+                        #              pull-from-hub time to seed
+                        #              bundle_index/cells_index
+                        #   [cell]     the LINKED cell this bundle wraps
+                        #              (one of 'toml'/'cell_idn', same
+                        #              grammar a kind='cell' [[nodes]]
+                        #              entry uses) plus this bundle's own
+                        #              [[variables.resources]]/
+                        #              [[variables.actors]] bindings for
+                        #              it -- consulted at ordinary
+                        #              resolution time by
+                        #              cell_from_bundle()/
+                        #              resolve_bundle_target(), see those
+                        #              functions' own docstrings
             cells/              — bundle-specific cell files (optional)
-            settings/           — parameter JSON files, resources.json
-            data/               — parquet outputs
+            data/               — parquet/sqlite outputs, this bundle's own
             notebooks/          — Marimo .py notebooks
+        settings/<bundle_name>/ — parameter JSON/TSV files, resources.json
+
+    settings/ is the one exception kept OUTSIDE bundles/<bundle_name>/ --
+    still keyed by bundle_name (one subdirectory per bundle), a sibling of
+    bundles/ itself, so a bundle.toml can point {app_root}/settings/
+    <some OTHER bundle_name>/... at a fixture tree it intentionally reuses
+    (e.g. an 'observe_0' reading 'train_0's own settings) without also
+    reusing that other bundle's data/. data/, by contrast, is back under
+    each bundle's own bundles/<bundle_name>/ -- addressed via {bundle_root}
+    (see _template_vars()), not {app_root}, since a bundle's own on-disk
+    outputs are never meant to be borrowed by another bundle the way its
+    settings sometimes are.
     """
 
     def __init__( self, bundle_name: str, app_name: str ) -> None:
@@ -645,7 +782,7 @@ class BundleDirs:
 
     @property
     def settings( self ) -> Path:
-        return self.root / 'settings'
+        return self._app_root / 'settings' / self._bundle_name
     #
 
     @property

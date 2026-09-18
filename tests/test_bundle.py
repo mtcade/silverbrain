@@ -107,10 +107,90 @@ def test_cell_from_bundle_builds_cell_via_bundle_name( tmp_path: Path, monkeypat
     bundle_module.register_cell( 'my_cell', target, app_name='nonexistent_test_app_xyz' )
     bundle_module.register_bundle( 'my_bundle', 'my_cell', app_name='nonexistent_test_app_xyz' )
 
+    dirs = bundle_module.BundleDirs( 'my_bundle', 'nonexistent_test_app_xyz' )
+    dirs.root.mkdir( parents=True )
+    ( dirs.root / 'bundle.toml' ).write_text( '[cell]\ncell_idn = "my_cell"\n' )
+
     cell = bundle_module.cell_from_bundle(
         'my_bundle', app_name='nonexistent_test_app_xyz', op_classes={},
     )
     assert cell.main_id == 'my_cell'
+
+
+def test_cell_from_bundle_raises_when_bundle_toml_missing( tmp_path: Path, monkeypatch: pytest.MonkeyPatch ) -> None:
+    from silverbrain import bundle as bundle_module
+
+    monkeypatch.setattr(
+        bundle_module, 'PlatformDirs',
+        lambda app_name: type( 'P', (), { 'user_data_path': tmp_path } )(),
+    )
+    target = tmp_path / 'cells' / 'root.toml'
+    target.parent.mkdir( parents=True )
+    target.write_text( '[cell]\n' )
+
+    bundle_module.register_cell( 'my_cell', target, app_name='nonexistent_test_app_xyz' )
+    bundle_module.register_bundle( 'my_bundle', 'my_cell', app_name='nonexistent_test_app_xyz' )
+
+    with pytest.raises( FileNotFoundError, match="bundle.toml" ):
+        bundle_module.cell_from_bundle(
+            'my_bundle', app_name='nonexistent_test_app_xyz', op_classes={},
+        )
+
+
+def test_cell_from_bundle_applies_bundle_toml_resources_and_grafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+    """bundle.toml's own [[variables.resources]]/[[variables.actors]] reach
+    into the linked cell's subtree exactly like an in-tree declaration
+    would -- see bundle.py's cell_from_bundle docstring."""
+    from silverbrain import bundle as bundle_module
+    from silverbrain.tableOps import PlaceholderOp
+
+    monkeypatch.setattr(
+        bundle_module, 'PlatformDirs',
+        lambda app_name: type( 'P', (), { 'user_data_path': tmp_path } )(),
+    )
+
+    cells_dir = tmp_path / 'cells'
+    cells_dir.mkdir( parents=True )
+    ( cells_dir / 'root.toml' ).write_text(
+        '[cell]\n'
+        'source = ["_trigger"]\n'
+        'target = ["out"]\n'
+        '\n'
+        '[[nodes]]\n'
+        'node_idn = "picker"\n'
+        'kind = "variable"\n'
+        'source = ["_trigger"]\n'
+        'target = ["out"]\n'
+        'columns = { a = "Int64" }\n'
+    )
+    bundle_module.register_cell( 'my_cell', cells_dir / 'root.toml', app_name='nonexistent_test_app_xyz' )
+    bundle_module.register_bundle( 'my_bundle', 'my_cell', app_name='nonexistent_test_app_xyz' )
+
+    dirs = bundle_module.BundleDirs( 'my_bundle', 'nonexistent_test_app_xyz' )
+    dirs.root.mkdir( parents=True )
+    ( dirs.root / 'bundle.toml' ).write_text(
+        '[cell]\n'
+        'cell_idn = "my_cell"\n'
+        '\n'
+        '[[variables.actors]]\n'
+        'target = "picker"\n'
+        'op_type = "identity_op"\n'
+    )
+
+    import polars as pl
+
+    class _IdentityOp( PlaceholderOp ):
+        def __init__( self, rng=None ):
+            super().__init__( columns = { 'a': pl.Int64 }, rng = rng )
+
+    cell = bundle_module.cell_from_bundle(
+        'my_bundle', app_name='nonexistent_test_app_xyz',
+        op_classes={ 'identity_op': _IdentityOp },
+    )
+    picker_actor = cell.tableOps[ 'picker' ]
+    assert isinstance( picker_actor, _IdentityOp )
 
 
 # -- bundle_index.toml (bundle_name -> {bundle_root, cell_idn}) / resolve_bundle / register_bundle

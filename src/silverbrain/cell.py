@@ -1248,6 +1248,7 @@ def cell_from_file(
     fallback_data_roots: dict[ str, Path ] | None = None,
     cells_index_file: Path = configTree.CELLS_INDEX_FILE_DEFAULT,
     resources: pl.DataFrame | None = None,
+    extra_declarations: dict[ str, pl.DataFrame ] | None = None,
 ) -> Cell:
     """
     Construct a Cell from a config file, delegating to configTree.config_tree
@@ -1293,6 +1294,16 @@ def cell_from_file(
                   forwarded to any nested child automatically -- a child
                   only ever sees resources it (or some ancestor's
                   [[variables.resources]] targeting it) declared.
+    extra_declarations : an already-parsed {'resources': DataFrame, 'actors':
+                  DataFrame} pair (same shape config_tree() itself returns --
+                  see configTree.bundle_variable_declarations()) folded into
+                  this call's own declarations before resolution/splicing,
+                  same as `resources` above but general enough to also
+                  target descendants (not just the root cell itself) and to
+                  carry variables.actors grafts -- used by
+                  bundle.cell_from_bundle() to apply a bundle.toml's own
+                  [[variables.resources]]/[[variables.actors]] entries,
+                  which live outside the linked cell's own file entirely.
 
     TOML schema expected
     --------------------
@@ -1395,6 +1406,14 @@ def cell_from_file(
                 ),
             ],
             how = 'diagonal_relaxed',
+        )
+    if extra_declarations is not None:
+        declarations = dict( declarations )
+        declarations[ 'resources' ] = pl.concat(
+            [ declarations[ 'resources' ], extra_declarations[ 'resources' ] ], how = 'vertical',
+        )
+        declarations[ 'actors' ] = pl.concat(
+            [ declarations[ 'actors' ], extra_declarations[ 'actors' ] ], how = 'vertical',
         )
     # Resolves declarations AND splices in any variables.actors 'toml'
     # graft binding (repeatedly, until no more remain -- a graft can

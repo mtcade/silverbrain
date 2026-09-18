@@ -185,3 +185,121 @@ lets concurrent invocations of the same `Cell`, and separate iterations of
 the same loop, resolve fan-in joins without cross-talk. `TableOp.__call__`
 doesn't accept `corr_id` (it's atomic, nothing to route between
 internally) -- the dispatch layer detects this and calls it without one.
+
+## Bundles
+
+A bundle is a named, resolvable *instance* of a Cell TOML tree --
+`bundle_name` (e.g. `"train_0"`) plus everything needed to run it: which
+cell file it links, and any settings/data of its own. `src/silverbrain/
+bundle.py`'s `cell_from_bundle(bundle_name, op_classes, ...)` resolves a
+`bundle_name` all the way to a live `Cell`, the bundle-level counterpart to
+`cell.py`'s `cell_from_file`.
+
+### `bundle_index.toml` -- the global registry
+
+A user-global TOML (`PlatformDirs(app_name).user_data_path/
+bundle_index.toml`) mapping `bundle_name -> {cell_idn, bundle_root?}`:
+
+```toml
+[[bundles]]
+bundle_name = 'train_0'
+cell_idn    = 'train_0'
+```
+
+`register_bundle()`/`resolve_bundle()` read and write it. `bundle_root`
+defaults to the `BundleDirs` convention below when omitted. **`cell_idn`
+here is only a fallback hint for `BundleDirs`, not the linked-cell
+resolution path** -- resolution always goes through this bundle's own
+`bundle.toml` (below), never straight from this index.
+
+### `bundle.toml` -- the linked cell + its own bindings
+
+Every registered bundle must have an on-disk `bundle.toml` at its
+`bundle_root` (`cell_from_bundle` raises `FileNotFoundError` if it's
+missing). Two independent top-level tables can share the file:
+
+- `[bundle]` -- self-description (`default_cell_idn`, `required_cell_idns`)
+  read once at pull-from-hub time to seed `bundle_index.toml`/
+  `cells_index.toml`. Not consulted at ordinary resolution time.
+- `[cell]` -- the LINKED cell this bundle wraps, resolved with the same
+  has-exactly-one-of grammar a `kind = "cell"` `[[nodes]]` entry uses
+  (`_bundle_cell_link()`):
+
+  ```toml
+  [cell]
+  cell_idn = "train_0"      # resolve_cell_fp(), same as [[nodes]] cell_idn
+  # ... or:
+  toml = "path/to/cell.toml"  # relative to this bundle.toml, template vars applied
+  ```
+
+  plus, optionally, `[[variables.resources]]`/`[[variables.actors]]`
+  entries (same shape a cell TOML's own `variables` header uses) that bind
+  into the linked cell's *own* subtree from outside its file entirely --
+  parsed by `configTree.bundle_variable_declarations()` at
+  `declarer_depth=-1`, so they're senior to any declaration the linked
+  cell (or any node inside it) makes for itself. A `bundle.toml` is never
+  parsed as an ordinary cell TOML: no `[[nodes]]`/`[[parameters]]` of its
+  own, just these two responsibilities.
+
+`main_id` for the resulting `Cell` is `cell_idn` when given, else the
+`toml` path's own stem.
+
+### Directory layout (`BundleDirs`)
+
+```
+user_data_path/<app_name>/
+    bundle_index.toml
+    cells_index.toml
+    bundles/<bundle_name>/
+        bundle.toml     # [bundle] + [cell], see above
+        cells/          # bundle-specific cell files (optional)
+        data/           # this bundle's own parquet/sqlite outputs
+        notebooks/      # Marimo .py notebooks
+    settings/<bundle_name>/
+                        # parameter JSON/TSV files, resources.json
+```
+
+`settings/` is the one piece kept OUTSIDE `bundles/<bundle_name>/` --
+still keyed by `bundle_name` (one subdirectory per bundle), a sibling of
+`bundles/` itself. That's what lets one bundle's `bundle.toml` point at
+*another* bundle's settings tree when it intentionally reuses fixtures
+(e.g. an `observe_0` bundle reading `train_0`'s settings) without also
+reusing that other bundle's `data/`.
+
+Two template vars are available to a linked cell's own TOML (and to
+`bundle.toml`'s `toml =`/`[[variables.resources]]` paths):
+
+- `{bundle_root}` -- this bundle's own `bundles/<bundle_name>/` directory.
+  What a reusable cell file uses for on-disk state that should resolve
+  differently per bundle that loads it (e.g. a random-sampler's
+  best-so-far cache at `"{bundle_root}/data/search_state.db"`).
+- `{app_root}` -- the platformdirs top-level root itself
+  (`user_data_path`), the directory `bundle_index.toml`/`cells_index.toml`/
+  every `bundles/<name>/`, `settings/<name>/` live directly under. What a
+  `bundle.toml` uses to spell out explicitly which *other* bundle's
+  settings tree it means when reusing one (`"{app_root}/settings/
+  train_0/..."`).
+
+These are deliberately the only bundle-layout shorthand offered -- no
+`{settings_root}`/`{data_root}`-style var whose target could silently
+depend on some other key elsewhere in the same file.
+
+### Resolution flow
+
+`cell_from_bundle(bundle_name, ...)`:
+
+1. `resolve_bundle()` -- `bundle_name` -> `{bundle_root, cell_idn}` via
+   `bundle_index.toml` (`cell_idn` here unused past this point).
+2. Read `{bundle_root}/bundle.toml`'s own `[cell]` table --
+   `_bundle_cell_link()` resolves it to `(cell_fp, main_id)`.
+3. Parse `[[variables.resources]]`/`[[variables.actors]]` from that same
+   `bundle.toml` (`configTree.bundle_variable_declarations()`).
+4. `cell_from_file(cell_fp, ..., main_id=main_id, extra_declarations=...)`
+   -- the bundle.toml declarations are folded in ahead of the linked
+   cell's own, same precedence as `cell_from_file`'s `resources` param (an
+   outside-the-tree caller override).
+
+`resolve_bundle_target()` follows the same bundle_name -> bundle.toml ->
+`_bundle_cell_link()` path for tooling that only wants the resolved cell
+FILE (e.g. `sf-viz`), not a live `Cell` -- it does not apply
+`bundle.toml`'s own `variables.resources`/`variables.actors`.

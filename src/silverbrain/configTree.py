@@ -776,6 +776,40 @@ def _actor_variable_entries(
 #/def _actor_variable_entries
 
 
+def bundle_variable_declarations(
+    data:          dict[ str, Any ],
+    root_node_idn: str,
+    base_path:     Path,
+    tvars:         dict[ str, str ] | None = None,
+    ) -> dict[ str, pl.DataFrame ]:
+    """
+    Parse a bundle.toml's own [[variables.resources]]/[[variables.actors]]
+    entries (see bundle.py's cell_from_bundle) into declaration rows,
+    addressed at root_node_idn's own subtree using the same target-routing
+    convention an ordinary cell TOML's own variables header uses -- 'target'
+    is a dotted path relative to root_node_idn itself, omitted/''/'.'
+    meaning root_node_idn itself (see module docstring above).
+
+    declarer_depth is fixed at -1: a bundle.toml is never itself a node in
+    the config_tree() it links to -- it sits entirely outside that tree --
+    so its own bindings must be senior to anything the linked cell (or any
+    of its own descendants) declares for itself by default. Same precedent
+    as cell_from_file()'s own `resources` param (an outside-the-tree
+    caller override, also declarer_depth=-1).
+    """
+    tvars = tvars or {}
+    variables_header = data.get( 'variables', {} )
+    return {
+        'resources': _resource_variable_entries(
+            variables_header.get( 'resources', [] ), root_node_idn, -1, tvars,
+        ),
+        'actors': _actor_variable_entries(
+            variables_header.get( 'actors', [] ), root_node_idn, -1, base_path, tvars,
+        ),
+    }
+#/def bundle_variable_declarations
+
+
 def config_tree(
     path:                str | Path,
     node_idn:            str,
