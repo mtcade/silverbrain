@@ -303,62 +303,12 @@ def test_hand_written_sequencing_actor() -> None:
     assert result[ 0 ][ 'v' ].to_list() == [ 3, 5, 7 ]
 
 
-# -- join='any'/'at_least_k', round_origin, fan-out cursor independence,
-# and misaligned-round deadlock detection (Token/round-id wiring model)
-
-
-def _record_op( calls: list ):
-    """Returns an Actor that appends dfs[0] (or None) to `calls` and
-    passes it through unchanged -- used to observe how many times/with
-    what a node actually fired."""
-    def _op( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
-        calls.append( dfs[ 0 ] if dfs[ 0 ] is None else dfs[ 0 ][ 'v' ].to_list() )
-        return ( dfs[ 0 ], )
-    return _op
-
-
-def test_join_any_fires_with_only_one_of_two_sources_ever_written() -> None:
-    calls: list = []
-    c = Cell(
-        main_id='c',
-        ops={ 'merge_like': _record_op( calls ) },
-        source=[ 'inp' ], target=[ 'out' ],
-    )
-    # 'never_written' is declared but nothing ever seeds/produces it.
-    c.register_node( 'merge_like', source=[ 'inp', 'never_written' ], target=[ 'out' ], join='any' )
-
-    df_in = pl.DataFrame( { 'v': [ 1 ] } )
-    result = c( ( df_in, ) ).result( timeout=5 )
-    assert result[ 0 ][ 'v' ].to_list() == [ 1 ]
-    assert calls == [ [ 1 ] ]
-
-
-def test_join_at_least_k_fires_once_k_sources_agree() -> None:
-    calls: list = []
-    c = Cell(
-        main_id='c',
-        ops={ 'quorum': _record_op( calls ) },
-        source=[ 'a', 'b' ], target=[ 'out' ],
-    )
-    # 3 declared sources, only 2 ('a','b') ever get written -- 'c_unwritten'
-    # never does; join_k=2 still lets it fire on 'a'+'b' alone.
-    c.register_node( 'quorum', source=[ 'a', 'b', 'c_unwritten' ], target=[ 'out' ], join='at_least_k', join_k=2 )
-
-    result = c( ( pl.DataFrame( { 'v': [ 1 ] } ), pl.DataFrame( { 'v': [ 2 ] } ) ) ).result( timeout=5 )
-    assert result[ 0 ][ 'v' ].to_list() in ( [ 1 ], [ 2 ] )  # whichever 'a'/'b' resolved first, by declared order
-
-
-def test_at_least_k_requires_join_k_in_valid_range() -> None:
-    c = Cell( main_id='c', ops={ 'op': _passthrough_op }, source=[ 'a' ], target=[ 'out' ] )
-    with pytest.raises( ValueError ):
-        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join='at_least_k', join_k=2 )  # k > len(source)
-    with pytest.raises( ValueError ):
-        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join='at_least_k' )  # missing join_k
-    with pytest.raises( ValueError ):
-        c.register_node( 'op', source=[ 'a' ], target=[ 'out' ], join_k=1 )  # join_k without at_least_k
-
-
-# -- discard_on_null (default True, only consulted under join='all')
+# -- null handling: every node is a strict AND-join (the engine's only
+# firing rule, no join modes), and a null input always discards the round
+# rather than invoking the op -- see _WiringEngine._scan/_on_done. A
+# TableOp is required to always return a real DataFrame (zero-row is
+# fine, never None) for each of its declared outputs; _on_done enforces
+# this loudly if violated.
 #
 # _WiringEngine._scan stops looking for any further work at all the
 # instant the Cell's own target resolves ("if self.future.done(): return"
@@ -374,10 +324,10 @@ def test_at_least_k_requires_join_k_in_valid_range() -> None:
 
 def _null_terminating_controller( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
     """0, 1, 2 on 'n' (self-loop), then None on 'n' + the final value on
-    'escape' -- same shape as _loop_controller_op, just also feeding a
-    'sink' node (registered separately per test, source=['n']) so
-    discard_on_null's effect on THAT node can be observed independently
-    of the loop's own already-covered termination behavior."""
+    'escape' -- also feeds a 'sink' node (registered separately per test,
+    source=['n']) so the null round's effect on THAT node can be observed
+    independently of the loop's own already-covered termination
+    behavior."""
     time.sleep( 0.02 )
     n = dfs[ 0 ][ 'n' ][ 0 ]
     if n < 2:
@@ -385,7 +335,7 @@ def _null_terminating_controller( dfs: tuple, corr_id: tuple = (), verbose: int 
     return ( None, dfs[ 0 ] )
 
 
-def test_discard_on_null_default_skips_the_op_on_a_null_round() -> None:
+def test_null_input_always_discards_the_round() -> None:
     calls: list = []
 
     def _sink( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
@@ -399,7 +349,7 @@ def test_discard_on_null_default_skips_the_op_on_a_null_round() -> None:
     )
     c.register_node( 'controller',  source=[ 'n' ],      target=[ 'n', 'escape' ] )
     c.register_node( 'passthrough', source=[ 'escape' ], target=[ 'done' ] )
-    c.register_node( 'sink',        source=[ 'n' ],      target=[ '_' ] )  # discard_on_null defaults True
+    c.register_node( 'sink',        source=[ 'n' ],      target=[ '_' ] )
 
     result = c( ( pl.DataFrame( { 'n': [ 0 ] } ), ) ).result( timeout=5 )
     assert result[ 0 ][ 'n' ].to_list() == [ 2 ]
@@ -409,43 +359,39 @@ def test_discard_on_null_default_skips_the_op_on_a_null_round() -> None:
     assert calls == [ 0, 1, 2 ]
 
 
-def test_discard_on_null_false_still_invokes_the_op_with_a_null_input() -> None:
+def test_op_returning_none_for_a_target_never_fires_a_sole_consumer() -> None:
+    """None is a real, logged token like any other (see Token's
+    docstring) -- but a node's firing rule requires every declared
+    source's token be non-null (see _WiringEngine._scan), so a
+    downstream node fed only by that output simply never fires on a
+    round where the upstream op wrote null, only on a round where it
+    wrote something real."""
     calls: list = []
 
+    def _withholds_once( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
+        n = dfs[ 0 ][ 'n' ][ 0 ]
+        return ( None if n == 0 else dfs[ 0 ], )
+
     def _sink( dfs: tuple, corr_id: tuple = (), verbose: int = 0, verbose_prefix: str = '' ) -> tuple:
-        calls.append( dfs[ 0 ] if dfs[ 0 ] is None else dfs[ 0 ][ 'n' ][ 0 ] )
+        calls.append( dfs[ 0 ][ 'n' ][ 0 ] )
         return ( dfs[ 0 ], )
 
     c = Cell(
         main_id='c',
-        ops={ 'controller': _null_terminating_controller, 'passthrough': _passthrough_op, 'sink': _sink },
-        source=[ 'n' ], target=[ 'done' ],
+        ops={ 'withholder': _withholds_once, 'sink': _sink },
+        source=[ 'n' ], target=[ 'out' ],
     )
-    c.register_node( 'controller',  source=[ 'n' ],      target=[ 'n', 'escape' ] )
-    c.register_node( 'passthrough', source=[ 'escape' ], target=[ 'done' ] )
-    c.register_node( 'sink',        source=[ 'n' ],      target=[ '_' ], discard_on_null=False )
+    c.register_node( 'withholder', source=[ 'n' ],        target=[ 'maybe' ] )
+    c.register_node( 'sink',       source=[ 'maybe' ],    target=[ 'out' ] )
 
-    c( ( pl.DataFrame( { 'n': [ 0 ] } ), ) ).result( timeout=5 )
-    time.sleep( 0.1 )  # let sink's already-submitted null-round dispatch settle
-    assert None in calls
-
-
-def test_discard_on_null_default_does_not_affect_join_any() -> None:
-    """join='any' already positionally fills a non-participating source
-    with None for unrelated reasons (see _scan) -- discard_on_null must
-    stay inert there, or this would never fire at all."""
-    calls: list = []
-    c = Cell(
-        main_id='c',
-        ops={ 'merge_like': _record_op( calls ) },
-        source=[ 'inp' ], target=[ 'out' ],
-    )
-    c.register_node( 'merge_like', source=[ 'inp', 'never_written' ], target=[ 'out' ], join='any' )
-
-    df_in = pl.DataFrame( { 'v': [ 1 ] } )
-    result = c( ( df_in, ) ).result( timeout=5 )
-    assert result[ 0 ][ 'v' ].to_list() == [ 1 ]
-    assert calls == [ [ 1 ] ]
+    # withholder writes nothing for n=0 -- sink must never fire on it.
+    c( ( pl.DataFrame( { 'n': [ 0 ] } ), ) )
+    # A second, independent call where withholder does write a real
+    # token -- confirms the mechanism works at all (not just "nothing
+    # ever happened").
+    result = c( ( pl.DataFrame( { 'n': [ 1 ] } ), ) ).result( timeout=5 )
+    assert result[ 0 ][ 'n' ].to_list() == [ 1 ]
+    assert calls == [ 1 ]
 
 
 def test_corr_id_relays_unchanged_through_a_chain() -> None:

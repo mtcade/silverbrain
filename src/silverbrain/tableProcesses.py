@@ -31,27 +31,10 @@ def make_node_row(
     source:            Sequence[ str ] = (),
     target:            Sequence[ str ] = (),
     parent_idn:        str | None      = None,
-    join:              str             = 'all',
-    join_k:            int | None      = None,
-    discard_on_null:   bool            = True,
     ) -> pl.DataFrame:
-    """Build a single-row DataFrame with the '__nodes__' schema.
-    discard_on_null (default True) is only ever consulted by
-    _WiringEngine._scan when join == 'all' -- no validation needed here
-    for other join values, it's simply inert for them (see schema.py's
-    __nodes__ column docs)."""
+    """Build a single-row DataFrame with the '__nodes__' schema."""
     if kind not in ( 'op', 'cell' ):
         raise ValueError( f"kind must be 'op' or 'cell', got {kind!r}" )
-    if join not in ( 'all', 'any', 'at_least_k' ):
-        raise ValueError( f"join must be 'all', 'any', or 'at_least_k', got {join!r}" )
-    if join == 'at_least_k':
-        if not isinstance( join_k, int ) or not ( 1 <= join_k <= len( source ) ):
-            raise ValueError(
-                f"join='at_least_k' requires join_k to be an int with "
-                f"1 <= join_k <= len(source)={ len( source ) }, got {join_k!r}"
-            )
-    elif join_k is not None:
-        raise ValueError( f"join_k is only meaningful when join='at_least_k', got join={join!r} join_k={join_k!r}" )
     return pl.DataFrame(
         {
             'node_idn':         [ node_idn ],
@@ -59,9 +42,6 @@ def make_node_row(
             'kind':             [ kind ],
             'source':           [ list( source ) ],
             'target':           [ list( target ) ],
-            'join':             [ join ],
-            'join_k':           [ join_k ],
-            'discard_on_null':  [ discard_on_null ],
         },
         schema = table_schemas[ '__nodes__' ],
     )

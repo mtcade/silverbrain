@@ -35,15 +35,6 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
     target   = [...]          # this node's positional outputs, written
                                # under these names (need not be unique --
                                # see squishy-sleeping-snowflake.md)
-    join         = "all"      # optional: "all" (default) | "any" | "at_least_k"
-                               # -- this node's firing rule; see schema.py's
-                               # __nodes__ column docs / cell.py's
-                               # _WiringEngine._scan
-    join_k       = 2          # required iff join = "at_least_k" (1 <= join_k
-                               # <= len(source)), else omitted
-    discard_on_null = true    # optional, default true; only consulted when
-                               # join = "all" -- see schema.py's __nodes__
-                               # column docs / cell.py's _WiringEngine._scan
 
     # kind="op" additionally requires nothing else -- node_idn must be a
     # key op_classes resolves (its ctor kwargs, if any, come from
@@ -335,14 +326,14 @@ def splice_actor_grafts(
     Splicing a target abs_path: find its (currently kind='variable')
     row, parse the graft's toml (config_tree(), same recursive machinery
     an ordinary kind='cell' [[nodes]] entry uses) with that row's OWN
-    node_idn/parent_idn/source/target/join/discard_on_null carried over
-    unchanged (only WHICH implementation answers this node_idn is
-    changing, not how it's wired -- same principle as cell.py's
-    Cell._replace_actor) and ancestor_path set so the grafted subtree's
-    own abs_path comes out identical to the variable's -- then replace
-    the variable row with the graft's own root row (now kind='cell')
-    plus every row underneath it, and fold the graft's own parameters/
-    declarations into the running totals for the next round.
+    node_idn/parent_idn/source/target carried over unchanged (only WHICH
+    implementation answers this node_idn is changing, not how it's wired
+    -- same principle as cell.py's Cell._replace_actor) and ancestor_path
+    set so the grafted subtree's own abs_path comes out identical to the
+    variable's -- then replace the variable row with the graft's own root
+    row (now kind='cell') plus every row underneath it, and fold the
+    graft's own parameters/declarations into the running totals for the
+    next round.
 
     Returns (tree, parameters, node_idx, resolved_resources,
     resolved_actors) -- fully resolved and fully spliced; resolved_actors
@@ -386,9 +377,6 @@ def splice_actor_grafts(
                 app_name            = app_name,
                 fallback_data_roots = fallback_data_roots,
                 cells_index_file     = cells_index_file,
-                join                = target_row[ 'join' ] or 'all',
-                join_k              = target_row[ 'join_k' ],
-                discard_on_null     = True if target_row[ 'discard_on_null' ] is None else target_row[ 'discard_on_null' ],
                 ancestor_path       = ancestor_path,
             )
             tree = pl.concat(
@@ -452,9 +440,6 @@ def _config_tree_row(
     cell_target:         Sequence[ str ] | None = None,
     variable_columns: str | None             = None,
     op_type:             str | None             = None,
-    join:                str | None             = None,
-    join_k:              int | None             = None,
-    discard_on_null:     bool | None            = None,
     ) -> pl.DataFrame:
     return pl.DataFrame(
         {
@@ -469,9 +454,6 @@ def _config_tree_row(
             'cell_target':          [ list( cell_target ) if cell_target is not None else None ],
             'variable_columns':  [ variable_columns ],
             'op_type':              [ op_type ],
-            'join':                 [ join ],
-            'join_k':               [ join_k ],
-            'discard_on_null':      [ discard_on_null ],
         },
         schema = table_schemas[ 'config_tree' ],
     )
@@ -522,47 +504,6 @@ def _auto_node_idn( entry: dict[ str, Any ] ) -> str:
     )
     return f"{prefix}__{uuid4().hex[:8]}"
 #/def _auto_node_idn
-
-
-def _entry_join_fields( entry: dict[ str, Any ], entry_node_idn: str ) -> tuple[ str, int | None ]:
-    """
-    Extract and validate a [[nodes]] entry's join/join_k -- shared by the
-    op/variable/cell branches below (see schema.py's __nodes__ column
-    docs / _WiringEngine._scan for what these mean). Default ('all', None)
-    reproduces today's only behavior (a plain AND-join) when neither is
-    declared.
-    """
-    join = entry.get( 'join', 'all' )
-    if join not in ( 'all', 'any', 'at_least_k' ):
-        raise ValueError(
-            f"[[nodes]] entry {entry_node_idn!r} has join={join!r} -- "
-            f"must be 'all', 'any', or 'at_least_k'"
-        )
-    join_k = entry.get( 'join_k' )
-    src_len = len( entry.get( 'source', [] ) )
-    if join == 'at_least_k':
-        if not isinstance( join_k, int ) or not ( 1 <= join_k <= src_len ):
-            raise ValueError(
-                f"[[nodes]] entry {entry_node_idn!r} has join='at_least_k' but "
-                f"join_k={join_k!r} is not an int with 1 <= join_k <= "
-                f"len(source)={src_len}"
-            )
-    elif join_k is not None:
-        raise ValueError(
-            f"[[nodes]] entry {entry_node_idn!r} declares join_k={join_k!r} "
-            f"but join={join!r} -- join_k is only meaningful when join='at_least_k'"
-        )
-    return join, join_k
-#/def _entry_join_fields
-
-
-def _entry_discard_on_null_field( entry: dict[ str, Any ] ) -> bool:
-    """Extract a [[nodes]] entry's discard_on_null -- shared by the
-    op/variable/cell branches below, same as _entry_join_fields.
-    Default True. No join-compatibility validation needed -- it's simply
-    inert when join != 'all' (see schema.py's __nodes__ column docs)."""
-    return bool( entry.get( 'discard_on_null', True ) )
-#/def _entry_discard_on_null_field
 
 
 def _empty_parameters() -> pl.DataFrame:
@@ -821,9 +762,6 @@ def config_tree(
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
-    join:                str  = 'all',
-    join_k:              int | None = None,
-    discard_on_null:     bool = True,
     ancestor_path:       tuple[ str, ... ] = (),
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
@@ -851,12 +789,6 @@ def config_tree(
     'cell_idn' instead of 'toml' -- resolved via bundle.resolve_cell_fp()'s
     maps_index.toml search. None/omitted (the default) preserves today's
     exact behavior for every caller that only ever uses 'toml'.
-
-    join/join_k: this file's own wiring-edge firing rule, as assigned by
-    whoever referenced it (a parent's kind='cell' [[nodes]] entry, or the
-    root caller for the top-level file, where they're unused) -- see
-    schema.py's __nodes__ column docs. Default ('all', None) reproduces
-    today's only behavior (a plain AND-join).
     """
     suffix = Path( path ).suffix.lower()
     if suffix == '.toml':
@@ -879,9 +811,6 @@ def config_tree(
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
         cells_index_file     = cells_index_file,
-        join                = join,
-        join_k              = join_k,
-        discard_on_null     = discard_on_null,
         ancestor_path       = ancestor_path,
     )
 #/def config_tree
@@ -898,9 +827,6 @@ def toml_config_tree(
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
-    join:                str  = 'all',
-    join_k:              int | None = None,
-    discard_on_null:     bool = True,
     ancestor_path:       tuple[ str, ... ] = (),
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
@@ -924,9 +850,6 @@ def toml_config_tree(
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
         cells_index_file     = cells_index_file,
-        join                = join,
-        join_k              = join_k,
-        discard_on_null     = discard_on_null,
         ancestor_path       = ancestor_path,
     )
 #/def toml_config_tree
@@ -943,9 +866,6 @@ def json_config_tree(
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
-    join:                str  = 'all',
-    join_k:              int | None = None,
-    discard_on_null:     bool = True,
     ancestor_path:       tuple[ str, ... ] = (),
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
@@ -972,9 +892,6 @@ def json_config_tree(
         app_name            = app_name,
         fallback_data_roots = fallback_data_roots,
         cells_index_file     = cells_index_file,
-        join                = join,
-        join_k              = join_k,
-        discard_on_null     = discard_on_null,
         ancestor_path       = ancestor_path,
     )
 #/def json_config_tree
@@ -992,9 +909,6 @@ def _config_tree_from_data(
     app_name:            str | None = None,
     fallback_data_roots: dict[ str, Path ] | None = None,
     cells_index_file:     Path = CELLS_INDEX_FILE_DEFAULT,
-    join:                str  = 'all',
-    join_k:              int | None = None,
-    discard_on_null:     bool = True,
     ancestor_path:       tuple[ str, ... ] = (),
     ) -> tuple[ pl.DataFrame, pl.DataFrame, int, dict[ str, pl.DataFrame ] ]:
     """
@@ -1040,9 +954,6 @@ def _config_tree_from_data(
         abs_path         = own_abs_path,
         cell_source      = cell_header.get( 'source' ),
         cell_target      = cell_header.get( 'target' ),
-        join             = join,
-        join_k           = join_k,
-        discard_on_null  = discard_on_null,
     ) ]
     param_rows: list[ pl.DataFrame ] = [ _empty_parameters() ]
     node_idx = node_idx_start
@@ -1093,8 +1004,6 @@ def _config_tree_from_data(
         entry_abs_path = f"{own_abs_path}.{entry_node_idn}"
 
         if kind == 'op':
-            join, join_k = _entry_join_fields( entry, entry_node_idn )
-            discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
                 node_idn         = entry_node_idn,
                 parent_idn       = node_idn,
@@ -1104,9 +1013,6 @@ def _config_tree_from_data(
                 path             = None,
                 abs_path          = entry_abs_path,
                 op_type          = entry.get( 'op_type', entry_node_idn ),
-                join             = join,
-                join_k           = join_k,
-                discard_on_null  = discard_on_null_entry,
             ) )
             if 'parameters' in entry:
                 # Same (inline keys) | (exactly one external '_toml'/'_json'
@@ -1132,8 +1038,6 @@ def _config_tree_from_data(
                     f"__table_ops_parameters__ forest, so inline parameters here "
                     f"would silently never be read"
                 )
-            join, join_k = _entry_join_fields( entry, entry_node_idn )
-            discard_on_null_entry = _entry_discard_on_null_field( entry )
             node_rows.append( _config_tree_row(
                 node_idn             = entry_node_idn,
                 parent_idn           = node_idn,
@@ -1143,9 +1047,6 @@ def _config_tree_from_data(
                 path                 = None,
                 abs_path              = entry_abs_path,
                 variable_columns  = expr_to_text( _variable_expr( entry.get( 'columns', {} ) ) ),
-                join                 = join,
-                join_k               = join_k,
-                discard_on_null      = discard_on_null_entry,
             ) )
         elif kind == 'cell':
             if 'parameters' in entry:
@@ -1202,8 +1103,6 @@ def _config_tree_from_data(
                 f"'toml' nor 'cell_idn' -- one is required"
             )
 
-        join, join_k = _entry_join_fields( entry, entry_node_idn )
-        discard_on_null_entry = _entry_discard_on_null_field( entry )
         child_nodes, child_params, node_idx, child_decls = config_tree(
             path                = child_toml_path,
             node_idn            = entry_node_idn,
@@ -1215,9 +1114,6 @@ def _config_tree_from_data(
             app_name            = app_name,
             fallback_data_roots = fallback_data_roots,
             cells_index_file     = cells_index_file,
-            join                = join,
-            join_k              = join_k,
-            discard_on_null     = discard_on_null_entry,
             ancestor_path       = own_path,
         )
         node_rows.append( child_nodes )

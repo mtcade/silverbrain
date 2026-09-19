@@ -122,8 +122,15 @@ class Token:
     unchanged from whichever token(s) triggered the firing that produced
     this one (see _WiringEngine._dispatch); it plays no role in which
     tokens get paired together, that's decided entirely by each port's own
-    queue position. value is the dataframe itself (or None -- a legitimate
-    token, not a missing one; see _WiringEngine._on_done).
+    queue position. value is the dataframe itself (or None -- a
+    legitimate, logged token like any other, e.g. a sampler op whose
+    next/done outputs are mutually exclusive per call: one branch's None
+    and the other's real value both land in the very same firing, as
+    ordinary tokens on their own named ports). A node that reads a null
+    token as one of its own declared sources never fires on that round --
+    see _WiringEngine._scan; this is the ONLY thing that treats null
+    specially, and it is unconditional (no per-node opt-out, no join
+    modes).
     """
     corr_id: tuple[ str, ... ]
     value:   pl.DataFrame | None
@@ -168,18 +175,9 @@ class _WiringEngine:
     name) works for free -- every consumer sees every token, in order, at
     its own pace, independent of any other consumer's pace.
 
-    A node's `join` firing rule (__nodes__ row) decides when it's ready,
-    checking each declared source's presence (does it have an unread
-    token at all) -- there is no cross-source identity/round check:
-      - 'all' (default): fires once every declared source has an unread
-        token (an AND-join).
-      - 'any': fires once at least one declared source has an unread
-        token; sources with nothing unread contribute None this firing.
-      - 'at_least_k': fires once join_k declared sources have an unread
-        token; the rest contribute None.
-    Every source that had an unread token when the node fired has its
-    cursor advanced by one (its oldest unread token consumed); a source
-    with nothing unread is simply left for a future scan.
+    A node's firing rule (see below) checks each declared source's
+    presence (does it have an unread token at all) -- there is no
+    cross-source identity/round check.
 
     Correctness of pairing across a node's several source ports rests on
     Kahn Process Network determinism, not on any explicit correlation id:
@@ -208,35 +206,38 @@ class _WiringEngine:
     target isn't fully resolved, `future` gets a RuntimeError naming the
     unresolved names.
 
-    A Cell's own target resolves on each name's first token, null included
-    -- a null result is an ordinary, final answer for the firing that
-    produced it (e.g. a sampler op whose next/done outputs are mutually
-    exclusive per call: one branch's null and the other's real value both
-    land in the very same firing), not a placeholder to wait past. This
-    Cell's own __call__ never re-fires on its own to produce a "better,
-    later" token for a name that already has one -- a fresh call each
-    time is Cell.__call__'s whole model (see its own docstring: "a fresh
-    _WiringEngine ... is constructed every call regardless") -- so a loop
-    that needs a different branch to eventually go non-null is necessarily
-    the CALLER's concern, expressed by re-invoking this Cell again from
-    outside (a fresh call, fresh engine, fresh chance for the other branch
-    to be the one that's null this time), never by this engine privately
-    holding out for a second token on the same name within one call.
+    A Cell's own target resolves on each name's first token, null
+    included -- a null result is an ordinary, final answer for the
+    firing that produced it (e.g. a sampler op whose next/done outputs
+    are mutually exclusive per call: one branch's null and the other's
+    real value both land in the very same firing), not a placeholder to
+    wait past. This is safe precisely because a Cell's own __call__ never
+    re-fires on its own to produce a "better, later" token for a name
+    that already has one -- a fresh call each time is Cell.__call__'s
+    whole model (see its own docstring: "a fresh _WiringEngine ... is
+    constructed every call regardless"), so there is no earlier round
+    within THIS call for a null to preempt. A name that instead gets
+    written repeatedly ACROSS MANY rounds within one call (a loop) is a
+    different matter -- resolving a Cell's own target directly off such a
+    name risks grabbing an early, still-null round (see the AND-join
+    rule below for how a node guards against exactly that on its OWN
+    inputs; a bundle wiring a loop's output straight to its own external
+    target needs an explicit gate node in between, since the engine has
+    no way to tell "single-shot boundary" apart from "loop-carried name"
+    on its own).
 
-    discard_on_null (__nodes__ row, default True, only consulted when
-    join='all'): the ordinary/default behavior is that once a `join='all'`
-    node's dispatched inputs would include a None, the engine itself stops
-    invoking it -- tokens are still consumed (cursor advances) but no
-    actor call happens and no target token is written, so a self-
-    referencing loop naturally stops re-firing once it starts producing a
-    null on its own feedback source, with nothing extra required of the
-    node's own implementation. Set discard_on_null=False on a node that
-    wants to keep receiving and handling a null input itself instead (the
-    only behavior available before this flag existed -- null is still an
-    ordinary value otherwise, not a special engine-level case, see
-    Token's docstring). Inert for 'any'/'at_least_k' joins, where a
-    non-participating source already positionally contributes None for
-    unrelated reasons.
+    Node firing rule -- the engine's only one, no join modes, no
+    per-node opt-out: a node fires once every one of its declared source
+    names has an unread token AND none of those tokens is null. Tokens
+    are consumed either way (cursors advance), but a round with any null
+    among its dispatched inputs is silently discarded -- no actor call,
+    no output token -- rather than invoking the op with a null input.
+    This is what lets a downstream gate node safely sit between a
+    loop-carried "maybe done yet" signal and a Cell's own external
+    target: the gate's sole source is that signal, so it simply never
+    fires (and so never writes anything) on a null round, only actually
+    producing (and writing, exactly once) its own output on the genuine
+    non-null round.
 
     "_" is a reserved discard target: a node's target list may name a
     result slot "_" to mean "run this (side effects included) but never
@@ -346,44 +347,27 @@ class _WiringEngine:
                     for s in src
                 }
                 present = [ s for s in src if unread[ s ] ]
-                if not present:
+                # Strict AND-join, the engine's only firing rule: every
+                # declared source needs an unread token before this node
+                # is even a candidate.
+                if len( present ) != len( src ):
                     continue
 
-                join = row.get( 'join' ) or 'all'
-                if join == 'all':
-                    if len( present ) != len( src ):
-                        continue
-                    participants = src
-                elif join == 'any':
-                    participants = present
-                elif join == 'at_least_k':
-                    if len( present ) < row[ 'join_k' ]:
-                        continue
-                    participants = present
-                else:
-                    raise ValueError( f"__nodes__ row {node_idn!r} has unrecognized join={join!r}" )
-                participants = set( participants )
-
-                for s in participants:
+                for s in src:
                     self.cursor[ ( node_idn, s ) ] = self.cursor.get( ( node_idn, s ), 0 ) + 1
-                inputs = tuple(
-                    unread[ s ][ 0 ].value if s in participants else None
-                    for s in src
-                )
+                inputs = tuple( unread[ s ][ 0 ].value for s in src )
 
-                # discard_on_null (default True, only meaningful under
-                # join='all' -- see class docstring): tokens above are
-                # already consumed: this round is discarded, not
-                # deferred. No actor call, no output token.
-                discard_on_null = row.get( 'discard_on_null' )
-                discard_on_null = True if discard_on_null is None else discard_on_null
-                if join == 'all' and discard_on_null and any( v is None for v in inputs ):
+                # Tokens above are already consumed: a null among them
+                # discards this round rather than dispatching it -- no
+                # actor call, no output token (see class docstring). This
+                # is unconditional, not a per-node opt-out.
+                if any( v is None for v in inputs ):
                     continue
 
                 # corr_id relayed from whichever source port (first in
                 # declared order) actually participated -- purely for
                 # tracing, see Token's docstring; never used for matching.
-                dispatch_corr_id = next( unread[ s ][ 0 ].corr_id for s in src if s in participants )
+                dispatch_corr_id = next( unread[ s ][ 0 ].corr_id for s in src )
 
                 self.in_flight.add( node_idn )
                 to_fire.append( ( node_idn, row, inputs, dispatch_corr_id ) )
@@ -406,7 +390,7 @@ class _WiringEngine:
         self:               Self,
         node_idn:           str,
         row:                dict,
-        inputs:             tuple[ pl.DataFrame | None, ... ],
+        inputs:             tuple[ pl.DataFrame, ... ],
         dispatch_corr_id:  tuple[ str, ... ],
         ) -> None:
         actor = self.cell.tableOps[ node_idn ]
@@ -463,9 +447,11 @@ class _WiringEngine:
                     # never contributes to resolving anything.
                     continue
                 # Every value is appended, including None -- a null token
-                # is an ordinary result a downstream consumer can inspect
-                # (e.g. for loop termination), not a special engine-level
-                # case.
+                # is an ordinary result (see Token's docstring): a
+                # downstream node reading it as one of its own sources
+                # simply won't fire on this round (_scan's unconditional
+                # null-discard), and a Cell's own external target may
+                # resolve to it directly as a legitimate final answer.
                 self.logs.setdefault( name, [] ).append(
                     Token( corr_id = dispatch_corr_id, value = value )
                 )
@@ -883,9 +869,6 @@ class Cell:
         source:            Sequence[ str ] = (),
         target:            Sequence[ str ] = (),
         parent_idn:        str | None      = None,
-        join:              str             = 'all',
-        join_k:            int | None      = None,
-        discard_on_null:   bool            = True,
         ) -> None:
         """
         Declare a __nodes__ row for node_idn, an entry already registered in
@@ -901,19 +884,16 @@ class Cell:
         special-casing here: any number of nodes may independently declare
         target=["_"] with no conflict, same as any other repeated name.
 
-        join/join_k: this node's firing rule over its declared source
-        ports -- see _WiringEngine._scan/tableProcesses.make_node_row for
-        the exact semantics/validation. Default ('all', None) reproduces a
-        strict AND-join -- today's only behavior before join/join_k were
-        added.
-
-        discard_on_null (default True, only consulted when join='all'):
-        when this node would otherwise fire but at least one dispatched
-        input is None, the engine consumes the tokens without ever
-        invoking the actor or writing a target token. Set False on a node
-        that wants to keep receiving and handling a null input itself
-        (e.g. a self-referencing loop controller with its own null
-        guard) -- see _WiringEngine._scan.
+        This node fires once every one of its declared source names has an
+        unread, non-null token -- a strict AND-join over presence AND
+        non-nullity, the engine's only firing rule (see
+        _WiringEngine._scan), with no per-node opt-out (no join modes, no
+        discard flag). A registered TableOp may still return None for one
+        of its declared outputs -- a real, logged token like any other
+        (see Token's docstring), used for branching/loop-termination:
+        e.g. a downstream node whose sole source is a "maybe done yet"
+        signal never fires on a null round, only on the genuine non-null
+        one.
         """
         if node_idn not in self.tableOps:
             raise KeyError(
@@ -930,9 +910,6 @@ class Cell:
                     source           = source,
                     target           = target,
                     parent_idn       = parent_idn,
-                    join             = join,
-                    join_k           = join_k,
-                    discard_on_null  = discard_on_null,
                 ),
             ],
             how = 'vertical',
@@ -1215,22 +1192,12 @@ def _cell_from_tree(
 
     for row in op_children + variable_children:
         cell.register_node(
-            node_idn         = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
-            join             = row[ 'join' ] or 'all',
-            join_k           = row[ 'join_k' ],
-            # discard_on_null defaults True -- coalesce a null row value
-            # (never actually written today, since every writer already
-            # supplies a concrete bool) the same way join's own 'all'
-            # fallback does, rather than passing None through.
-            discard_on_null  = True if row[ 'discard_on_null' ] is None else row[ 'discard_on_null' ],
+            node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
         )
     for row in cell_children:
         if row[ 'source' ] or row[ 'target' ]:
             cell.register_node(
-                node_idn         = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
-                join             = row[ 'join' ] or 'all',
-                join_k           = row[ 'join_k' ],
-                discard_on_null  = True if row[ 'discard_on_null' ] is None else row[ 'discard_on_null' ],
+                node_idn = row[ 'node_idn' ], source = row[ 'source' ], target = row[ 'target' ],
             )
 
     return cell

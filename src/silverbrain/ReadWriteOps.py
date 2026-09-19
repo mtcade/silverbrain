@@ -410,7 +410,7 @@ _IMPLS: dict[ str, type ] = {
 def _open_output_schema() -> OutputSchema:
     """Content is unknown ahead of time (it comes from whichever resource
     table_idn resolves to) -- a fresh anonymous ColVar Union, same 'open'
-    shape PlaceholderOp/MergeOp use for their own unconstrained slots."""
+    shape PlaceholderOp uses for its own unconstrained slot."""
     return OutputSchema( expr = bdd.Union( bdd.ColVar( f'_rwops_out_{uuid4().hex}' ) ) )
 #/def _open_output_schema
 

@@ -814,67 +814,6 @@ class PlaceholderOp( TableOp ):
     #/def __call__
 #/class PlaceholderOp
 
-class MergeOp( TableOp ):
-    """
-    N alternate-producer inputs, 1 output -- meant to be registered with
-    join='any' (Cell.register_node(..., join='any')), so cell.py's
-    _WiringEngine may dispatch it as soon as any ONE of its n source ports
-    has an unread token, rather than the default join='all' AND-join.
-    Useful when a slot genuinely has more than one possible live producer
-    (not a simple loop-carried pair -- see parameterSearch_0.toml's worked
-    example, which needs no merge node at all: with point-to-point ports,
-    a node's own 'all' join over two ports fed by different phase-dependent
-    producers already works correctly with no round/identity tracking of
-    any kind -- see _WiringEngine's docstring).
-
-    Under join='any', normally at most one of dfs's n entries is non-None
-    per firing (the others simply have nothing unread on their own port
-    yet -- see _WiringEngine._scan's 'any' branch). __call__ returns the
-    LAST non-None entry by position (a defensive tie-break for the rare
-    case more than one participates in the same firing -- declare the
-    higher-priority producer later in `source` if that matters); raises if
-    every entry is None (unreachable under a correctly-configured
-    join='any' registration, but a real error if misconfigured, e.g. still
-    left at the default join='all').
-    """
-    def __init__(
-        self: Self,
-        n: int = 2,
-        rng: np.random.Generator | None = None,
-        ) -> None:
-        if n < 2:
-            raise ValueError( f'MergeOp requires n >= 2 inputs, got n={n!r}' )
-        self.n = n
-        cols = [ bdd.ColVar( f'_merge_{uuid4().hex}' ) for _ in range( n ) ]
-        super().__init__(
-            rng = rng,
-            input  = [ InputSchema( expr = bdd.Union( c ) ) for c in cols ],
-            output = [ OutputSchema( expr = bdd.Union( *cols ) ) ],
-        )
-    #/def __init__
-
-    def __call__(
-        self: Self,
-        dfs: tuple[ pl.DataFrame | None, ... ],
-        corr_id: tuple[ str, ... ] = (),
-        verbose: int = 0,
-        verbose_prefix: str = '',
-        ) -> tuple[ pl.DataFrame, ... ]:
-        if len( dfs ) != self.n:
-            raise ValueError( f'MergeOp(n={self.n}) got {len(dfs)} input(s)' )
-        chosen: pl.DataFrame | None = None
-        for df in dfs:
-            if df is not None:
-                chosen = df
-        if chosen is None:
-            raise ValueError(
-                'MergeOp: every input is None -- nothing to merge (check '
-                "this node is registered with join='any', not the default 'all')"
-            )
-        return ( chosen, )
-    #/def __call__
-#/class MergeOp
-
 # -- Expression Resolution Table Ops
 
 class ResolveExpressionOp( TableOp ):

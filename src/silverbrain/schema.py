@@ -110,42 +110,17 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     #              different rounds (loops) -- each write just appends
     #              another token to that name's log
     # target     — names this node's positional outputs are written under,
-    #              likewise parent-assigned; a null/None value for a target
-    #              is an ordinary token like any other (still appended to
-    #              the log) -- a consumer that cares about a null branch
-    #              (e.g. loop termination) inspects the value it received,
-    #              no separate engine-level rule
-    # join       — this node's firing rule over its declared source
-    #              names' per-consumer read cursors (point-to-point/Kahn
-    #              Process Network-style ports, see _WiringEngine): 'all'
-    #              (default, AND-join -- fires once every source has an
-    #              unread token), 'any' (fires once at least one source
-    #              has an unread token; others contribute None that
-    #              firing), 'at_least_k' (fires once join_k sources have
-    #              an unread token). Pure presence, no cross-source
-    #              identity check needed -- see _WiringEngine._scan's
-    #              docstring for why per-port FIFO ordering alone
-    #              guarantees correct pairing.
-    # join_k     — required (1 <= join_k <= len(source)) iff
-    #              join == 'at_least_k', else must be null.
-    # discard_on_null — default true; only consulted when join == 'all'
-    #              (silently inert for 'any'/'at_least_k', where a
-    #              non-participating source already positionally
-    #              contributes None for unrelated reasons -- see
-    #              _WiringEngine._scan). When true and this node would
-    #              otherwise fire but at least one of its dispatched
-    #              inputs is None, the engine consumes the tokens
-    #              (cursor still advances) but never invokes the actor
-    #              and never writes a target token -- "discard this
-    #              round" instead of calling the op with a null input.
-    #              Set false on a node that wants to keep receiving and
-    #              handling a null input itself.
+    #              likewise parent-assigned; a null/None value for a
+    #              target is an ordinary, logged token like any other
+    #              (branching/loop termination -- see Token's/
+    #              _WiringEngine's docstrings). A node fires only once
+    #              every one of its declared source names has an unread,
+    #              NON-NULL token -- a strict AND-join over presence and
+    #              non-nullity, the only firing rule this engine has (no
+    #              join modes, no discard-on-null opt-out).
     'node_idn':        pl.Utf8,
     'parent_idn':      pl.Utf8,
     'kind':            pl.Utf8,
-    'join':            pl.Utf8,
-    'join_k':          pl.Int64,
-    'discard_on_null': pl.Boolean,
     # configTree.py: which op_classes key to construct a kind='op' row with
     # -- distinct from node_idn (that row's own wiring/dispatch identity),
     # so the same class can be built by multiple anonymous nodes (node_idn
@@ -279,7 +254,6 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     )),
     '__nodes__': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'join', 'join_k', 'discard_on_null',
     )),
 
     # parameterParse.py's ParameterParser().schema, structural/identifier-
@@ -305,7 +279,6 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # see cannonical_schema above.
     'config_tree': cannonical_schema_for_keys((
         'node_idn', 'parent_idn', 'kind', 'source', 'target',
-        'join', 'join_k', 'discard_on_null',
         'path', 'abs_path', 'cell_source', 'cell_target', 'variable_columns', 'op_type',
     )),
 
