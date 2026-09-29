@@ -80,8 +80,8 @@ def test_or_par_idx_matches_pre_existing_numbering() -> None:
 # -- _or nested directly inside another _or: allowed now (explicit junction nodes)
 
 def test_flat_or_directly_nested_in_or_does_not_raise() -> None:
-    # Unlike the old to_polars_flat (removed), the tree-derived flat expansion
-    # has no nesting restriction -- explicit junction nodes compose freely.
+    # The tree-derived flat expansion has no nesting restriction --
+    # explicit junction nodes compose freely.
     p = _make_parser()
     d = {
         '_or': [
@@ -721,9 +721,8 @@ def test_branch_does_not_search_across_unrelated_branch() -> None:
 #/def test_branch_does_not_search_across_unrelated_branch
 
 
-# -- schema.table_schemas['parameter_tree'] consolidation (schema.py is
-# now the single source of truth -- par_type/.../node_idx/parent_idx/
-# par_val_* naming was previously hand-duplicated here)
+# -- schema.py is the single source of truth for par_type/.../node_idx/
+# parent_idx/par_val_* naming
 
 def test_fresh_parser_schema_matches_table_schemas_parameter_tree() -> None:
     assert ParameterParser().schema == table_schemas[ 'parameter_tree' ]

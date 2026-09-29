@@ -4,9 +4,9 @@
 #//
 
 """
-Tests for the Actor protocol's declared input/output interface (§1.6 of
-nested-gathering-russell.md): InputSchema/OutputSchema as a property of
-Actor, replacing Web's declare()/NodeDecl exposure machinery.
+Tests for the Actor protocol's declared input/output interface:
+InputSchema/OutputSchema as a property of Actor -- a genuine schema,
+not routing metadata.
 """
 
 import warnings

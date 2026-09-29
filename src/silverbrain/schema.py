@@ -41,7 +41,7 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'target':           pl.List( pl.Utf8 ),
     # a Cell's own external binding (Cell.source/Cell.target) -- distinct
     # from a __nodes__/config_tree row's source/target, which are assigned
-    # by whoever registers that node (see squishy-sleeping-snowflake.md).
+    # by whoever registers that node.
     'cell_source':      pl.List( pl.Utf8 ),
     'cell_target':      pl.List( pl.Utf8 ),
     # __tables_schema__ (generic domain-table schema registry)
@@ -240,7 +240,7 @@ table_schemas: dict[ str, dict[ str, pl.DataType ] ] = {
     # InputSchema/OutputSchema declare a bdd.Expr, not a flat column list --
     # __table_op_schema__ is exactly bdd's (op_idn, direction, index)-rooted
     # expression forest (bdd._SIGNATURE_TREE_COLS), not a cannonical_schema
-    # subset. extra/passthrough_from no longer exist as separate columns --
+    # subset. 'extra'/'passthrough_from' aren't separate columns here --
     # see InputSchema/OutputSchema below for how those are recovered from
     # ColVar presence/sharing instead.
     '__table_op_schema__': bdd._SIGNATURE_TREE_COLS,

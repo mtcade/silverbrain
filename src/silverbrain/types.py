@@ -45,21 +45,19 @@ TableProcessDict: Type = dict[ str, TableProcess | TableCheck ]
 
 # -- Actor: the recursive actor interface. TableOp and Cell both conform to
 # this, whether running in-process or as a Ray actor proxy -- a Cell may
-# nest other Cells directly, so there is no separate Web class (see
-# nested-gathering-russell.md §1.6). Per the Static Execution Binding
-# invariant (see plan), an Actor's mode of execution is fixed once at
-# bind() time -- this Protocol only describes the call shape, not how a
-# given implementation is reached.
+# nest other Cells directly, so there is no separate Web class. Per the
+# Static Execution Binding invariant, an Actor's mode of execution is fixed
+# once at bind() time -- this Protocol only describes the call shape, not
+# how a given implementation is reached.
 #
 # input/output declare what __call__ consumes/produces (InputSchema/
 # OutputSchema, already used ad hoc by TableOp -- see tableOps.py:399-476).
-# This is the declared interface that replaces Web's declare()/NodeDecl
-# exposure machinery (§1.6): a genuine schema instead of routing metadata.
-# Either may be None, same as TableOp today, when no schema has been
-# declared.
+# This is the declared interface a Cell/TableOp exposes -- a genuine schema
+# instead of routing metadata. Either may be None, same as TableOp today,
+# when no schema has been declared.
 #
-# corr_id (squishy-sleeping-snowflake.md) is a tuple of strings, carried
-# alongside dfs on every message a node sends or receives. It is PURELY a
+# corr_id is a tuple of strings, carried alongside dfs on every message a
+# node sends or receives. It is PURELY a
 # tracing/correlation aid, not correctness-relevant: cell.py's
 # _WiringEngine wires actors point-to-point (Kahn Process Network-style
 # named ports, each an ordered FIFO queue, not a shared overwritable

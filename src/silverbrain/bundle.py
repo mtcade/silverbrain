@@ -69,10 +69,8 @@ def package_data_root( package: str ) -> Path:
     """
     <package>/data -- a package's own bundled data/ dir (cell TOMLs,
     schema JSON, etc.), resolved via importlib.resources rather than
-    hand-derived Path(__file__).resolve().parents[N] arithmetic (what
-    this used to do, and what e.g. duckpond.paths.DATA_DIR/
-    SILVERFLOW_DATA_ROOT did by hand before autoconfigure_app() existed).
-    That arithmetic only ever worked for an editable/src-layout install
+    hand-derived Path(__file__).resolve().parents[N] arithmetic. That
+    arithmetic only ever works for an editable/src-layout install
     (site-packages just points back at the real source tree, so walking
     up from __file__ lands on the real repo root); it silently breaks for
     a genuinely installed wheel, where there's no such parent-relative
@@ -83,10 +81,8 @@ def package_data_root( package: str ) -> Path:
     wheel, or even a zipped one) -- but for that to see anything, data/
     must live INSIDE the package's own tree (src/<package>/data/), not a
     sibling top-level data/ next to src/; a wheel's separate `.data`
-    category (what `[tool.uv.build-backend.data]` used to map this
-    workspace's old top-level data/ dirs to) installs to a completely
-    different, unrelated location (e.g. sys.prefix/share/...), not
-    reachable this way at all.
+    category installs to a completely different, unrelated location (e.g.
+    sys.prefix/share/...), not reachable this way at all.
 
     Callers here need a real Path (fallback_data_roots values end up
     substituted as literal filesystem path strings into cell TOML

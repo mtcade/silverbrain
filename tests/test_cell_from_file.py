@@ -5,10 +5,9 @@
 
 """
 Tests for cell_from_file's nested kind='cell' [[nodes]] loading, delegated
-to configTree.py to build the flat initialization table (replaces
-Web/web_from_toml -- see nested-gathering-russell.md §1.6 and the
-squishy-sleeping-snowflake plan): a Cell can nest other Cells directly via
-tableOps, with no separate composite class and no alias/exposure machinery.
+to configTree.py to build the flat initialization table: a Cell can nest
+other Cells directly via tableOps, with no separate composite class and no
+alias/exposure machinery.
 """
 
 from pathlib import Path
@@ -95,7 +94,7 @@ def test_nested_child_executes_through_parent_call( tmp_path: Path ) -> None:
 
 
 def test_resources_root_override_does_not_reach_nested_child_without_explicit_binding( tmp_path: Path ) -> None:
-    """Cell.resources is no longer threaded unchanged down the whole tree.
+    """Cell.resources is not threaded unchanged down the whole tree.
     A resources= kwarg passed to cell_from_file() only ever becomes the
     ROOT cell's own most-senior override (see configTree.py's module
     docstring -- declarer_depth=-1, beating even a TOML [[variables.

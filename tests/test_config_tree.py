@@ -7,8 +7,8 @@
 Tests for configTree.toml_config_tree: pure parsing of a cell TOML's
 transitive kind='cell' [[nodes]] file references into a flat node_idn/parent_idn
 dataframe, plus the TableOp construction-parameter forest sourced from
-[[parameters]] entries -- inline, or via an external .toml/.json reference
-(squishy-sleeping-snowflake.md §2). No live Cell construction.
+[[parameters]] entries -- inline, or via an external .toml/.json reference.
+No live Cell construction.
 """
 
 from pathlib import Path
@@ -404,9 +404,8 @@ path      = "/top/override/foo.parquet"
 
 
 def test_variables_resources_reaches_multiple_levels_deep_without_forwarding( tmp_path: Path ) -> None:
-    """The core new capability: an ancestor several kind='cell' hops above a
-    node can bind straight to it -- NO intermediate file has to re-declare
-    or forward anything, unlike the old one-hop [nodes.resources]."""
+    """An ancestor several kind='cell' hops above a node can bind straight
+    to it -- NO intermediate file has to re-declare or forward anything."""
     _write( tmp_path / 'grandchild.toml', "[cell]\n" )
     _write( tmp_path / 'child.toml', """\
 [cell]

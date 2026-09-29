@@ -92,9 +92,9 @@ from .utilities import TableBuilder
 # -- Column naming
 #
 # _IDENTIFIER_COLS/_TREE_IDENTIFIER_COLS/_CANDIDATE_LIST_COLS/
-# col_for_dtype() all now live in schema.py -- the single source of truth
-# for column names/dtypes (including node_idx/parent_idx, which used to
-# be hand-duplicated here). Imported, not redefined.
+# col_for_dtype() live in schema.py -- the single source of truth for
+# column names/dtypes (including node_idx/parent_idx). Imported, not
+# redefined.
 
 _PAR_IDX_DTYPE: pl.DataType = _cannonical_schema['par_idx']
 
@@ -876,8 +876,7 @@ class ParameterParser:
 # node_idx, globally unique across one config_tree() call's whole forest.
 # Each such root group carries one par_name == 'op_idn' row identifying
 # which op its sibling rows are ctor kwargs for -- kept as an explicit,
-# self-describing identity marker (consistent with the original design
-# sketch, nested-gathering-russell.md) rather than inferring identity from
+# self-describing identity marker rather than inferring identity from
 # node_idx position alone.
 #
 # Caveat: this relies on node_idx actually being unique forest-wide, which

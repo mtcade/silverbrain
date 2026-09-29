@@ -31,8 +31,7 @@ def verify_toml( path: Path ) -> list[ VerifyIssue ]:
     Checks performed:
     - No duplicate node_idn across [[nodes]] (node_idn is a tableOps dict
       key, so must stay unique within one Cell -- unlike source/target
-      names, which may legitimately repeat; see
-      squishy-sleeping-snowflake.md).
+      names, which may legitimately repeat, e.g. for fan-out).
     - Each [[nodes]] entry has a node_idn and a recognized kind
       ('op'/'cell'/'variable').
     - Each kind='cell' entry has a 'toml' path that exists; its own TOML is

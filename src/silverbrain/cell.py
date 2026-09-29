@@ -30,8 +30,8 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
     '__table_op_schema__':        table_schemas[ '__table_op_schema__'  ],
     '__table_op_effects__':       table_schemas[ '__table_op_effects__' ],
     # TableOp construction-parameter forest -- see configTree.py's module
-    # docstring and squishy-sleeping-snowflake.md. No parameter sources
-    # exist yet, so this is always empty for now; the schema is
+    # docstring. No parameter sources exist yet, so this is always empty
+    # for now; the schema is
     # ParameterParser's own (with zero dtypes registered, just its
     # identifier columns), reused directly rather than duplicated.
     '__table_ops_parameters__':   ParameterParser().schema,
@@ -41,7 +41,7 @@ _SYSTEM_SCHEMAS: dict[ str, dict ] = {
 # -- Async dispatch: a shared thread pool every Cell's wiring engine and
 # bind() submit calls to, so a synchronous TableOp gets adapted into a
 # non-blocking Future uniformly with a nested Cell (which already returns
-# one natively) or a Ray remote handle. See squishy-sleeping-snowflake.md.
+# one natively) or a Ray remote handle.
 _EXECUTOR = ThreadPoolExecutor( thread_name_prefix = 'silverbrain-actor' )
 
 # -- Process-wide in-flight tracking, for drain_executor() below. A Cell's
@@ -151,7 +151,7 @@ def _call_actor(
     takes corr_id, so it's always passed. If the target itself returns a
     Future (a nested Cell, or a Ray remote call already wrapped), blocks
     this worker thread on it rather than the caller -- a known
-    simplification; see squishy-sleeping-snowflake.md.
+    simplification.
     """
     if hasattr( actor, '_ray_actor_id' ):
         # A Ray ActorHandle itself has no 'remote' attribute -- only its
@@ -540,17 +540,15 @@ class Cell:
         self.resources: pl.DataFrame | None = resources
         # This Cell's own external binding -- private to this Cell, not the
         # same as the source/target a parent assigns when registering this
-        # Cell as one of ITS nodes. Replaces the old single op_idn (Static
-        # Execution Binding is still upheld: this binding is fixed at
-        # construction, never re-decided per call -- it's just no longer
-        # restricted to "exactly one child, called directly").
+        # Cell as one of ITS nodes. Per the Static Execution Binding
+        # invariant, this binding is fixed at construction, never re-decided
+        # per call; a Cell may wire in any number of children, not just one.
         self.source: tuple[ str, ... ] = tuple( source )
         self.target: tuple[ str, ... ] = tuple( target )
         # Declared Actor interface (actor.py) -- what __call__ consumes/
         # produces, same params/semantics as TableOp.__init__ already has.
-        # This is the "genuine interface, not routing" that replaced Web's
-        # declare()/NodeDecl exposure machinery (nested-gathering-
-        # russell.md §1.6); may be left None, same as an undeclared TableOp.
+        # This is a genuine interface (a schema), not routing metadata; may
+        # be left None, same as an undeclared TableOp.
         self.input:  list[ tableOps.InputSchema ]  | None = input
         self.output: list[ tableOps.OutputSchema ] | None = output
 
@@ -653,8 +651,8 @@ class Cell:
     def bind( self: Self, op_idn: str ) -> Actor:
         """
         Resolve op_idn to a callable Actor, fixed once per the Static
-        Execution Binding invariant (nested-gathering-russell.md §1.5): a
-        dict lookup on self.tableOps, nothing more. A registered entry
+        Execution Binding invariant: a dict lookup on self.tableOps,
+        nothing more. A registered entry
         (TableOp, nested Cell, or Ray actor handle) is a child this Cell was
         constructed with. The returned callable always returns a Future,
         uniformly, whether the underlying target is a synchronous TableOp
@@ -1092,11 +1090,9 @@ def build_tableOps(
     keeps every EXISTING build_tableOps() call site (none of which pass
     these two params) byte-for-byte unchanged.
 
-    Replaces the old "a series of lambdas" pattern (an application
-    hand-writing a get_ops(keys, rng) function with one branch per op_idn)
-    with a plain class registry + this one generic instantiation rule.
-    op_classes[class_key] not existing raises KeyError, same failure mode
-    as the old hook silently producing an incomplete ops dict.
+    A plain class registry (op_classes) plus this one generic instantiation
+    rule is what builds every op -- op_classes[class_key] not existing
+    raises KeyError.
     """
     kwargs_by_op = op_ctor_kwargs_forest( parameters )
     op_types     = op_types or {}
@@ -1131,9 +1127,8 @@ def _cell_from_tree(
     child of whom, op vs cell, each node's own parent-assigned source/
     target, each cell's own external source/target binding) comes entirely
     from the tree, already fully parsed by configTree. No file access
-    happens here at all -- Cell no longer manages any domain data of its
-    own (squishy-sleeping-snowflake.md), so there's no remaining
-    non-topology metadata to read.
+    happens here at all -- Cell manages no domain data of its own, so
+    there's no non-topology metadata to read.
 
     parameters is the whole TableOp construction-parameter forest parsed by
     configTree alongside the tree, threaded unchanged to every level -- it's
@@ -1148,9 +1143,9 @@ def _cell_from_tree(
     module docstring) are each a FULLY RESOLVED, whole-tree {abs_path: ...}
     dict -- computed once by cell_from_file, before any Cell exists, and
     threaded UNCHANGED to every recursive level here (same as parameters).
-    Unlike the old one-hop resources_map, there is no further per-level
-    merging left to do: every row in `tree` already carries its own
-    abs_path (configTree.py), so each node just looks itself up.
+    There is no further per-level merging to do: every row in `tree`
+    already carries its own abs_path (configTree.py), so each node just
+    looks itself up.
 
     resolved_deployment (configTree.resolve_deployment()) is the same
     "already fully resolved, whole-tree {abs_path: ...} dict, threaded
@@ -1381,8 +1376,8 @@ def cell_from_file(
                                    # read from (this Cell's own namespace)
         target   = [...]          # names this node's positional outputs are
                                    # written under (ditto) -- need not be
-                                   # unique across [[nodes]] entries; see
-                                   # squishy-sleeping-snowflake.md
+                                   # unique across [[nodes]] entries (fan-out:
+                                   # several nodes may write the same name)
 
         # kind="op": node_idn must be a key op_classes resolves; no other
         #   fields required.

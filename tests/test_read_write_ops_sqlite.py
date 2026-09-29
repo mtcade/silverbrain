@@ -35,10 +35,10 @@ def test_append_accumulates_rows( tmp_path ) -> None:
 
 def test_append_is_robust_to_column_order( tmp_path ) -> None:
     """
-    A regression test for a real bug hit migrating hyperparameter_0's results:
-    _write_sqlite used to INSERT positionally, so appending a DataFrame whose
-    columns were in a different order than the table's original CREATE TABLE
-    silently wrote values into the wrong columns.
+    Regression pin: _write_sqlite must INSERT by column name, not
+    positionally -- an appended DataFrame whose columns are in a different
+    order than the table's original CREATE TABLE must still land in the
+    right columns.
     """
     db_path = str( tmp_path / 'results.db' )
     _write_sqlite(
@@ -78,13 +78,13 @@ def test_fail_raises_when_table_exists( tmp_path ) -> None:
 
 def test_list_column_round_trips_as_json( tmp_path ) -> None:
     """
-    A regression test for a real bug: map_elements passes List-column element
-    values as pl.Series, not plain Python lists -- json.dumps(pl.Series(...))
-    used to raise TypeError on the very first sqlite write of any List column
-    (e.g. hyperparameter_0's 'X.categories_per_var'). Stored as JSONB now (see
-    _write_sqlite_conn) -- read back via the json() SQL function, which
-    re-serializes compactly (no spaces after ','), so compare parsed content
-    rather than the exact string.
+    Regression pin: map_elements passes List-column element values as
+    pl.Series, not plain Python lists, so writing a List column must
+    convert each element before json.dumps() (json.dumps(pl.Series(...))
+    raises TypeError). Stored as JSONB (see _write_sqlite_conn) -- read
+    back via the json() SQL function, which re-serializes compactly (no
+    spaces after ','), so compare parsed content rather than the exact
+    string.
     """
     db_path = str( tmp_path / 'results.db' )
     df = pl.DataFrame( { 'nums': [ [ 1, 2, 3 ] ] } )

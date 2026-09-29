@@ -34,7 +34,8 @@ Cell.tableOps[node_idn] -- kind here only affects how this node is
                                # this Cell's own namespace
     target   = [...]          # this node's positional outputs, written
                                # under these names (need not be unique --
-                               # see squishy-sleeping-snowflake.md)
+                               # fan-out: several nodes may write the same
+                               # name)
 
     # kind="op" additionally requires nothing else -- node_idn must be a
     # key op_classes resolves (its ctor kwargs, if any, come from
@@ -122,8 +123,7 @@ SOME node in the tree (any file, not just a direct parent) and names a
 itself). Resolved to an absolute path by prefixing the declaring node's own
 abs_path. A declarer can therefore only ever reach INTO ITS OWN SUBTREE --
 never sideways to a sibling's internals, never upward -- but may reach
-arbitrarily deep, not just its direct children (unlike the old one-hop
-[resources]/[nodes.resources] this replaces).
+arbitrarily deep, not just its direct children.
 
     [[variables.resources]]
     target    = "search"        # optional, defaults to "." (self)

@@ -789,9 +789,8 @@ class PlaceholderOp( TableOp ):
             expr = bdd.Union( *( bdd.Atom( n, t ) for n, t in columns.items() ) )
         self.expr = expr
         # input tolerates extra columns beyond the declared interface (a
-        # fresh anonymous ColVar, same 'open' behavior the old columns-only
-        # constructor had) -- independent of whether expr itself already
-        # references its own ColVars.
+        # fresh anonymous ColVar) -- independent of whether expr itself
+        # already references its own ColVars.
         _extra = bdd.ColVar( f'_placeholder_extra_{uuid4().hex}' )
         super().__init__(
             rng = rng,

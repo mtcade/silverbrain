@@ -4,8 +4,8 @@
 #//
 
 """
-Tests for Cell's declarative wiring engine (squishy-sleeping-snowflake.md):
-__call__ seeds a call-scoped resolve of named values from self.source, runs
+Tests for Cell's declarative wiring engine: __call__ seeds a call-scoped
+resolve of named values from self.source, runs
 whichever registered __nodes__ entry has all its declared source names
 available, feeding results forward by target name, until self.target is
 fully resolved -- returning a concurrent.futures.Future, never blocking the
@@ -279,12 +279,12 @@ def test_loop_terminates_via_null_vs_nonnull_targets() -> None:
     assert result[ 0 ][ 'n' ].to_list() == [ 3 ]
 
 
-# -- Sequencing baked into a hand-written Actor (replaces TableProcessSequence)
+# -- Sequencing baked into a hand-written Actor
 
 
 def test_hand_written_sequencing_actor() -> None:
-    """What used to be a declarative TableProcessSequence row is now plain
-    Python inside a custom Actor's __call__, calling bind() on siblings."""
+    """Sequencing is plain Python inside a custom Actor's __call__, calling
+    bind() on siblings."""
 
     class DoubleThenIncr:
         def __init__( self, cell: Cell ) -> None:

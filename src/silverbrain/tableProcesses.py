@@ -6,8 +6,7 @@
 #//
 
 """
-Node-row helpers for the __nodes__ schema (see schema.py and
-nested-gathering-russell.md §1.6 / the squishy-sleeping-snowflake plan).
+Node-row helpers for the __nodes__ schema (see schema.py).
 
 A Cell's __call__ is a declarative wiring engine (cell.py's _WiringEngine),
 not hand-written per Cell: it fires whichever registered node's declared

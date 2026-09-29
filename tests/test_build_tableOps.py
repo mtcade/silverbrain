@@ -5,9 +5,8 @@
 
 """
 Tests for build_tableOps() (cell.py): op_classes[op_idn](rng=rng, **kwargs)
-construction, replacing the old ops_module.get_ops(keys, rng) hook -- a
-plain class registry + this one generic instantiation rule, kwargs sourced
-from op_ctor_kwargs_forest() (parameterParse.py).
+construction -- a plain class registry + this one generic instantiation
+rule, kwargs sourced from op_ctor_kwargs_forest() (parameterParse.py).
 """
 
 import numpy as np
