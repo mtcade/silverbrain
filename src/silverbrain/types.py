@@ -9,9 +9,7 @@
 Abstract types for building blocks
 """
 
-import enum
 from concurrent.futures import Future
-from dataclasses import dataclass
 from typing import Protocol, Self, Type
 
 import polars as pl
@@ -119,36 +117,4 @@ class ExecutionStrategy( Protocol ):
     ) -> dict[ str, pl.DataFrame ]: ...
     #/def execute
 #/class ExecutionStrategy
-
-
-# -- Network / distributed types
-
-class MessageKind( enum.Enum ):
-    DATA   = 'data'
-    SYSTEM = 'system'
-#/class MessageKind
-
-
-@dataclass
-class RequestContext:
-    """
-    Per-request routing metadata that travels alongside table data through the
-    pipeline without entering any table.  Set by the receive side; consumed by
-    the send/relay side.
-    """
-    request_id:      str    # correlation key; used to rejoin relay responses
-    origin_identity: bytes  # ZMQ ROUTER routing frame for this request
-#/class RequestContext
-
-
-@dataclass
-class InboundMessage:
-    """
-    Decoded envelope from a ROUTER socket, before dispatch to system or data
-    processing.  The kind field determines which processing path fires.
-    """
-    kind:    MessageKind
-    context: RequestContext
-    tables:  tuple[ pl.DataFrame, ... ]
-#/class InboundMessage
 

@@ -4,7 +4,7 @@
 #//
 
 from . import configTree, exprParse, tableOps, tableProcesses, types
-from .types import Actor
+from .types import Actor, TableProcess
 from .tableOps import PlaceholderOp, TableOp, TableOpSchema
 from .parameterParse import ParameterParser, op_ctor_kwargs_forest
 from .schema import table_schemas, table_schemas_to_df
@@ -13,7 +13,7 @@ from .sunder import sunder_table_factories
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, Sequence
+from typing import Any, Self, Sequence
 
 import inspect
 import threading
@@ -153,7 +153,12 @@ def _call_actor(
     this worker thread on it rather than the caller -- a known
     simplification; see squishy-sleeping-snowflake.md.
     """
-    if hasattr( actor, 'remote' ):
+    if hasattr( actor, '_ray_actor_id' ):
+        # A Ray ActorHandle itself has no 'remote' attribute -- only its
+        # individual bound METHODS do (actor.__call__.remote(...)) -- so
+        # '_ray_actor_id' (present on every ActorHandle, absent from a
+        # plain TableOp/Cell) is what actually distinguishes one here,
+        # checked without importing ray just to ask the question.
         import ray
         result = ray.get( actor.__call__.remote( dfs, corr_id, verbose, verbose_prefix ) )
     else:
@@ -1009,6 +1014,40 @@ class Cell:
 #/class Cell
 
 
+def _construct_op(
+    cls:             type[ TableOp ],
+    rng:             np.random.Generator | None,
+    kwargs:          dict[ str, Any ],
+    strategy_entry:  dict[ str, Any ] | None,
+    ) -> TableProcess:
+    """
+    Build one leaf TableOp instance according to a resolved deployment
+    entry (configTree.resolve_deployment()'s own per-abs_path shape,
+    {'strategy': ..., 'options': {...}}) -- 'local' (or no entry at all,
+    the default) constructs cls(rng=rng, **kwargs) exactly as every caller
+    already did before deployment existed; 'ray' instead returns a Ray
+    actor handle (ray.remote(cls).options(**options).remote(rng=rng,
+    **kwargs)) -- cell.py's _call_actor already dispatches to one
+    transparently via its own hasattr(actor, '_ray_actor_id') check, so no
+    dispatch-side change was needed to support this. `ray` is imported
+    lazily, only on this branch, so a deployment-less (or all-'local')
+    Cell never pays for it -- same pattern _call_actor's own lazy import
+    already uses.
+    """
+    strategy = ( strategy_entry or {} ).get( 'strategy', 'local' )
+    if strategy == 'local':
+        return cls( rng = rng, **kwargs )
+    if strategy == 'ray':
+        import ray
+        options = strategy_entry.get( 'options', {} ) or {}
+        return ray.remote( cls ).options( **options ).remote( rng = rng, **kwargs )
+    raise ValueError(
+        f"unknown deployment strategy {strategy!r} for {cls!r} -- expected "
+        f"'local' or 'ray'"
+    )
+#/def _construct_op
+
+
 def build_tableOps(
     op_classes: dict[ str, type[ TableOp ] ],
     op_keys:    Sequence[ str ],
@@ -1016,6 +1055,8 @@ def build_tableOps(
     parameters: pl.DataFrame,
     op_types:   dict[ str, str ] | None = None,
     resources:  pl.DataFrame | None     = None,
+    deployment: dict[ str, dict[ str, Any ] ] | None = None,
+    abs_paths:  dict[ str, str ] | None = None,
     ) -> types.TableProcessDict:
     """
     Construct one TableOp instance per op_keys entry:
@@ -1040,6 +1081,17 @@ def build_tableOps(
     parameter (see silverbrain.ReadWriteOps.ReadOp/WriteOp/ReadWriteOp for
     the ops that do want it).
 
+    deployment/abs_paths (both optional, both default to today's exact
+    behavior when omitted): deployment is configTree.resolve_deployment()'s
+    own {abs_path: {'strategy': ..., 'options': {...}}} result; abs_paths
+    maps each op_idn here to its own abs_path in that same tree, so this
+    function can look itself up without needing to know anything about
+    configTree's row shape directly. See _construct_op() for what each
+    strategy actually does. An op_idn missing from abs_paths (or an
+    abs_path missing from deployment) is treated as 'local' -- this is what
+    keeps every EXISTING build_tableOps() call site (none of which pass
+    these two params) byte-for-byte unchanged.
+
     Replaces the old "a series of lambdas" pattern (an application
     hand-writing a get_ops(keys, rng) function with one branch per op_idn)
     with a plain class registry + this one generic instantiation rule.
@@ -1048,13 +1100,16 @@ def build_tableOps(
     """
     kwargs_by_op = op_ctor_kwargs_forest( parameters )
     op_types     = op_types or {}
+    deployment   = deployment or {}
+    abs_paths    = abs_paths or {}
     ops: types.TableProcessDict = {}
     for op_idn in op_keys:
         cls    = op_classes[ op_types.get( op_idn, op_idn ) ]
         kwargs = dict( kwargs_by_op.get( op_idn, {} ) )
         if 'resources' in inspect.signature( cls.__init__ ).parameters:
             kwargs.setdefault( 'resources', resources )
-        ops[ op_idn ] = cls( rng = rng, **kwargs )
+        strategy_entry = deployment.get( abs_paths.get( op_idn ) )
+        ops[ op_idn ] = _construct_op( cls, rng, kwargs, strategy_entry )
     return ops
 #/def build_tableOps
 
@@ -1068,6 +1123,7 @@ def _cell_from_tree(
     parameters: pl.DataFrame,
     resolved_resources: dict[ str, pl.DataFrame ] | None = None,
     resolved_actors:    dict[ str, dict ]          | None = None,
+    resolved_deployment: dict[ str, dict ]         | None = None,
     ) -> Cell:
     """
     Construct one Cell (and, recursively, its nested Cell children) from a
@@ -1095,6 +1151,17 @@ def _cell_from_tree(
     Unlike the old one-hop resources_map, there is no further per-level
     merging left to do: every row in `tree` already carries its own
     abs_path (configTree.py), so each node just looks itself up.
+
+    resolved_deployment (configTree.resolve_deployment()) is the same
+    "already fully resolved, whole-tree {abs_path: ...} dict, threaded
+    unchanged" shape as resolved_resources/resolved_actors -- see that
+    function's own docstring for what it decides (WHERE a leaf TableOp gets
+    constructed, not what it is). Consulted here for a bound kind='variable'
+    node's own abs_path (op_children's own abs_path lookup happens inside
+    build_tableOps, via the abs_paths param below); nested kind='cell'
+    children just receive it unchanged, same as every other resolved_*
+    dict -- deployment decisions for THEIR own descendants are made at
+    their own recursive _cell_from_tree call, not here.
     """
     own_row = tree.filter(
         ( pl.col( 'node_idn' ) == node_idn ) & ( pl.col( 'kind' ) == 'cell' )
@@ -1111,7 +1178,11 @@ def _cell_from_tree(
         row[ 'node_idn' ]: row[ 'op_type' ] or row[ 'node_idn' ]
         for row in op_children
     }
-    ops: types.TableProcessDict = build_tableOps( op_classes, op_keys, rng, parameters, op_types, effective_resources )
+    op_abs_paths: dict[ str, str ] = { row[ 'node_idn' ]: row[ 'abs_path' ] for row in op_children }
+    ops: types.TableProcessDict = build_tableOps(
+        op_classes, op_keys, rng, parameters, op_types, effective_resources,
+        deployment = resolved_deployment, abs_paths = op_abs_paths,
+    )
 
     # node_idn -> resolved actor binding, for the __actor_bindings__ rows
     # appended below (once this Cell exists to append to).
@@ -1127,7 +1198,8 @@ def _cell_from_tree(
             ops[ row[ 'node_idn' ] ] = PlaceholderOp( expr = expr, rng = rng )
         else:
             cls = op_classes[ binding[ 'op_type' ] ]
-            ops[ row[ 'node_idn' ] ] = cls( rng = rng, **binding[ 'kwargs' ] )
+            strategy_entry = ( resolved_deployment or {} ).get( row[ 'abs_path' ] )
+            ops[ row[ 'node_idn' ] ] = _construct_op( cls, rng, binding[ 'kwargs' ], strategy_entry )
             bound_variables[ row[ 'node_idn' ] ] = binding
 
     # A cell_children row whose abs_path has a resolved kind='cell' actor
@@ -1150,6 +1222,7 @@ def _cell_from_tree(
             parameters          = parameters,
             resolved_resources  = resolved_resources,
             resolved_actors     = resolved_actors,
+            resolved_deployment = resolved_deployment,
         )
 
     cell = Cell(
@@ -1216,6 +1289,7 @@ def cell_from_file(
     cells_index_file: Path = configTree.CELLS_INDEX_FILE_DEFAULT,
     resources: pl.DataFrame | None = None,
     extra_declarations: dict[ str, pl.DataFrame ] | None = None,
+    deployment: pl.DataFrame | None = None,
 ) -> Cell:
     """
     Construct a Cell from a config file, delegating to configTree.config_tree
@@ -1271,6 +1345,22 @@ def cell_from_file(
                   bundle.cell_from_bundle() to apply a bundle.toml's own
                   [[variables.resources]]/[[variables.actors]] entries,
                   which live outside the linked cell's own file entirely.
+    deployment  : an optional {abs_path, strategy, options_json} DataFrame
+                  (configTree.resolve_deployment()'s own input shape)
+                  deciding WHERE each leaf TableOp is constructed -- 'local'
+                  (today's exact behavior, the default for any node this
+                  frame doesn't cover) or 'ray' (a ray.remote actor handle
+                  instead, dispatched to transparently by cell.py's own
+                  _call_actor). Supplied from OUTSIDE the config tree
+                  entirely, exactly like `resources` above -- never written
+                  into any TOML, and resolved fresh against whatever `tree`
+                  this particular call produces, so the SAME bundle.toml
+                  can be deployed differently at different call sites (or
+                  different times) without editing it. See
+                  configTree.resolve_deployment()'s own docstring for the
+                  abs_path-prefix inheritance rule (declare once on a
+                  nested Cell's own root abs_path, every descendant not
+                  more specifically overridden inherits it).
 
     TOML schema expected
     --------------------
@@ -1399,6 +1489,7 @@ def cell_from_file(
         fallback_data_roots = fallback_data_roots,
         cells_index_file     = cells_index_file,
     )
+    resolved_deployment = configTree.resolve_deployment( deployment, tree )
     return _cell_from_tree(
         tree                = tree,
         node_idn            = main_id,
@@ -1408,5 +1499,6 @@ def cell_from_file(
         parameters          = parameters,
         resolved_resources  = resolved_resources,
         resolved_actors     = resolved_actors,
+        resolved_deployment = resolved_deployment,
     )
 #/def cell_from_file

@@ -206,6 +206,23 @@ _ACTOR_DECL_SCHEMA: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
     'abs_path', 'declarer_depth', 'kind', 'op_type', 'path', 'kwargs_json', 'declaring_path',
 ) )
 
+# -- deployment: a caller-supplied {abs_path, strategy, options_json} frame
+# deciding WHERE a leaf TableOp is constructed (build_tableOps(), cell.py)
+# -- "local" (today's exact `cls(rng=rng, **kwargs)`, the default whenever a
+# node has no matching row) vs. "ray" (a ray.remote actor handle instead).
+# Deliberately NOT a variables.<channel> declaration: it doesn't live in any
+# TOML at all, and isn't scoped to a declaring node's own subtree -- it's
+# supplied directly alongside the already-traversed `tree` (resolve_
+# deployment()'s own second argument), the same "outside the config tree
+# entirely" position cell_from_file's own `resources` param already
+# occupies for the root cell. See resolve_deployment()'s own docstring for
+# the inheritance rule (longest abs_path PREFIX match, not exact-only).
+_DEPLOYMENT_SCHEMA: dict[ str, pl.DataType ] = cannonical_schema_for_keys( (
+    'abs_path', 'strategy', 'options_json',
+) )
+
+_DEFAULT_DEPLOYMENT_STRATEGY = 'local'
+
 
 def _empty_resource_decls() -> pl.DataFrame:
     return pl.DataFrame( schema = _RESOURCE_DECL_SCHEMA )
@@ -289,6 +306,57 @@ def resolve_actor_declarations( decls: pl.DataFrame ) -> dict[ str, dict[ str, A
         resolved[ row[ 'abs_path' ] ] = binding
     return resolved
 #/def resolve_actor_declarations
+
+
+def resolve_deployment(
+    deployment: pl.DataFrame | None,
+    tree:       pl.DataFrame,
+    ) -> dict[ str, dict[ str, Any ] ]:
+    """
+    Resolve a flat deployment frame (abs_path, strategy, options_json --
+    see _DEPLOYMENT_SCHEMA above) against every abs_path actually present
+    in `tree` into {abs_path: {'strategy': ..., 'options': {...}}} -- one
+    entry per node, so cell.py's build_tableOps() (and the kind='variable'
+    binding path in _cell_from_tree) can do a plain dict lookup with no
+    further resolution logic at construction time, same consumption
+    pattern resolved_resources/resolved_actors already give.
+
+    Unlike those two, `deployment` isn't a set of declarations SCOPED to a
+    declaring node's own subtree -- it's one external frame supplied
+    directly by the caller alongside the already-traversed `tree` (see
+    cell.py's cell_from_file `deployment` param), so there is no
+    declarer_depth/root-wins merge to do. Inheritance instead works by
+    longest abs_path PREFIX match: a row declared for an ancestor abs_path
+    (e.g. a whole nested Cell's own root, "wrapper.search") applies to
+    every descendant abs_path ("wrapper.search.picker") that has no more
+    specific row of its own -- the same "declare once, let it flow down"
+    shape variables.resources/variables.actors already give TOML-authored
+    declarations, just resolved against path prefixes here instead of
+    single exact targets, since a deployment row isn't itself a node in the
+    tree. An abs_path matched by no row of any length defaults to
+    {'strategy': 'local', 'options': {}} -- construction behaves exactly as
+    it does today whenever `deployment` is omitted (or empty) entirely.
+    """
+    rows: dict[ str, dict[ str, Any ] ] = {}
+    if deployment is not None and not deployment.is_empty():
+        for row in deployment.to_dicts():
+            options_json = row.get( 'options_json' )
+            rows[ row[ 'abs_path' ] ] = {
+                'strategy': row[ 'strategy' ],
+                'options':  json.loads( options_json ) if options_json else {},
+            }
+    resolved: dict[ str, dict[ str, Any ] ] = {}
+    for abs_path in tree[ 'abs_path' ].unique( maintain_order = True ):
+        parts = abs_path.split( '.' )
+        entry = { 'strategy': _DEFAULT_DEPLOYMENT_STRATEGY, 'options': {} }
+        for depth in range( len( parts ), 0, -1 ):
+            prefix = '.'.join( parts[ :depth ] )
+            if prefix in rows:
+                entry = rows[ prefix ]
+                break
+        resolved[ abs_path ] = entry
+    return resolved
+#/def resolve_deployment
 
 
 # Hard cap on splice_actor_grafts()'s resolve/splice rounds -- exists only

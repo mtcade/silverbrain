@@ -176,6 +176,12 @@ cannonical_schema: dict[ str, pl.DataType ] = {
     'declarer_depth':   pl.Int64,
     'declaring_path':   pl.Utf8,
     'kwargs_json':      pl.Utf8,
+    # configTree.resolve_deployment(): a caller-supplied deployment row's
+    # own placement tag ('local'/'ray'/...) and its strategy-specific ctor
+    # kwargs, JSON-encoded the same way variables.actors' own 'kwargs_json'
+    # is (build_tableOps() decodes it right before use).
+    'strategy':         pl.Utf8,
+    'options_json':     pl.Utf8,
 }
 
 def cannonical_schema_for_keys(
