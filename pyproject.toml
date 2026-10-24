@@ -9,7 +9,7 @@ authors = [
 
 requires-python = ">=3.13"
 dependencies = [
-    "polars>=1.32,<2",
+    "polars>=1.32,<3",
     "numpy>=1.26.0",
     "pyarrow",
     "ray>=2.40",
